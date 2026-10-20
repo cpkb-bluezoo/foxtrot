@@ -21,7 +21,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/include
 AM_CFLAGS = $(STD_CFLAGS) $(WARN_CFLAGS)
 LDADD = $(top_builddir)/src/libfoxtrot.la
 
-UNIT_TESTS = test-wire test-packet test-ident test-key test-kex test-kexinit test-policy test-conn test-conn-attack test-auth test-chan test-sftp test-session test-cert test-knownhosts test-sk test-keyfile test-x509 test-authkeys test-krl test-certsign
+UNIT_TESTS = test-wire test-packet test-ident test-key test-kex test-kexinit test-policy test-conn test-conn-attack test-auth test-chan test-sftp test-session test-cert test-knownhosts test-sk test-keyfile test-x509 test-authkeys test-krl test-certsign test-keyfmt
 
 TESTS = $(UNIT_TESTS)
 check_PROGRAMS = $(UNIT_TESTS)
@@ -34,11 +34,14 @@ EXTRA_DIST = tst-util.h tst-pair.h vectors-packet.h gen-packet-vectors.py \
   vectors-sk.h gen-sk-vectors.py \
   vectors-keyfile.h gen-keyfile-vectors.py \
   vectors-x509.h gen-x509-vectors.py \
-  vectors-krl.h gen-krl-vectors.py
+  vectors-krl.h gen-krl-vectors.py \
+  vectors-keyfmt.h gen-keyfmt-vectors.py
 
 # Calls libgcrypt's KEM interface directly to check the hybrid methods'
 # composition from outside.
 test_kex_CFLAGS = $(AM_CFLAGS) $(LIBGCRYPT_CFLAGS)
 test_kex_LDADD = $(LDADD) $(LIBGCRYPT_LIBS)
 test_keyfile_CFLAGS = $(AM_CFLAGS) $(LIBGCRYPT_CFLAGS)
+test_keyfmt_CFLAGS = $(AM_CFLAGS) $(LIBGCRYPT_CFLAGS)
+test_keyfmt_LDADD = $(LDADD) $(LIBGCRYPT_LIBS)
 test_keyfile_LDADD = $(LDADD) $(LIBGCRYPT_LIBS)

@@ -253,6 +253,20 @@ csseed('plain', 1, 0, 1, 9, 5, 6, 'id', '', '', 'p')
 csseed('bad-times', 1, 0, 0, 9, 6, 5, 'id', '', '', 'p')
 csseed('bad-addr', 1, 0, 0, 9, 5, 6, 'id', '', 'example.org', 'p')
 
+# ---- keyfmt: [mode][file] ----
+fmt = consts('vectors-keyfmt.h')
+for kind in ('ed25519', 'p256', 'p384', 'rsa'):
+    for f in ('pkcs8', 'spki', 'sec1', 'pkcs1', 'rsapub'):
+        t = fmt.get('vec_fmt_%s_%s' % (kind, f), '')
+        if t: add('keyfmt', '%s-%s' % (kind, f), b'\x00' + t.encode())
+    add('keyfmt', kind + '-rfc4716', b'\x02' + fmt['vec_fmt_%s_rfc4716' % kind].encode())
+    add('keyfmt', kind + '-ppk', b'\x03' + fmt['vec_fmt_%s_ppk' % kind].encode())
+for k, v in fmt.items():
+    if '_enc_' in k and k.startswith('vec_fmt_ed25519') or k in ('vec_fmt_rsa_enc_aes_256_cbc_hmacWithSHA256',):
+        add('keyfmt', k[8:], b'\x01' + v.encode())
+    if k.startswith('vec_fmt_ed25519_ppk_argon2'):
+        add('keyfmt', k[8:], b'\x04' + v.encode())
+
 # ---- sftp: [mode][schedule][chunk] raw ----
 def sftp(t, body): return u32(len(body) + 1) + bytes([t]) + body
 srv_stream = (sftp(1, u32(3)) + sftp(16, u32(1) + s('.')) + sftp(3, u32(2) + s('/a') + u32(1) + u32(0))

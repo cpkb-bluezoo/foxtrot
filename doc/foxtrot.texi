@@ -264,7 +264,7 @@ checked by removing it and seeing a test fail.
 @code{make check} also runs the fuzz targets of @file{fuzz/} once over
 their corpora.  There is one for each parser of what a peer or a file
 sends (the identification line, packets, key exchange messages, keys and
-certificates, private key files, @file{known_hosts}, @file{authorized_keys}, revocation lists,
+certificates, private key files and other key formats, @file{known_hosts}, @file{authorized_keys}, revocation lists,
 X.509 chains,
 authentication, channels, SFTP and a whole connection), and each checks
 what must hold on any input as well as that nothing crashes.  Built with
@@ -693,6 +693,62 @@ A client has no default trust in a host key.  The signature on the exchange
 hash is verified first, then the application is asked through the
 @code{host_key} callback; a client without one refuses every key.  At a
 rekey the server must present the same key.
+
+@node Other key formats
+@subsection Other key formats
+@cindex PEM
+@cindex PKCS#8
+@cindex PuTTY
+@cindex RFC 4716
+@cindex randomart
+
+@file{keyfmt.h} reads what other programs write, and some of what they read.
+All of it is I/O free, strict, and held to the key policy as if the key
+had come in a blob.
+
+@itemize @bullet
+@item
+@strong{RFC 4716} public key files (what @command{ssh-keygen -e} writes), read
+and written; headers may continue after a backslash, and the output is the
+same bytes as @command{ssh-keygen}'s.
+@item
+@strong{PEM and DER}, as @command{openssl} and others write them: SPKI
+(@samp{PUBLIC KEY}), @samp{RSA PUBLIC KEY}, PKCS#8 (@samp{PRIVATE KEY}),
+PKCS#1 (@samp{RSA PRIVATE KEY}) and SEC1 (@samp{EC PRIVATE KEY}), for
+Ed25519, ECDSA over P-256 and P-384, and RSA.  The DER is read strictly:
+lengths in their shortest form and definite, minimal non-negative integers,
+no trailing bytes, parameters exactly as each algorithm has them.  An
+Ed25519 key's public key is computed from its seed; an ECDSA key must carry
+its point, as every writer includes it.  Whatever a file says, the private
+part is checked against the public part.  @code{gf_key_to_pem_public}
+writes the SPKI, byte for byte as @command{openssl pkey -pubout}.
+@item
+@strong{PKCS#8 under a passphrase} (@samp{ENCRYPTED PRIVATE KEY}) is read
+when it is PBES2 with PBKDF2 using SHA-256, SHA-384 or SHA-512 and AES-128,
+-192 or -256 in CBC mode, with at most five million iterations.  A file is
+refused (@code{GF_ERR_UNSUPPORTED}) if it uses PBKDF2 with SHA-1, which it
+does if it names no hash, scrypt, or the older PBES1 (MD5 or SHA-1 with
+DES or RC2); and so is the old PEM encryption (@samp{Proc-Type:
+4,ENCRYPTED}), which makes its key with one round of MD5.  CBC is not
+authenticated, but a file on a disk has no attacker who can feed it chosen
+ciphertexts and see whether it was accepted; a wrong passphrase is told by
+the padding and the structure, and is @code{GF_ERR_PASSPHRASE}.
+@item
+@strong{PuTTY} @file{.ppk} files of format 3, plain or under AES-256-CBC with a key made
+by Argon2 (@samp{Argon2id}, @samp{Argon2i} or @samp{Argon2d}); the MAC is
+checked before anything is believed, and the memory, passes and lanes that a
+file asks of Argon2 are bounded (512 MiB, 1000, 16).  Formats 1 and 2 are
+refused: their key comes from the passphrase through SHA-1 and their MAC is
+HMAC-SHA-1, and @command{puttygen} will write a format 3 file from them.
+@item
+@code{gf_key_randomart} is the picture of @command{ssh-keygen -lv}, from the
+SHA-256 fingerprint, and the same characters.
+@end itemize
+
+The generator of the test vectors (@file{tests/gen-keyfmt-vectors.py}) has
+python's @code{cryptography}, @command{openssl}, @command{ssh-keygen} and
+@command{puttygen} write each format from one key and read none of them
+back with this library's code.
 
 @node Authorized keys
 @subsection Authorized keys

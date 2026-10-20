@@ -88,4 +88,14 @@ int gfi_x509_parse (gf_key **out, const uint8_t *blob, size_t len,
                     gf_slice name);
 void gfi_x509_free (struct gf_x509 *x);
 
+/* For keyfmt.c: an integer from its magnitude, and the private part of K
+   (a public key made from a blob) from the parts a file has: for Ed25519 the
+   public point Q (QLEN bytes) and the SEED; for ECDSA Q and D; for RSA N, E,
+   D and the primes P and QQ.  The private part is checked against the public
+   one.  Defined in key.c.  */
+gcry_mpi_t gfi_mpi_from (const uint8_t *data, size_t len);
+int gfi_key_attach_private (gf_key *k, const uint8_t *q, size_t qlen,
+                            gcry_mpi_t d, const uint8_t *seed, gcry_mpi_t n,
+                            gcry_mpi_t e, gcry_mpi_t p, gcry_mpi_t qq);
+
 #endif /* GF_KEYINT_H */

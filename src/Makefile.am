@@ -33,6 +33,7 @@ libfoxtrot_la_SOURCES = \
   kex.c \
   kexinit.c \
   key.c \
+  keyfmt.c \
   keyint.h \
   knownhosts.c \
   krl.c \
@@ -62,6 +63,7 @@ foxtrotinclude_HEADERS = \
   $(top_srcdir)/include/foxtrot/kex.h \
   $(top_srcdir)/include/foxtrot/kexinit.h \
   $(top_srcdir)/include/foxtrot/key.h \
+  $(top_srcdir)/include/foxtrot/keyfmt.h \
   $(top_srcdir)/include/foxtrot/knownhosts.h \
   $(top_srcdir)/include/foxtrot/krl.h \
   $(top_srcdir)/include/foxtrot/packet.h \

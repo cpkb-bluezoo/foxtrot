@@ -1775,3 +1775,33 @@ gf_key_to_openssh_private_encrypted (const gf_key *k, char *out, size_t cap,
     return GF_ERR_INVAL;
   return private_write (k, out, cap, outlen, passphrase, rounds, kdf, user);
 }
+
+/* ---- For the other file formats (keyfmt.c) ---- */
+
+gcry_mpi_t
+gfi_mpi_from (const uint8_t *data, size_t len)
+{
+  return mpi_from (data, len);
+}
+
+int
+gfi_key_attach_private (gf_key *k, const uint8_t *q, size_t qlen, gcry_mpi_t d,
+                        const uint8_t *seed, gcry_mpi_t n, gcry_mpi_t e,
+                        gcry_mpi_t p, gcry_mpi_t qq)
+{
+  int rc;
+
+  if (k == NULL || k->priv != NULL || k->cert != NULL || k->x509 != NULL)
+    return GF_ERR_INVAL;
+  rc = import_private (k, q, qlen, d, seed, n, e, p, qq);
+  /* That the private part belongs to the public one is checked for every
+     type, whatever the file said.  */
+  if (rc == GF_OK)
+    rc = selftest (k);
+  if (rc != GF_OK)
+    {
+      gcry_sexp_release (k->priv);
+      k->priv = NULL;
+    }
+  return rc;
+}
