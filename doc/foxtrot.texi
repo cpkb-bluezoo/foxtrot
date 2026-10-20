@@ -404,8 +404,9 @@ has @samp{permit-pty}, @samp{permit-port-forwarding},
 @samp{permit-user-rc}, and @samp{-O clear} has none.  Code that checks only
 what is present would let a user who was given nothing do everything, so the
 session does the checking for a server (@code{gf_session_permits}): a pty
-request without @samp{permit-pty}, and a direct-tcpip channel or a
-tcpip-forward request without @samp{permit-port-forwarding}, are refused
+request without @samp{permit-pty}, and a direct-tcpip or direct-streamlocal
+channel or a tcpip-forward or streamlocal-forward request without
+@samp{permit-port-forwarding}, are refused
 before the application is asked, with the answers of a refusal and not as
 an offence.  Agent and X11 forwarding are never offered.
 @samp{permit-user-rc} is for the application, with @code{force-command}, to
@@ -919,7 +920,14 @@ and @samp{forwarded-tcpip} channels, the requests on session channels
 (@samp{exec}, @samp{shell}, @samp{subsystem}, @samp{pty-req}, @samp{env},
 @samp{window-change}, @samp{signal}, @samp{exit-status}, @samp{exit-signal},
 @samp{break}) and the global requests @samp{tcpip-forward},
-@samp{cancel-tcpip-forward} and @samp{no-more-sessions@@openssh.com}.
+@samp{cancel-tcpip-forward} and @samp{no-more-sessions@@openssh.com}; and
+OpenSSH's forwarding of Unix sockets, which has the same shape with a path
+for an address: the channels @samp{direct-streamlocal@@openssh.com} (the
+peer is to connect to a socket on its side) and
+@samp{forwarded-streamlocal@@openssh.com} (a connection came to a socket we
+were asked to listen on), and the global requests
+@samp{streamlocal-forward@@openssh.com} and
+@samp{cancel-streamlocal-forward@@openssh.com}.
 
 @itemize @bullet
 @item
@@ -942,10 +950,24 @@ than the configured limits (64 channels, 16 requests) all end the connection.
 @strong{What is refused.}  X11 forwarding and agent forwarding, in channels
 and in requests: both extend the trust of the connection to other
 credentials of the machine at the other end.  So is every channel type
-other than the three above, and every request or global request the library
+other than those above, and every request or global request the library
 does not know, which is also how the @samp{keepalive@@openssh.com} request
 is answered.  A refusal is sent in order behind the answers still owed for
 earlier requests, as RFC 4254 requires.
+@item
+@strong{A Unix socket is more than a port.}  The library checks that a path
+is not empty, has no NUL and is at most 4096 bytes, and otherwise hands it
+over as written (@code{gf_chan_open.path}, @code{gf_global_request.path}):
+what a user may connect to is the application's decision, and some sockets
+(the one of a container runtime, say) are a way to become root.  The
+session does what it does for TCP: a server refuses a direct-streamlocal
+channel or a streamlocal-forward request from a user whose certificate lacks
+@samp{permit-port-forwarding}, or whom the application denied it
+(@code{gf_session_deny}), before the application is asked.  An
+@file{authorized_keys} line that limits a user with @code{permitopen} or
+@code{permitlisten} cannot name a path in either, so
+@code{gf_authkey_permits_open_path} and @code{_listen_path} say no for a line
+that has the list of that direction.
 @item
 A channel number is reused only after the channel is closed on both sides.
 A CLOSE is answered with a CLOSE; data in flight when a channel is closed

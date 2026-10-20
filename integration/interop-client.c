@@ -42,7 +42,12 @@
    COMMAND in a session channel, sends N bytes of the test pattern to its
    input (--send), checks that what it prints is the test pattern too
    (--check-pattern), and waits for the exit status and the end of the
-   channel.  With --sftp it runs the commands in an SFTP session instead:
+   channel.  With --direct-streamlocal PATH it opens a direct-streamlocal
+   channel to the Unix socket PATH on the server's side instead, sends a line
+   and prints "STREAMLOCAL-ECHO line" for the answer; with
+   --streamlocal-forward PATH it asks the server to listen on PATH, prints
+   "STREAMLOCAL-FORWARD OK" or "REFUSED", echoes the first connection that
+   comes ("FORWARDED-STREAMLOCAL PATH") and finishes when it closes.  With --sftp it runs the commands in an SFTP session instead:
 
      put LOCAL REMOTE      get REMOTE LOCAL      ls DIR
      mkdir DIR   rmdir DIR   rm FILE   mv OLD NEW   ln TARGET LINK
@@ -96,6 +101,11 @@ struct ctx
   uint32_t exit_status;
   char out[256];
   size_t outn;
+  /* Unix socket forwarding: --direct-streamlocal opens a channel to a socket
+     on the server's side and checks it is echoed; --streamlocal-forward asks
+     the server to listen on one, and echoes the first connection.  */
+  const char *dsl_path, *fsl_path;
+  int fsl_refused;
   /* SFTP.  */
   const char *sftp_script;
   gf_sftp_client *sftp;
@@ -229,6 +239,11 @@ auth_ok (void *user, gf_slice none)
   x->authed = 1;
   if (x->rekey)
     return gf_conn_rekey (gf_session_conn (x->s), now_us ()) != GF_OK;
+  if (x->dsl_path)
+    return gf_chans_open_direct_streamlocal (x->chans, &x->chan, x->dsl_path,
+                                             0, 0) != GF_OK;
+  if (x->fsl_path)
+    return gf_chans_request_streamlocal_forward (x->chans, x->fsl_path) != GF_OK;
   if (x->command || x->sftp_script)
     return gf_chans_open_session (x->chans, &x->chan, 0, 0) != GF_OK;
   return 0;
@@ -286,6 +301,12 @@ chan_confirmed (void *user, uint32_t id)
 
   (void) id;
   x->opened = 1;
+  if (x->dsl_path)
+    {
+      static const uint8_t ping[] = "streamlocal ping\n";
+
+      return gf_chans_send_data (x->chans, x->chan, ping, sizeof ping - 1) < 0;
+    }
   if (x->sftp_script)
     return gf_chans_request_subsystem (x->chans, x->chan, "sftp", 1) != GF_OK;
   return gf_chans_request_exec (x->chans, x->chan, x->command, 1) != GF_OK;
@@ -294,10 +315,39 @@ chan_confirmed (void *user, uint32_t id)
 static int
 chan_failed (void *user, uint32_t id, uint32_t reason, gf_slice text)
 {
-  (void) user;
   (void) id;
+  ((struct ctx *) user)->fsl_refused = 1;	/* Nothing more will happen.  */
   printf ("OPEN FAILED %u %.*s\n", (unsigned) reason, (int) text.len,
           (const char *) text.data);
+  return 0;
+}
+
+static int
+chan_open (void *user, const gf_chan_open *o)
+{
+  struct ctx *x = user;
+
+  if (x->fsl_path && o->type == GF_CHAN_FORWARDED_STREAMLOCAL)
+    {
+      printf ("FORWARDED-STREAMLOCAL %.*s\n", (int) o->path.len,
+              (const char *) o->path.data);
+      return gf_session_channel_accept (x->s, o->id, 0, 0) != GF_OK;
+    }
+  return gf_session_channel_reject (x->s, o->id,
+                                    GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                                    "not expected") != GF_OK;
+}
+
+static int
+global_reply (void *user, int ok, uint32_t port)
+{
+  struct ctx *x = user;
+
+  (void) port;
+  printf ("STREAMLOCAL-FORWARD %s\n", ok ? "OK" : "REFUSED");
+  fflush (stdout);
+  if (!ok)
+    x->fsl_refused = 1;
   return 0;
 }
 
@@ -345,6 +395,27 @@ chan_data (void *user, uint32_t id, const uint8_t *d, size_t n)
   struct ctx *x = user;
   size_t i;
 
+  if (x->fsl_path)
+    {
+      /* A connection to the socket the server listens on: echo it.  */
+      if (gf_chans_send_data (x->chans, id, d, n) < 0)
+        return 1;
+      return gf_chans_consumed (x->chans, id, n) != GF_OK;
+    }
+  if (x->dsl_path)
+    {
+      for (i = 0; i < n && x->outn < sizeof x->out - 1; i++)
+        x->out[x->outn++] = (char) d[i];
+      x->out[x->outn] = '\0';
+      if (gf_chans_consumed (x->chans, id, n) != GF_OK)
+        return 1;
+      if (strchr (x->out, '\n') != NULL)
+        {
+          printf ("STREAMLOCAL-ECHO %s", x->out);
+          return gf_chans_close (x->chans, id) != GF_OK;
+        }
+      return 0;
+    }
   for (i = 0; i < n; i++)
     {
       if (x->check_pattern && d[i] != pattern_at (x->received + i))
@@ -849,6 +920,8 @@ finished (void *user)
     return x->service;
   if (x->auth_failed)
     return 1;
+  if (x->dsl_path || x->fsl_path)
+    return x->chan_closed || x->fsl_refused;
   if (x->sftp_script)
     {
       if (x->sftp_done && !x->chan_closed && x->opened)
@@ -926,6 +999,10 @@ main (int argc, char **argv)
         x.command = argv[++i];
       else if (strcmp (argv[i], "--sftp") == 0 && i + 1 < argc)
         x.sftp_script = argv[++i];
+      else if (strcmp (argv[i], "--direct-streamlocal") == 0 && i + 1 < argc)
+        x.dsl_path = argv[++i];
+      else if (strcmp (argv[i], "--streamlocal-forward") == 0 && i + 1 < argc)
+        x.fsl_path = argv[++i];
       else if (strcmp (argv[i], "--send") == 0 && i + 1 < argc)
         x.send_total = strtoull (argv[++i], NULL, 10);
       else if (strcmp (argv[i], "--check-pattern") == 0)
@@ -1039,6 +1116,8 @@ main (int argc, char **argv)
   ev.auth_kbdint = x.kbd_answer ? auth_kbdint : NULL;
   ev.authenticated = auth_ok;
   ev.auth_failed = auth_failed;
+  ev.channel_open = chan_open;
+  ev.global_reply = global_reply;
   ev.channel_confirmed = chan_confirmed;
   ev.channel_failed = chan_failed;
   ev.channel_request_reply = chan_reply;

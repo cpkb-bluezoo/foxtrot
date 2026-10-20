@@ -190,7 +190,7 @@ act (struct ctx *c, uint8_t what)
   uint8_t buf[300];
 
   memset (buf, 'x', sizeof buf);
-  switch (what % 9)
+  switch (what % 12)
     {
     case 0:
       break;
@@ -219,6 +219,28 @@ act (struct ctx *c, uint8_t what)
       break;
     case 7:
       (void) gf_chans_request_tcpip_forward (c->m, "0.0.0.0", 0);
+      break;
+    case 8:
+      {
+        uint32_t nid;
+
+        if (gf_chans_open_direct_streamlocal (c->m, &nid, "/run/x.sock", 0, 0) == GF_OK
+            && c->nids < 8)
+          c->ids[c->nids++] = nid;
+      }
+      break;
+    case 9:
+      (void) gf_chans_request_streamlocal_forward (c->m, "/tmp/l.sock");
+      break;
+    case 10:
+      {
+        uint32_t nid;
+
+        if (gf_chans_open_forwarded_streamlocal (c->m, &nid, "/tmp/f.sock", 0, 0) == GF_OK
+            && c->nids < 8)
+          c->ids[c->nids++] = nid;
+      }
+      (void) gf_chans_request_cancel_streamlocal_forward (c->m, "/tmp/l.sock");
       break;
     default:
       (void) gf_chans_send_extended (c->m, id, 1, buf, 50);

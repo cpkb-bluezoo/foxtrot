@@ -394,7 +394,8 @@ w_global (void *u, const gf_global_request *r)
   if (!r->want_reply)
     return 0;
   return gf_chans_global_reply (gf_session_channels (x->s), !x->deny_global,
-                                r->port == 0 ? 7000 : 0) != GF_OK;
+                                r->type == GF_GLOBAL_TCPIP_FORWARD
+                                && r->port == 0 ? 7000 : 0) != GF_OK;
 }
 
 static int
@@ -1604,6 +1605,24 @@ test_cert_permissions (void)
       CHECK_EQ (gf_chans_request_cancel_tcpip_forward (ch, "0.0.0.0", 8080), GF_OK);
       pump (&w, 0);
       CHECK_EQ (w.sv.global_requests - globals, v[i].fwd);
+      /* Unix sockets are forwarding too.  */
+      opens = w.sv.opens;
+      w.c.failed = 0;
+      CHECK_EQ (gf_chans_open_direct_streamlocal (ch, &b, "/run/x.sock", 0, 0), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.opens - opens, v[i].fwd);
+      CHECK_EQ (w.c.failed, !v[i].fwd);
+      if (!v[i].fwd)
+        CHECK_EQ (w.c.fail_reason, GF_OPEN_ADMINISTRATIVELY_PROHIBITED);
+      globals = w.sv.global_requests;
+      CHECK_EQ (gf_chans_request_streamlocal_forward (ch, "/tmp/l.sock"), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.global_requests - globals, v[i].fwd);
+      CHECK_EQ (w.c.global_ok, v[i].fwd);
+      globals = w.sv.global_requests;
+      CHECK_EQ (gf_chans_request_cancel_streamlocal_forward (ch, "/tmp/l.sock"), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.global_requests - globals, v[i].fwd);
       /* Sessions themselves are not forwarding.  */
       CHECK_EQ (gf_chans_open_session (ch, &a, 0, 0), GF_OK);
       pump (&w, 0);
@@ -1675,6 +1694,13 @@ test_restrict (void)
   CHECK_EQ (w.sv.opens, opens);
   globals = w.sv.global_requests;
   CHECK_EQ (gf_chans_request_tcpip_forward (ch, "0.0.0.0", 8080), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.sv.global_requests, globals);
+  /* The same for sockets.  */
+  CHECK_EQ (gf_chans_open_direct_streamlocal (ch, &b, "/run/x.sock", 0, 0), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.sv.opens, opens);
+  CHECK_EQ (gf_chans_request_streamlocal_forward (ch, "/tmp/l.sock"), GF_OK);
   pump (&w, 0);
   CHECK_EQ (w.sv.global_requests, globals);
 

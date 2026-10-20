@@ -229,6 +229,55 @@ grep -q '^IDNAMES root root$' "$dir/client.out" || fail "sftp: users-groups-by-i
 # Failures are statuses.
 cli_exec --sftp "prename $x/nosuch $x/y; hardlink $x/nosuch $x/y; copydata $x/nosuch $x/y; statvfs $x/nosuch"
 [ "$(grep -c '^RESULT [a-z]* 2$' "$dir/client.out")" -ge 3 ] || { fail "sftp extension failures"; cat "$dir/client.out"; }
+# Unix socket forwarding through sshd: a channel to a socket on its side
+# (direct-streamlocal), and a socket it listens on for us
+# (streamlocal-forward), whose connections come back as
+# forwarded-streamlocal channels.
+if command -v python3 >/dev/null 2>&1; then
+  cat > "$dir/echo.py" <<'EOT'
+import os, socket, sys
+path = sys.argv[1]
+s = socket.socket(socket.AF_UNIX)
+s.bind(path)
+s.listen(1)
+open(path + ".ready", "w").close()
+c, _ = s.accept()
+while True:
+    d = c.recv(4096)
+    if not d:
+        break
+    c.sendall(d)
+EOT
+  python3 "$dir/echo.py" "$dir/sl-echo.sock" > "$dir/echo.log" 2>&1 &
+  echo_pid=$!
+  i=0; while [ $i -lt 30 ] && [ ! -e "$dir/sl-echo.sock.ready" ]; do sleep 0.1; i=$((i + 1)); done
+  cli_exec --direct-streamlocal "$dir/sl-echo.sock"
+  grep -q '^STREAMLOCAL-ECHO streamlocal ping$' "$dir/client.out" \
+    || { fail "direct-streamlocal through sshd"; cat "$dir/client.out" "$dir/echo.log"; }
+  wait "$echo_pid" 2>/dev/null
+  # A socket that is not there: the open fails and says why.
+  cli_exec --direct-streamlocal "$dir/no-such.sock"
+  grep -q '^OPEN FAILED' "$dir/client.out" || fail "direct-streamlocal to a missing socket"
+
+  "$CLIENT" "$port" --user "$user" --key "$dir/uk_ed25519" \
+    --streamlocal-forward "$dir/sl-fwd.sock" > "$dir/fsl.out" 2>&1 &
+  fsl_pid=$!
+  i=0; while [ $i -lt 50 ] && [ ! -S "$dir/sl-fwd.sock" ]; do sleep 0.1; i=$((i + 1)); done
+  python3 - "$dir/sl-fwd.sock" > "$dir/fsl.py.out" 2>&1 <<'EOT'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall(b"through sshd\n")
+print(s.recv(4096).decode().strip())
+s.close()
+EOT
+  wait "$fsl_pid" 2>/dev/null
+  grep -q '^through sshd$' "$dir/fsl.py.out" \
+    && grep -q '^STREAMLOCAL-FORWARD OK$' "$dir/fsl.out" \
+    && grep -q "^FORWARDED-STREAMLOCAL $dir/sl-fwd.sock\$" "$dir/fsl.out" \
+    || { fail "streamlocal-forward through sshd"; cat "$dir/fsl.py.out" "$dir/fsl.out"; }
+fi
 # Keys alone offer nothing sshd (password and k-i off) would take.
 client --user "$user" --password hunter2 && fail "client authenticated with a password sshd does not take"
 
@@ -711,6 +760,73 @@ EOT
   sleep 0.3
   grep -q '^FORWARD echo.example 7$' "$dir/server.out" || fail "ssh -L: no direct-tcpip request"
   grep -q '^TCPIP-FORWARD localhost' "$dir/server.out" || fail "ssh -R: no tcpip-forward request"
+  kill "$server_pid" 2>/dev/null
+  wait "$server_pid" 2>/dev/null
+  server_pid=
+fi
+
+# Unix sockets with ssh -L and -R against foxtrot: a connection to the local
+# socket goes out as a direct-streamlocal channel that foxtrot echoes; and
+# for -R foxtrot, once it has granted the request, opens a
+# forwarded-streamlocal channel to which ssh connects the local socket.
+if command -v python3 >/dev/null 2>&1; then
+  cat > "$dir/target.py" <<'EOT'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen(1)
+open(sys.argv[1] + ".ready", "w").close()
+c, _ = s.accept()
+line = b""
+while not line.endswith(b"\n"):
+    d = c.recv(4096)
+    if not d:
+        break
+    line += d
+c.sendall(b"echo: " + line)
+c.close()
+EOT
+  python3 "$dir/target.py" "$dir/sl-target.sock" > "$dir/target.log" 2>&1 &
+  target_pid=$!
+  i=0; while [ $i -lt 30 ] && [ ! -e "$dir/sl-target.sock.ready" ]; do sleep 0.1; i=$((i + 1)); done
+  sport=$(pick_port)
+  "$SERVER" "$dir/hk_ed25519" "$sport" --auth-key "$dir/uk_ed25519" --streamlocal-callback \
+    > "$dir/server.out" 2>&1 &
+  server_pid=$!
+  i=0
+  while [ $i -lt 30 ] && ! grep -q READY "$dir/server.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  # shellcheck disable=SC2086
+  $SSH $sshopts -o BatchMode=yes -o ExitOnForwardFailure=yes -i "$dir/uk_ed25519" \
+    -N -L "$dir/sl-local.sock:/remote/x.sock" -R "/remote/y.sock:$dir/sl-target.sock" \
+    -p "$sport" "$user@127.0.0.1" > "$dir/slfwd.out" 2>&1 &
+  fwd_pid=$!
+  i=0; while [ $i -lt 50 ] && [ ! -S "$dir/sl-local.sock" ]; do sleep 0.1; i=$((i + 1)); done
+  python3 - "$dir/sl-local.sock" > "$dir/slfwd.py.out" 2>&1 <<'EOT'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+data = bytes(range(256)) * 2000
+s.sendall(data)
+s.shutdown(socket.SHUT_WR)
+got = b""
+while True:
+    d = s.recv(65536)
+    if not d:
+        break
+    got += d
+print("OK" if got == data else "MISMATCH")
+EOT
+  sleep 0.5
+  kill "$fwd_pid" 2>/dev/null
+  wait "$fwd_pid" 2>/dev/null
+  kill "$target_pid" 2>/dev/null
+  wait "$target_pid" 2>/dev/null
+  grep -q '^OK$' "$dir/slfwd.py.out" || { fail "ssh -L with a Unix socket through foxtrot"; cat "$dir/slfwd.py.out" "$dir/slfwd.out"; }
+  grep -q '^STREAMLOCAL /remote/x.sock$' "$dir/server.out" || fail "ssh -L socket: no direct-streamlocal channel"
+  grep -q '^STREAMLOCAL-FORWARD /remote/y.sock$' "$dir/server.out" || fail "ssh -R socket: no streamlocal-forward request"
+  grep -q '^FORWARDED-DATA echo: hello from foxtrot$' "$dir/server.out" \
+    || { fail "ssh -R socket: forwarded-streamlocal channel"; cat "$dir/server.out" "$dir/slfwd.out"; }
   kill "$server_pid" 2>/dev/null
   wait "$server_pid" 2>/dev/null
   server_pid=

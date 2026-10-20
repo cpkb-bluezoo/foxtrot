@@ -43,8 +43,9 @@
    What it refuses by itself, replying failure: X11 forwarding and agent
    forwarding (both extend the trust of the connection to other
    credentials of a machine), channel types other than session,
-   direct-tcpip and forwarded-tcpip, and requests and global requests it
-   does not know, which is also how the "keepalive@openssh.com" request is
+   direct-tcpip, forwarded-tcpip and OpenSSH's Unix socket counterparts
+   (direct-streamlocal and forwarded-streamlocal), and requests and global
+   requests it does not know, which is also how the "keepalive@openssh.com" request is
    answered.
 
    Channel numbers are the local ones: gf_chans allocates them and the
@@ -85,8 +86,13 @@ enum gf_chan_type
 {
   GF_CHAN_SESSION = 1,
   GF_CHAN_DIRECT_TCPIP,
-  GF_CHAN_FORWARDED_TCPIP
+  GF_CHAN_FORWARDED_TCPIP,
+  GF_CHAN_DIRECT_STREAMLOCAL,	/* direct-streamlocal@openssh.com */
+  GF_CHAN_FORWARDED_STREAMLOCAL	/* forwarded-streamlocal@openssh.com */
 };
+
+/* The longest Unix socket path in a message.  */
+#define GF_MAX_SOCKET_PATH 4096
 
 /* Reasons for refusing to open a channel (RFC 4254 section 5.1).  */
 enum gf_open_failure
@@ -120,6 +126,12 @@ typedef struct gf_chan_open
   uint16_t port;
   gf_slice orig_host;
   uint16_t orig_port;
+  /* direct-streamlocal: the Unix socket the peer wants us to connect to.
+     forwarded-streamlocal: the socket that was connected to on the peer.
+     Not empty and without NUL, but otherwise as the peer wrote it: a path
+     is as dangerous as a host name, and a server must decide what a user
+     may connect to (a socket such as docker's is a way to be root).  */
+  gf_slice path;
   uint32_t window, max_packet;	/* The peer's.  */
 } gf_chan_open;
 
@@ -156,7 +168,9 @@ enum gf_global_type
 {
   GF_GLOBAL_TCPIP_FORWARD = 1,		/* addr, port */
   GF_GLOBAL_CANCEL_TCPIP_FORWARD,	/* addr, port */
-  GF_GLOBAL_NO_MORE_SESSIONS		/* no-more-sessions@openssh.com */
+  GF_GLOBAL_NO_MORE_SESSIONS,		/* no-more-sessions@openssh.com */
+  GF_GLOBAL_STREAMLOCAL_FORWARD,	/* path: streamlocal-forward@openssh.com */
+  GF_GLOBAL_CANCEL_STREAMLOCAL_FORWARD	/* path */
 };
 
 typedef struct gf_global_request
@@ -165,6 +179,8 @@ typedef struct gf_global_request
   int want_reply;		/* Answer with gf_chans_global_reply.  */
   gf_slice addr;
   uint32_t port;
+  gf_slice path;		/* The streamlocal requests: the socket to
+				   listen on, or to stop listening on.  */
 } gf_global_request;
 
 typedef struct gf_chans_events
@@ -239,6 +255,16 @@ int gf_chans_open_forwarded_tcpip (gf_chans *m, uint32_t *id,
                                    const char *orig_host, uint16_t orig_port,
                                    uint32_t window, uint32_t max_packet);
 
+/* The Unix socket versions (OpenSSH's PROTOCOL): ask the peer to connect to
+   the socket PATH on its side (direct), or tell it that a connection came
+   to the socket PATH that it asked us to listen on (forwarded).  */
+int gf_chans_open_direct_streamlocal (gf_chans *m, uint32_t *id,
+                                      const char *path, uint32_t window,
+                                      uint32_t max_packet);
+int gf_chans_open_forwarded_streamlocal (gf_chans *m, uint32_t *id,
+                                         const char *path, uint32_t window,
+                                         uint32_t max_packet);
+
 /* Answer an open_request.  */
 int gf_chans_open_accept (gf_chans *m, uint32_t id, uint32_t window,
                           uint32_t max_packet);
@@ -303,6 +329,11 @@ int gf_chans_request_tcpip_forward (gf_chans *m, const char *addr,
                                     uint32_t port);
 int gf_chans_request_cancel_tcpip_forward (gf_chans *m, const char *addr,
                                            uint32_t port);
+/* Ask the peer to listen on the Unix socket PATH on its side and send
+   forwarded-streamlocal channels for the connections it gets, or to stop.
+   The answer is a global reply.  */
+int gf_chans_request_streamlocal_forward (gf_chans *m, const char *path);
+int gf_chans_request_cancel_streamlocal_forward (gf_chans *m, const char *path);
 int gf_chans_request_no_more_sessions (gf_chans *m);
 /* Answer the oldest global request that asked for a reply.  PORT is the
    port bound, for a tcpip-forward of port 0.  */

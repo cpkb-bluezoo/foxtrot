@@ -26,3 +26,5 @@ foxtrot NEWS - history of user-visible changes.
 ** Certificates can be made (gf_cert_sign, gf_cert_spec): user and host certificates, signed by CAs of each kind, accepted by sshd and ssh.
 ** SFTP extensions (sftp.h): posix-rename, statvfs, fstatvfs, hardlink, fsync, lsetstat, limits, expand-path, copy-data and users-groups-by-id, typed for client and server, advertised in VERSION, checked both ways; tested against OpenSSH's sftp-server, sftp and scp.
 ** gf_sftp_server_config has two more members (extensions, nextensions).
+** Unix socket forwarding (OpenSSH's streamlocal): direct-streamlocal and forwarded-streamlocal channels, streamlocal-forward and its cancel; the session enforces permit-port-forwarding for them, and gf_authkey_permits_open_path and _listen_path say whether a line allows sockets.
+** gf_chan_open and gf_global_request have a path member; enums gf_chan_type and gf_global_type have new values at the end.

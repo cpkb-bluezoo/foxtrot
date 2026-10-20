@@ -96,7 +96,7 @@ never touches:
                       are our side), through key exchange, public key
                       (also host-bound), password and keyboard-interactive
                       authentication, commands, bulk transfers with
-                      rekeying, port forwarding and SFTP, with its
+                      rekeying, port forwarding (TCP and Unix sockets) and SFTP, with its
                       extensions (against sshd's sftp-server, and sftp and
                       scp against foxtrot's); needs ssh, sftp, scp,
                       ssh-keygen and sshd (python3 for the forwarding

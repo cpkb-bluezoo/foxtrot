@@ -216,16 +216,18 @@ const char *gf_session_force_command (const gf_session *s);
 /* A server: does the user's certificate permit PERMISSION (one of the
    GF_CERT_PERMIT_* names of key.h)?  1 for a user who did not use a
    certificate, who is not restricted by one.  The session itself refuses a
-   pty request without "permit-pty", and a direct-tcpip channel or a
-   tcpip-forward request without "permit-port-forwarding", before the
-   application is asked; agent and X11 forwarding are never offered.  The
+   pty request without "permit-pty", and a direct-tcpip or
+   direct-streamlocal channel or a tcpip-forward or streamlocal-forward
+   request without "permit-port-forwarding", before the application is
+   asked; agent and X11 forwarding are never offered.  The
    rest, "permit-user-rc" (whether to run ~/.ssh/rc) among them, is the
    application's to ask here.  */
 int gf_session_permits (const gf_session *s, const char *permission);
 
 /* A server: take PERMISSION (one of the GF_CERT_PERMIT_* names of key.h)
    away from the user, whatever their certificate says, for the pty request,
-   direct-tcpip channels and tcpip-forward requests the session refuses
+   direct-tcpip and direct-streamlocal channels and tcpip-forward and
+   streamlocal-forward requests the session refuses
    itself and for gf_session_permits.  For what an authorized_keys line says
    (authkeys.h): call it for each permission gf_authkey_permits denies.
    GF_ERR_INVAL for a name that is not one of the five, or for a client.  */

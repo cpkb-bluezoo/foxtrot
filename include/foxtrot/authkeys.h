@@ -157,6 +157,17 @@ int gf_authkey_permits_open (const gf_authkey_match *m, const char *host,
 int gf_authkey_permits_listen (const gf_authkey_match *m, const char *host,
                                unsigned port);
 
+/* May the user be given a direct-streamlocal channel to a Unix socket, or
+   listen on one (streamlocal-forward)?  A path cannot be named by
+   permitopen or permitlisten, which OpenSSH leaves to the permission of
+   port forwarding (gf_authkey_permits), but a user who was restricted to
+   some hosts and ports should not get at any socket of the machine
+   either: so these are 1 only for a line with no permitopen (open) or no
+   permitlisten (listen).  A server also asks gf_authkey_permits for
+   "permit-port-forwarding", and decides which paths it allows.  */
+int gf_authkey_permits_open_path (const gf_authkey_match *m);
+int gf_authkey_permits_listen_path (const gf_authkey_match *m);
+
 /* The values of a repeated option of the line, in order: start with
    *POS = 0; each call returns 1 and sets ITEM (not NUL-terminated; valid
    while the table is), or 0 at the end.  */

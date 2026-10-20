@@ -306,7 +306,7 @@ ch_open_request (void *user, const gf_chan_open *o)
 
   /* Forwarding that the user's certificate does not allow is refused without
      the application hearing of it.  */
-  if (o->type == GF_CHAN_DIRECT_TCPIP
+  if ((o->type == GF_CHAN_DIRECT_TCPIP || o->type == GF_CHAN_DIRECT_STREAMLOCAL)
       && !permitted (s, GF_CERT_PERMIT_PORT_FORWARDING))
     return gf_chans_open_reject (s->ch, o->id,
                                  GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
@@ -511,7 +511,9 @@ ch_global_request (void *user, const gf_global_request *r)
       return r->want_reply ? gf_chans_global_reply (s->ch, 1, 0) != GF_OK : 0;
     }
   if ((r->type == GF_GLOBAL_TCPIP_FORWARD
-       || r->type == GF_GLOBAL_CANCEL_TCPIP_FORWARD)
+       || r->type == GF_GLOBAL_CANCEL_TCPIP_FORWARD
+       || r->type == GF_GLOBAL_STREAMLOCAL_FORWARD
+       || r->type == GF_GLOBAL_CANCEL_STREAMLOCAL_FORWARD)
       && !permitted (s, GF_CERT_PERMIT_PORT_FORWARDING))
     return r->want_reply ? gf_chans_global_reply (s->ch, 0, 0) != GF_OK : 0;
   if (s->ev.global_request)

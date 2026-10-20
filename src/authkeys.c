@@ -847,6 +847,22 @@ gf_authkey_permits_listen (const gf_authkey_match *m, const char *host,
 }
 
 int
+gf_authkey_permits_open_path (const gf_authkey_match *m)
+{
+  if (m == NULL || m->entry == NULL)
+    return 0;
+  return ((const struct entry *) m->entry)->open.n == 0;
+}
+
+int
+gf_authkey_permits_listen_path (const gf_authkey_match *m)
+{
+  if (m == NULL || m->entry == NULL)
+    return 0;
+  return ((const struct entry *) m->entry)->listen.n == 0;
+}
+
+int
 gf_authkey_next (const gf_authkey_match *m, enum gf_authkey_list which,
                  size_t *pos, gf_slice *item)
 {

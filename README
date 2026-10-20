@@ -56,8 +56,8 @@ Pre-alpha.  What exists today:
             server; interoperating with OpenSSH 9.6
 
   chan      the connection protocol (RFC 4254): channels with strict flow
-            control, session requests, TCP forwarding; interoperating with
-            OpenSSH 9.6
+            control, session requests, TCP and Unix socket forwarding;
+            interoperating with OpenSSH 9.6
   sftp      SFTP version 3, client and server, over a channel, with OpenSSH's
             extensions (posix-rename, statvfs, hardlink, fsync, lsetstat,
             limits, expand-path, copy-data, users-groups-by-id);

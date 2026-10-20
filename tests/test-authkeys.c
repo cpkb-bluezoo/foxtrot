@@ -596,6 +596,26 @@ test_forwarding_lists (void)
   CHECK_EQ (gf_authkey_permits_open (&m, "x", 1), 1);
   gf_authkeys_free (t);
   CHECK_EQ (gf_authkey_permits_open (NULL, "x", 1), 0);
+
+  /* A socket path cannot be named by either list: any list shuts sockets
+     out of its direction.  */
+  t = table (line (f, sizeof f, "", ptext (vec_ed_private)), NULL);
+  CHECK_EQ (accepts (t, ed, "a", ADDR, NULL, NOW, &m), 1);
+  CHECK_EQ (gf_authkey_permits_open_path (&m), 1);
+  CHECK_EQ (gf_authkey_permits_listen_path (&m), 1);
+  gf_authkeys_free (t);
+  t = table (line (f, sizeof f, "permitopen=\"none\"", ptext (vec_ed_private)), NULL);
+  CHECK_EQ (accepts (t, ed, "a", ADDR, NULL, NOW, &m), 1);
+  CHECK_EQ (gf_authkey_permits_open_path (&m), 0);
+  CHECK_EQ (gf_authkey_permits_listen_path (&m), 1);
+  gf_authkeys_free (t);
+  t = table (line (f, sizeof f, "permitlisten=\"8080\"", ptext (vec_ed_private)), NULL);
+  CHECK_EQ (accepts (t, ed, "a", ADDR, NULL, NOW, &m), 1);
+  CHECK_EQ (gf_authkey_permits_open_path (&m), 1);
+  CHECK_EQ (gf_authkey_permits_listen_path (&m), 0);
+  gf_authkeys_free (t);
+  CHECK_EQ (gf_authkey_permits_open_path (NULL), 0);
+  CHECK_EQ (gf_authkey_permits_listen_path (NULL), 0);
   (void) l;
   gf_key_free (ed);
 }

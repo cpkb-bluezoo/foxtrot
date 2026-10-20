@@ -21,6 +21,7 @@
      interop-server HOSTKEY PORT [--auth-key PRIVATEKEY] [--password PW]
                                  [--code CODE] [--hostbound]
                                  [--rekey-bytes N] [--sftp-root DIR]
+                                 [--streamlocal-callback]
                                  [--ca-key PUBFILE] [--host-cert CERTFILE]
 
    HOSTKEY is an unencrypted OpenSSH private key file.  The server accepts
@@ -45,7 +46,13 @@
    the "sftp" subsystem, serving the directory given with --sftp-root
    (paths are confined to it lexically; this is a test program, not a model
    of a file server), and direct-tcpip channels, which it simply echoes (so that ssh -L can be
-   tried without a network); tcpip-forward requests are granted.  On
+   tried without a network) and direct-streamlocal ones (the same, for
+   ssh -L with a Unix socket: "STREAMLOCAL path"); tcpip-forward and
+   streamlocal-forward requests are granted ("STREAMLOCAL-FORWARD path"), and
+   with --streamlocal-callback a granted streamlocal-forward is followed by a
+   forwarded-streamlocal channel to the client, on which "hello from
+   foxtrot" is sent and the first line the client's socket answers is
+   printed as "FORWARDED-DATA line".  On
    standard output, "HOSTKEY SHA256:..." is the fingerprint to expect, "READY" says
    the port is listening, "KEX ..." and "CLIENT ..." say what was
    negotiated and who the peer is, and "AUTH OK user method" or "AUTH
@@ -84,6 +91,12 @@ struct ctx
   /* The one channel being served.  */
   uint32_t chan;
   int active, tcpip;
+  /* With --streamlocal-callback: the channel we open to the client when it
+     asks us to listen on a Unix socket, and what it says on it.  */
+  int sl_callback, fchan_open;
+  uint32_t fchan;
+  char fbuf[256];
+  size_t fn;
   enum { M_NONE, M_TRUE, M_CAT, M_BYTES, M_ECHO, M_SFTP } mode;
   uint32_t exit_status;
   uint64_t bytes_left, produced;
@@ -801,6 +814,13 @@ chan_open_request (void *user, const gf_chan_open *o)
       x->mode = M_ECHO;
       x->tcpip = 1;
     }
+  else if (o->type == GF_CHAN_DIRECT_STREAMLOCAL)
+    {
+      printf ("STREAMLOCAL %.*s\n", (int) o->path.len, (const char *) o->path.data);
+      fflush (stdout);
+      x->mode = M_ECHO;
+      x->tcpip = 1;
+    }
   else if (o->type != GF_CHAN_SESSION)
     return gf_session_channel_reject (x->s, o->id,
                                       GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
@@ -921,6 +941,24 @@ chan_data (void *user, uint32_t id, const uint8_t *d, size_t n)
 {
   struct ctx *x = user;
 
+  if (x->fchan_open && id == x->fchan)
+    {
+      /* What the client's local socket said on a channel we opened.  */
+      size_t i;
+
+      for (i = 0; i < n && x->fn < sizeof x->fbuf - 1; i++)
+        x->fbuf[x->fn++] = (char) d[i];
+      x->fbuf[x->fn] = '\0';
+      if (strchr (x->fbuf, '\n') != NULL)
+        {
+          printf ("FORWARDED-DATA %s", x->fbuf);
+          fflush (stdout);
+          if (gf_chans_consumed (x->chans, id, n) != GF_OK)
+            return 1;
+          return gf_chans_close (x->chans, id) != GF_OK;
+        }
+      return gf_chans_consumed (x->chans, id, n) != GF_OK;
+    }
   if ((x->mode == M_CAT || x->mode == M_ECHO) && out_add (x, d, n))
     return 1;
   return gf_chans_consumed (x->chans, id, n) != GF_OK;
@@ -956,12 +994,46 @@ chan_closed (void *user, uint32_t id)
 {
   struct ctx *x = user;
 
-  (void) id;
+  if (x->fchan_open && id == x->fchan)
+    {
+      x->fchan_open = 0;
+      printf ("FORWARDED CLOSED\n");
+      fflush (stdout);
+      return 0;
+    }
   x->active = 0;
   x->sftp = NULL;			/* The session freed it.  */
   memset (x->handles, 0, sizeof x->handles);
   printf ("CHANNEL CLOSED\n");
   fflush (stdout);
+  return 0;
+}
+
+static int
+chan_confirmed (void *user, uint32_t id)
+{
+  struct ctx *x = user;
+  static const uint8_t hello[] = "hello from foxtrot\n";
+
+  if (!x->fchan_open || id != x->fchan)
+    return 0;
+  printf ("FORWARDED OPEN\n");
+  fflush (stdout);
+  return gf_chans_send_data (x->chans, id, hello, sizeof hello - 1) < 0;
+}
+
+static int
+chan_failed (void *user, uint32_t id, uint32_t reason, gf_slice text)
+{
+  struct ctx *x = user;
+
+  (void) reason;
+  if (x->fchan_open && id == x->fchan)
+    {
+      x->fchan_open = 0;
+      printf ("FORWARDED FAILED %.*s\n", (int) text.len, (const char *) text.data);
+      fflush (stdout);
+    }
   return 0;
 }
 
@@ -976,9 +1048,35 @@ chan_global (void *user, const gf_global_request *r)
               (const char *) r->addr.data, (unsigned) r->port);
       fflush (stdout);
     }
+  if (r->type == GF_GLOBAL_STREAMLOCAL_FORWARD
+      || r->type == GF_GLOBAL_CANCEL_STREAMLOCAL_FORWARD)
+    {
+      char path[GF_MAX_SOCKET_PATH + 1];
+
+      snprintf (path, sizeof path, "%.*s", (int) r->path.len,
+                (const char *) r->path.data);
+      printf ("%s %s\n", r->type == GF_GLOBAL_STREAMLOCAL_FORWARD
+              ? "STREAMLOCAL-FORWARD" : "CANCEL-STREAMLOCAL-FORWARD", path);
+      fflush (stdout);
+      if (r->want_reply && gf_chans_global_reply (x->chans, 1, 0) != GF_OK)
+        return 1;
+      /* A connection to the socket, as if one came: tell the client.  */
+      if (r->type == GF_GLOBAL_STREAMLOCAL_FORWARD && x->sl_callback
+          && !x->fchan_open)
+        {
+          if (gf_chans_open_forwarded_streamlocal (x->chans, &x->fchan, path,
+                                                   0, 0) != GF_OK)
+            return 1;
+          x->fchan_open = 1;
+          x->fn = 0;
+        }
+      return 0;
+    }
   if (!r->want_reply)
     return 0;
-  return gf_chans_global_reply (x->chans, 1, r->port == 0 ? 40000 : 0) != GF_OK;
+  return gf_chans_global_reply (x->chans, 1,
+                                r->type == GF_GLOBAL_TCPIP_FORWARD
+                                && r->port == 0 ? 40000 : 0) != GF_OK;
 }
 
 static gf_key *
@@ -1041,6 +1139,8 @@ main (int argc, char **argv)
         hostbound = 1;
       else if (strcmp (argv[i], "--rekey-bytes") == 0 && i + 1 < argc)
         rekey_bytes = strtoull (argv[++i], NULL, 10);
+      else if (strcmp (argv[i], "--streamlocal-callback") == 0)
+        x.sl_callback = 1;
       else if (strcmp (argv[i], "--sftp-root") == 0 && i + 1 < argc)
         x.sftp_root = argv[++i];
       else if (strcmp (argv[i], "--ca-key") == 0 && i + 1 < argc)
@@ -1131,6 +1231,8 @@ main (int argc, char **argv)
   ev.channel_writable = chan_writable;
   ev.channel_closed = chan_closed;
   ev.global_request = chan_global;
+  ev.channel_confirmed = chan_confirmed;
+  ev.channel_failed = chan_failed;
   ev.closed = on_closed;
   if (gf_session_server_new (&x.s, &cfg, &ev) != GF_OK
       || gf_session_start (x.s, now_us ()) != GF_OK)

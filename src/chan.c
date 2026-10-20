@@ -365,10 +365,14 @@ handle_open (gf_chans *m, gf_reader *rd)
     t = GF_CHAN_DIRECT_TCPIP;
   else if (gf_slice_equals (type, "forwarded-tcpip"))
     t = GF_CHAN_FORWARDED_TCPIP;
+  else if (gf_slice_equals (type, "direct-streamlocal@openssh.com"))
+    t = GF_CHAN_DIRECT_STREAMLOCAL;
+  else if (gf_slice_equals (type, "forwarded-streamlocal@openssh.com"))
+    t = GF_CHAN_FORWARDED_STREAMLOCAL;
   else
     return send_open_failure (m, sender, GF_OPEN_UNKNOWN_CHANNEL_TYPE,
                               "unknown channel type");
-  if (t != GF_CHAN_SESSION)
+  if (t == GF_CHAN_DIRECT_TCPIP || t == GF_CHAN_FORWARDED_TCPIP)
     {
       uint32_t port, oport;
 
@@ -380,6 +384,19 @@ handle_open (gf_chans *m, gf_reader *rd)
         return encoding_error (m);
       open.port = (uint16_t) port;
       open.orig_port = (uint16_t) oport;
+    }
+  else if (t == GF_CHAN_DIRECT_STREAMLOCAL || t == GF_CHAN_FORWARDED_STREAMLOCAL)
+    {
+      gf_slice reserved;
+      uint32_t reserved32;
+
+      /* The path, and what is reserved for the future, which is ignored.  */
+      if (gf_rd_text (rd, &open.path) != GF_OK || open.path.len == 0
+          || open.path.len > GF_MAX_SOCKET_PATH
+          || gf_rd_string (rd, &reserved) != GF_OK
+          || (t == GF_CHAN_DIRECT_STREAMLOCAL
+              && gf_rd_u32 (rd, &reserved32) != GF_OK))
+        return encoding_error (m);
     }
   if (gf_rd_finish (rd) != GF_OK || maxpkt == 0)
     return encoding_error (m);
@@ -492,6 +509,58 @@ open_out (gf_chans *m, uint32_t *id, const char *type, const char *host,
     }
   *id = c->id;
   return send_msg (m, b, w.len);
+}
+
+static int
+open_streamlocal (gf_chans *m, uint32_t *id, const char *type,
+                  const char *path, uint32_t window, uint32_t max_packet,
+                  enum gf_chan_type t)
+{
+  struct chan *c;
+  uint8_t b[GF_MAX_SOCKET_PATH + 128];
+  gf_writer w;
+
+  if (m == NULL || id == NULL || path == NULL || path[0] == '\0'
+      || strlen (path) > GF_MAX_SOCKET_PATH)
+    return GF_ERR_INVAL;
+  if (m->dead)
+    return GF_ERR_CLOSED;
+  c = alloc_chan (m);
+  if (c == NULL)
+    return GF_ERR_AGAIN;
+  c->state = CS_OPENING_OUT;
+  c->type = t;
+  c->lwin_initial = c->lwin = effective_window (window);
+  c->lmax = effective_packet (max_packet);
+  gf_writer_init (&w, b, sizeof b);
+  gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN);
+  gf_wr_cstring (&w, type);
+  gf_wr_u32 (&w, c->id);
+  gf_wr_u32 (&w, c->lwin);
+  gf_wr_u32 (&w, c->lmax);
+  gf_wr_cstring (&w, path);
+  gf_wr_cstring (&w, "");		/* Reserved.  */
+  if (t == GF_CHAN_DIRECT_STREAMLOCAL)
+    gf_wr_u32 (&w, 0);
+  *id = c->id;
+  return send_msg (m, b, w.len);
+}
+
+int
+gf_chans_open_direct_streamlocal (gf_chans *m, uint32_t *id, const char *path,
+                                  uint32_t window, uint32_t max_packet)
+{
+  return open_streamlocal (m, id, "direct-streamlocal@openssh.com", path,
+                           window, max_packet, GF_CHAN_DIRECT_STREAMLOCAL);
+}
+
+int
+gf_chans_open_forwarded_streamlocal (gf_chans *m, uint32_t *id,
+                                     const char *path, uint32_t window,
+                                     uint32_t max_packet)
+{
+  return open_streamlocal (m, id, "forwarded-streamlocal@openssh.com", path,
+                           window, max_packet, GF_CHAN_FORWARDED_STREAMLOCAL);
 }
 
 int
@@ -1234,6 +1303,15 @@ handle_global_request (gf_chans *m, gf_reader *rd)
           || rq.addr.len > MAX_HOST)
         return encoding_error (m);
     }
+  else if (gf_slice_equals (name, "streamlocal-forward@openssh.com")
+           || gf_slice_equals (name, "cancel-streamlocal-forward@openssh.com"))
+    {
+      rq.type = gf_slice_equals (name, "streamlocal-forward@openssh.com")
+        ? GF_GLOBAL_STREAMLOCAL_FORWARD : GF_GLOBAL_CANCEL_STREAMLOCAL_FORWARD;
+      if (gf_rd_text (rd, &rq.path) != GF_OK || gf_rd_finish (rd) != GF_OK
+          || rq.path.len == 0 || rq.path.len > GF_MAX_SOCKET_PATH)
+        return encoding_error (m);
+    }
   else if (gf_slice_equals (name, "no-more-sessions@openssh.com"))
     {
       rq.type = GF_GLOBAL_NO_MORE_SESSIONS;
@@ -1326,6 +1404,40 @@ gf_chans_request_cancel_tcpip_forward (gf_chans *m, const char *addr,
                                        uint32_t port)
 {
   return send_global (m, "cancel-tcpip-forward", addr, port, 1, 0);
+}
+
+static int
+send_global_path (gf_chans *m, const char *name, const char *path)
+{
+  uint8_t b[GF_MAX_SOCKET_PATH + 128];
+  gf_writer w;
+
+  if (m == NULL || m->dead)
+    return m ? GF_ERR_CLOSED : GF_ERR_INVAL;
+  if (path == NULL || path[0] == '\0' || strlen (path) > GF_MAX_SOCKET_PATH)
+    return GF_ERR_INVAL;
+  if (m->gout >= m->cfg.max_requests)
+    return GF_ERR_AGAIN;
+  gf_writer_init (&w, b, sizeof b);
+  gf_wr_u8 (&w, GF_MSG_GLOBAL_REQUEST);
+  gf_wr_cstring (&w, name);
+  gf_wr_bool (&w, 1);
+  gf_wr_cstring (&w, path);
+  m->gout_wants_port &= ~(UINT64_C (1) << m->gout);
+  m->gout++;
+  return send_msg (m, b, w.len);
+}
+
+int
+gf_chans_request_streamlocal_forward (gf_chans *m, const char *path)
+{
+  return send_global_path (m, "streamlocal-forward@openssh.com", path);
+}
+
+int
+gf_chans_request_cancel_streamlocal_forward (gf_chans *m, const char *path)
+{
+  return send_global_path (m, "cancel-streamlocal-forward@openssh.com", path);
 }
 
 int

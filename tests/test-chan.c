@@ -34,6 +34,8 @@
 
 #define MAXREQ 32
 
+static void slice_str (char *out, size_t cap, gf_slice s);
+
 struct reqlog
 {
   enum gf_req_type type;
@@ -59,6 +61,7 @@ struct node
   uint32_t fail_reason, last_open_id, closed_id;
   gf_chan_open open;
   char host[64], orig[64];
+  char path[GF_MAX_SOCKET_PATH + 8];
   uint32_t accept_window, accept_packet;
   uint8_t *rx;
   size_t rxn, rxcap, rx_err;
@@ -69,7 +72,7 @@ struct node
   int replies[MAXREQ];
   size_t nreplies;
   int answer_now;		/* Answer requests at once with success.  */
-  struct { gf_global_request r; char addr[64]; } globals[MAXREQ];
+  struct { gf_global_request r; char addr[64]; char path[GF_MAX_SOCKET_PATH + 8]; } globals[MAXREQ];
   size_t nglobals;
   int global_replies[MAXREQ];
   uint32_t global_ports[MAXREQ];
@@ -113,8 +116,10 @@ n_open_request (void *user, const gf_chan_open *o)
             (const char *) o->host.data);
   snprintf (x->orig, sizeof x->orig, "%.*s", (int) o->orig_host.len,
             (const char *) o->orig_host.data);
+  slice_str (x->path, sizeof x->path, o->path);
   x->open.host.data = (const uint8_t *) x->host;
   x->open.orig_host.data = (const uint8_t *) x->orig;
+  x->open.path.data = (const uint8_t *) x->path;
   if (x->auto_accept)
     return gf_chans_open_accept (x->m, o->id, x->accept_window,
                                  x->accept_packet) != GF_OK;
@@ -252,6 +257,8 @@ n_global (void *user, const gf_global_request *r)
     return 1;
   x->globals[x->nglobals].r = *r;
   slice_str (x->globals[x->nglobals].addr, 64, r->addr);
+  slice_str (x->globals[x->nglobals].path, sizeof x->globals[0].path, r->path);
+  x->globals[x->nglobals].r.path.data = (const uint8_t *) x->globals[x->nglobals].path;
   x->nglobals++;
   return 0;
 }
@@ -1282,6 +1289,185 @@ test_open_types_and_limits (void)
 }
 
 static void
+test_streamlocal (void)
+{
+  struct net n;
+  uint32_t id, id2, i;
+  uint8_t m[GF_MAX_SOCKET_PATH + 256];
+  gf_writer w;
+  static char longpath[GF_MAX_SOCKET_PATH + 2];
+
+  /* The two kinds of channel carry their paths; the request carries its.  */
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, "/run/app.sock", 0, 0), GF_OK);
+  CHECK_EQ (gf_chans_open_forwarded_streamlocal (n.a.m, &id2, "/tmp/fwd.sock", 0, 0), GF_OK);
+  CHECK_EQ (gf_chans_request_streamlocal_forward (n.a.m, "/tmp/listen.sock"), GF_OK);
+  CHECK_EQ (gf_chans_request_cancel_streamlocal_forward (n.a.m, "/tmp/listen.sock"), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.b.open_requests, 2);
+  CHECK_EQ (n.a.confirmed, 2);
+  CHECK_EQ (n.b.open.type, GF_CHAN_FORWARDED_STREAMLOCAL);
+  CHECK (strcmp (n.b.path, "/tmp/fwd.sock") == 0);
+  CHECK_EQ (n.b.open.host.len, 0);
+  CHECK_EQ (n.b.nglobals, 2);
+  CHECK_EQ (n.b.globals[0].r.type, GF_GLOBAL_STREAMLOCAL_FORWARD);
+  CHECK (strcmp (n.b.globals[0].path, "/tmp/listen.sock") == 0 && n.b.globals[0].r.want_reply);
+  CHECK_EQ (n.b.globals[1].r.type, GF_GLOBAL_CANCEL_STREAMLOCAL_FORWARD);
+  CHECK_EQ (gf_chans_global_reply (n.b.m, 1, 0), GF_OK);
+  CHECK_EQ (gf_chans_global_reply (n.b.m, 0, 0), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.a.ngreplies, 2);
+  CHECK (n.a.global_replies[0] && !n.a.global_replies[1]);
+  CHECK_EQ (n.a.global_ports[0], 0);
+  CHECK_EQ (n.a.disconnect + n.b.disconnect, 0);
+  /* The first one's type, seen by looking at the first open again.  */
+  net_free (&n);
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  n.b.auto_accept = 0;
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, "/run/app.sock", 0, 0), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.b.open.type, GF_CHAN_DIRECT_STREAMLOCAL);
+  CHECK (strcmp (n.b.path, "/run/app.sock") == 0);
+  /* A refusal is an open failure like any other.  */
+  CHECK_EQ (gf_chans_open_reject (n.b.m, n.b.last_open_id,
+                                  GF_OPEN_ADMINISTRATIVELY_PROHIBITED, "no"), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.a.failed, 1);
+  net_free (&n);
+
+  /* Arguments.  */
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  memset (longpath, 'a', sizeof longpath);
+  longpath[GF_MAX_SOCKET_PATH + 1] = '\0';
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, NULL, 0, 0), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, "", 0, 0), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, longpath, 0, 0), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, NULL, "/x", 0, 0), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_open_forwarded_streamlocal (n.a.m, &id, "", 0, 0), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_request_streamlocal_forward (n.a.m, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_request_streamlocal_forward (n.a.m, ""), GF_ERR_INVAL);
+  CHECK_EQ (gf_chans_request_cancel_streamlocal_forward (n.a.m, longpath), GF_ERR_INVAL);
+  longpath[GF_MAX_SOCKET_PATH] = '\0';
+  CHECK_EQ (gf_chans_open_direct_streamlocal (n.a.m, &id, longpath, 0, 0), GF_OK);
+  CHECK_EQ (gf_chans_request_streamlocal_forward (n.a.m, longpath), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.b.open.path.len, GF_MAX_SOCKET_PATH);
+  CHECK_EQ (n.b.nglobals, 1);
+  net_free (&n);
+
+  /* Malformed from the peer: each ends the connection.  */
+  for (i = 0; i < 10; i++)
+    {
+      net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+      gf_writer_init (&w, m, sizeof m);
+      switch (i)
+        {
+        case 0:		/* direct: no path at all.  */
+        case 1:		/* direct: an empty path.  */
+        case 2:		/* direct: a NUL in the path.  */
+        case 3:		/* direct: the reserved fields missing.  */
+        case 4:		/* direct: bytes after.  */
+          gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN);
+          gf_wr_cstring (&w, "direct-streamlocal@openssh.com");
+          gf_wr_u32 (&w, 5);
+          gf_wr_u32 (&w, 1000);
+          gf_wr_u32 (&w, 500);
+          if (i == 1)
+            {
+              gf_wr_cstring (&w, "");
+              gf_wr_cstring (&w, "");
+              gf_wr_u32 (&w, 0);
+            }
+          else if (i == 2)
+            {
+              gf_wr_string (&w, "a\0b", 3);
+              gf_wr_cstring (&w, "");
+              gf_wr_u32 (&w, 0);
+            }
+          else if (i == 3)
+            gf_wr_cstring (&w, "/x");
+          else if (i == 4)
+            {
+              gf_wr_cstring (&w, "/x");
+              gf_wr_cstring (&w, "");
+              gf_wr_u32 (&w, 0);
+              gf_wr_u8 (&w, 0);
+            }
+          break;
+        case 5:		/* forwarded: path alone.  */
+          gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN);
+          gf_wr_cstring (&w, "forwarded-streamlocal@openssh.com");
+          gf_wr_u32 (&w, 5);
+          gf_wr_u32 (&w, 1000);
+          gf_wr_u32 (&w, 500);
+          gf_wr_cstring (&w, "/x");
+          break;
+        case 6:		/* global: no path.  */
+          gf_wr_u8 (&w, GF_MSG_GLOBAL_REQUEST);
+          gf_wr_cstring (&w, "streamlocal-forward@openssh.com");
+          gf_wr_bool (&w, 1);
+          break;
+        case 7:		/* global: empty path.  */
+          gf_wr_u8 (&w, GF_MSG_GLOBAL_REQUEST);
+          gf_wr_cstring (&w, "cancel-streamlocal-forward@openssh.com");
+          gf_wr_bool (&w, 1);
+          gf_wr_cstring (&w, "");
+          break;
+        case 8:		/* direct: a path too long.  */
+          gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN);
+          gf_wr_cstring (&w, "direct-streamlocal@openssh.com");
+          gf_wr_u32 (&w, 5);
+          gf_wr_u32 (&w, 1000);
+          gf_wr_u32 (&w, 500);
+          longpath[GF_MAX_SOCKET_PATH] = 'a';
+          gf_wr_cstring (&w, longpath);
+          longpath[GF_MAX_SOCKET_PATH] = '\0';
+          gf_wr_cstring (&w, "");
+          gf_wr_u32 (&w, 0);
+          break;
+        default:	/* global: a path too long.  */
+          gf_wr_u8 (&w, GF_MSG_GLOBAL_REQUEST);
+          gf_wr_cstring (&w, "streamlocal-forward@openssh.com");
+          gf_wr_bool (&w, 1);
+          longpath[GF_MAX_SOCKET_PATH] = 'a';
+          gf_wr_cstring (&w, longpath);
+          longpath[GF_MAX_SOCKET_PATH] = '\0';
+          break;
+        }
+      CHECK_EQ (gf_wr_status (&w), GF_OK);
+      if (inject (&n.b, m, w.len) == GF_OK)
+        fprintf (stderr, "malformed streamlocal message %u was accepted\n", i);
+      CHECK_EQ (n.b.open_requests, 0);
+      CHECK_EQ (n.b.nglobals, 0);
+      net_free (&n);
+    }
+
+  /* The path may be anything but empty or with a NUL: a space, dots,
+     non-ASCII.  It is the application's to judge.  */
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  gf_writer_init (&w, m, sizeof m);
+  gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN);
+  gf_wr_cstring (&w, "direct-streamlocal@openssh.com");
+  gf_wr_u32 (&w, 5);
+  gf_wr_u32 (&w, 1000);
+  gf_wr_u32 (&w, 500);
+  gf_wr_cstring (&w, "../x y/\xc3\xa9");
+  gf_wr_cstring (&w, "anything reserved");
+  gf_wr_u32 (&w, 77);
+  CHECK_EQ (inject (&n.b, m, w.len), GF_OK);
+  CHECK_EQ (n.b.open_requests, 1);
+  CHECK (strcmp (n.b.path, "../x y/\xc3\xa9") == 0);
+  net_free (&n);
+
+  /* Nothing is listening for the callback: refused, not an offence.  */
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  CHECK_EQ (gf_chans_request_streamlocal_forward (n.a.m, "/x"), GF_OK);
+  pump (&n);
+  CHECK_EQ (n.a.disconnect + n.b.disconnect, 0);
+  net_free (&n);
+}
+
+static void
 test_close_races (void)
 {
   struct net n;
@@ -1393,6 +1579,7 @@ main (void)
   test_malformed_requests ();
   test_global_requests ();
   test_open_types_and_limits ();
+  test_streamlocal ();
   test_close_races ();
   test_send_failures ();
   TST_DONE ();
