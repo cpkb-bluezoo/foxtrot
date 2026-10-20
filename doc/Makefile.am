@@ -19,3 +19,15 @@
 
 info_TEXINFOS = foxtrot.texi
 foxtrot_TEXINFOS = fdl.texi
+
+## The reference pages: section 3 pages made from the public headers by
+## gen-man.py (checked in, so that building needs no python), and the overview
+## in foxtrot.7.  "make check" says if the headers have changed under them.
+include $(srcdir)/man.am
+
+EXTRA_DIST = gen-man.py man.am $(man3_MANS) $(man7_MANS)
+
+check-local:
+	@if command -v python3 >/dev/null 2>&1; then \
+	  python3 $(srcdir)/gen-man.py --check; \
+	fi

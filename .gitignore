@@ -55,6 +55,12 @@ Makefile
 /integration/interop-server
 /integration/interop-key
 /integration/interop-sign
+/examples/ssh-run
+/examples/sftp-get
+/examples/ssh-serve
+/examples/keyinfo
+/examples/krl-check
+/examples/cert-sign
 *.log
 *.trs
 /test-suite.log

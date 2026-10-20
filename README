@@ -108,3 +108,15 @@ and are compatible with this.
 Copyright is held by the authors until assigned to the Free Software
 Foundation.  Contributions will need a copyright assignment before they
 can be accepted.  See HACKING.
+
+Documentation
+-------------
+
+The manual is in doc/foxtrot.texi (info foxtrot).  The reference is the man
+pages: foxtrot(7) is the overview, and foxtrot_NAME(3) is the page for each
+header (man gf_key_from_blob finds the one with that function, once the
+system's man database has them).  examples/ has complete programs to read and
+copy: ssh-run (run a command), sftp-get (fetch a file), ssh-serve (a small
+server), keyinfo, krl-check and cert-sign, with example.h for the part of an
+application that the library leaves out.  They are installed as source in the
+documentation directory, and run by make check.

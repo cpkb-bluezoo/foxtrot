@@ -119,6 +119,7 @@ AC_CONFIG_FILES([Makefile
                  doc/Makefile
                  tests/Makefile
                  fuzz/Makefile
+                 examples/Makefile
                  integration/Makefile
                  foxtrot.pc])
 AC_OUTPUT

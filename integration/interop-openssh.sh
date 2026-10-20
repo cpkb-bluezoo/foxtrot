@@ -278,6 +278,31 @@ EOT
     && grep -q "^FORWARDED-STREAMLOCAL $dir/sl-fwd.sock\$" "$dir/fsl.out" \
     || { fail "streamlocal-forward through sshd"; cat "$dir/fsl.py.out" "$dir/fsl.out"; }
 fi
+# The example programs (examples/) against sshd: they are what a reader copies
+# from, so they must work with the real thing.
+EXD=$builddir/../examples
+if [ -x "$EXD/ssh-run" ] && [ -x "$EXD/sftp-get" ]; then
+  for t in ed25519 ecdsa rsa; do
+    echo "[127.0.0.1]:$port $(cut -d' ' -f1,2 "$dir/hk_$t.pub")"
+  done > "$dir/example_known_hosts"
+  out=$("$EXD/ssh-run" -p "$port" -i "$dir/uk_ed25519" -k "$dir/example_known_hosts" \
+          "$user@127.0.0.1" "echo from the example" 2>&1)
+  [ "$out" = "from the example" ] || { fail "examples/ssh-run against sshd: '$out'"; }
+  "$EXD/ssh-run" -p "$port" -i "$dir/uk_ecdsa" -k "$dir/example_known_hosts" \
+    "$user@127.0.0.1" "exit 5" >/dev/null 2>&1
+  [ $? -eq 5 ] || fail "examples/ssh-run: exit status through sshd"
+  "$EXD/sftp-get" -p "$port" -i "$dir/uk_rsa" -k "$dir/example_known_hosts" \
+    "$user@127.0.0.1" "$dir/cr/remote.txt" > "$dir/example_get.out" 2>&1
+  cmp -s "$dir/example_get.out" "$dir/cr/remote.txt" \
+    || { fail "examples/sftp-get against sshd"; cat "$dir/example_get.out"; }
+  "$EXD/sftp-get" -p "$port" -i "$dir/uk_ed25519" -k "$dir/example_known_hosts" \
+    "$user@127.0.0.1" "$dir/cr/up.bin" 2>/dev/null | cmp -s - "$dir/cr/up.bin" \
+    || fail "examples/sftp-get of 12 MB against sshd"
+  "$EXD/sftp-get" -p "$port" -i "$dir/uk_ed25519" -k "$dir/example_known_hosts" \
+    "$user@127.0.0.1" "$dir/cr/nosuch" >/dev/null 2>&1
+  [ $? -eq 1 ] || fail "examples/sftp-get of a missing file"
+fi
+
 # Keys alone offer nothing sshd (password and k-i off) would take.
 client --user "$user" --password hunter2 && fail "client authenticated with a password sshd does not take"
 

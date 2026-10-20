@@ -165,7 +165,7 @@ so that mutation builds on the inputs that reach new code:
 target with mutation, from fuzz/:
 
   export ASAN_OPTIONS=abort_on_error=1
-  export LSAN_OPTIONS=suppressions=$PWD/lsan.supp
+  export LSAN_OPTIONS=suppressions=$PWD/lsan.supp:print_suppressions=0
   ./fuzz-key -runs=1000000 -max_total_time=600 -seed=1 -out=/tmp/found \
       -save=/tmp/crash.bin corpus/key /tmp/found
 
@@ -179,6 +179,23 @@ sanitizers (make check with the CFLAGS above) and should stay clean.
 libgcrypt before 1.12.4 can abort the process in gcry_pk_verify on some
 Ed25519 public keys (fixed in 1.12.3), which is why that is the minimum: a
 fuzzer finds it in seconds.
+
+Examples and man pages
+----------------------
+
+examples/ is built with the library (with the same warnings) and its programs
+are run by make check (test-examples.sh, which needs ssh-keygen), and against
+sshd by interop-openssh.sh.  They are meant to be read: keep them short, and
+put in example.h only what the library leaves out.
+
+The section 3 man pages (doc/man/) and doc/man.am are generated from
+include/foxtrot/*.h by doc/gen-man.py (python3 doc/gen-man.py) and checked
+in, so that a build needs no python.  After changing a header's comments or
+declarations, run it; make check fails, naming the stale pages, if you do
+not.  A header's opening comment becomes the DESCRIPTION, a comment before a
+declaration its text, and a comment that begins with ---- a subsection.
+Declarations with no blank line between them share one description.  The
+overview, doc/foxtrot.7, is written by hand.
 
 Copyright assignment
 --------------------

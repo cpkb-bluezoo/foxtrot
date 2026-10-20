@@ -29,3 +29,5 @@ foxtrot NEWS - history of user-visible changes.
 ** Unix socket forwarding (OpenSSH's streamlocal): direct-streamlocal and forwarded-streamlocal channels, streamlocal-forward and its cancel; the session enforces permit-port-forwarding for them, and gf_authkey_permits_open_path and _listen_path say whether a line allows sockets.
 ** gf_chan_open and gf_global_request have a path member; enums gf_chan_type and gf_global_type have new values at the end.
 ** Other key formats (keyfmt.h): RFC 4716 public keys, PEM and DER keys (SPKI, PKCS#8 also under PBES2, PKCS#1, SEC1), PuTTY format 3 files, and randomart; all agree with openssl, ssh-keygen and puttygen. The old PEM encryption, PBES1, SHA-1 key derivations and PuTTY formats 1 and 2 are refused.
+** Example programs (examples/): ssh-run, sftp-get, ssh-serve, keyinfo, krl-check, cert-sign, installed as source and run by make check.
+** Man pages: foxtrot(7) and foxtrot_NAME(3) for every public header, made from the headers.

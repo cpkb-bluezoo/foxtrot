@@ -67,7 +67,7 @@ RUN make check -j"$(nproc)" CFLAGS="-g -O2 -Werror" \
 # separate from the one above because the sanitizers need their own flags.
 FROM build AS sanitize
 ENV SAN="-g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
-ENV ASAN_OPTIONS=abort_on_error=1 LSAN_OPTIONS=suppressions=/src/fuzz/lsan.supp
+ENV ASAN_OPTIONS=abort_on_error=1 LSAN_OPTIONS=suppressions=/src/fuzz/lsan.supp:print_suppressions=0
 RUN make distclean >/dev/null 2>&1; \
     ./configure --without-gnutls CFLAGS="$SAN" LDFLAGS="-fsanitize=address,undefined" \
     && make -j"$(nproc)" -C src CFLAGS="$SAN -fsanitize-coverage=trace-pc" \

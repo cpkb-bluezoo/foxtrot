@@ -1,0 +1,210 @@
+.\" Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+.\"
+.\" This file is part of foxtrot.
+.\"
+.\" foxtrot is free software: you can redistribute it and/or modify it
+.\" under the terms of the GNU General Public License as published
+.\" by the Free Software Foundation, either version 3 of the License, or
+.\" (at your option) any later version.
+.\"
+.\" foxtrot is distributed in the hope that it will be useful, but
+.\" WITHOUT ANY WARRANTY; without even the implied warranty of
+.\" MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+.\" General Public License for more details.
+.\"
+.\" You should have received a copy of the GNU General Public
+.\" License along with this program.  If not, see
+.\" <https://www.gnu.org/licenses/>.
+.TH FOXTROT 7 "2026" "foxtrot 0.0.1" "Foxtrot Library Reference"
+.SH NAME
+foxtrot \- an I/O-agnostic C library for SSH-2 and SFTP
+.SH SYNOPSIS
+.nf
+.B #include <foxtrot/session.h>
+.sp
+cc \-o prog prog.c \(ga\&pkg\-config \-\-cflags \-\-libs foxtrot\(ga
+.fi
+.SH DESCRIPTION
+foxtrot is a library for building SSH clients and servers.
+It speaks SSH-2 (RFC 4251 to 4254 and the extensions in current use) and SFTP
+version 3, with the user authentication methods, key types, certificates and
+file formats that OpenSSH uses.
+It is secure by design: what is known to be weak is not there to be enabled.
+.PP
+It does no input or output.
+It does not open a socket, read a file, look at a clock or start a thread.
+The application hands it bytes that arrived, takes the bytes it wants sent,
+and tells it the time.
+That is the whole interface to the world, and it fits any event loop, any
+transport (a socket, a pipe, a test), and any file system.
+.SH THE MODEL
+.IP \(bu 3
+Bytes in, bytes out.
+.BR gf_session_receive (3)
+takes whatever arrived, in any chunking, down to one byte at a time;
+the parsers are incremental and keep what they need.
+Output goes to the
+.I write
+callback, which is required and may be called from inside any call.
+.IP \(bu 3
+Time is an argument.
+Calls take the current time in microseconds on any clock that does not go
+backwards.
+.B gf_session_timeout
+says when the library next needs to be woken, and
+.B gf_session_on_timeout
+is what to call then.
+Certificates and revocation lists use the wall clock in seconds, supplied the
+same way.
+.IP \(bu 3
+Events are callbacks, set in a structure of function pointers and a
+.I user
+pointer that is passed back.
+What a callback is given (a key, a name, the data of a message) is valid only
+for the call unless the header says otherwise; copy what you keep.
+A callback that returns nonzero ends the session.
+.IP \(bu 3
+One session is used from one thread at a time.
+Separate sessions are independent.
+Tables that are only read after they are loaded (known hosts, authorized keys,
+revocation lists, trust stores) may be shared by readers.
+.IP \(bu 3
+Nothing in the library writes to standard error, exits or aborts on bad
+input from a peer.
+It will end a session that misbehaves, and say why.
+.SH LAYERS
+Each header has a page,
+.BI foxtrot_ name (3).
+The layers can be used on their own; the session is the usual way in.
+.TP
+.BR foxtrot_session (3)
+The transport, user authentication and channels joined in one object with one
+set of events, and the routing, deadlines and enforcement they need between
+them.
+.TP
+.BR foxtrot_conn (3), " foxtrot_kex" (3), " foxtrot_packet" (3), " foxtrot_ident" (3), " foxtrot_kexinit" (3)
+The transport: identification, binary packets, algorithm negotiation, key
+exchange (including the post-quantum hybrids), and rekeying.
+.TP
+.BR foxtrot_auth (3), " foxtrot_authkeys" (3)
+User authentication as client and server (public key, password,
+keyboard-interactive, certificates, security keys, external signers), and
+.I authorized_keys
+files.
+.TP
+.BR foxtrot_chan (3)
+The connection protocol: channels with strict flow control, session requests,
+TCP and Unix socket forwarding.
+.TP
+.BR foxtrot_sftp (3)
+SFTP version 3, client and server, with OpenSSH's extensions.
+.TP
+.BR foxtrot_key (3), " foxtrot_keyfmt" (3)
+Keys, OpenSSH certificates (reading and making them), security keys,
+OpenSSH private key files (also under a passphrase), and other formats: PEM,
+PKCS#8, RFC 4716, PuTTY.
+.TP
+.BR foxtrot_knownhosts (3), " foxtrot_krl" (3), " foxtrot_x509" (3)
+Host key checking, key revocation lists, and X.509 chains as keys (RFC 6187,
+with GnuTLS).
+.TP
+.BR foxtrot_policy (3), " foxtrot_crypto" (3), " foxtrot_wire" (3), " foxtrot_status" (3)
+The algorithm policy, the cryptographic primitives (all from libgcrypt), the
+wire encoding, and the status codes.
+.SH ERRORS
+Functions that can fail return a status:
+.B GF_OK
+(0) or a negative
+.B GF_ERR_*
+value, described in
+.BR foxtrot_status (3).
+.B gf_strerror
+turns one into text.
+Some parsers return
+.B GF_NEED_MORE
+(1) for input that ended in the middle of something, which is not an error.
+.PP
+Functions that give a result return it through a pointer argument.
+Objects are made by
+.B gf_*_new
+and freed by
+.BR gf_*_free ,
+which wipes secrets; keys that a configuration points to must outlive the
+object that uses it, as the headers say.
+.SH A CLIENT, IN OUTLINE
+.nf
+gf_session_config cfg = { 0 };
+gf_session_events ev = { 0 };
+gf_session *s;
+
+cfg.client_auth.user = "alice";
+cfg.client_auth.keys = keys;            /* with private parts */
+cfg.client_auth.nkeys = 1;
+ev.user = &my_state;
+ev.write = my_write;                    /* send these bytes */
+ev.host_key = my_host_key;              /* trust this key?  0 for yes */
+ev.authenticated = my_ready;            /* open a channel here */
+gf_session_client_new (&s, &cfg, &ev);
+gf_session_start (s, now_us ());
+/* then: whatever arrives goes to gf_session_receive (s, now_us (),
+   data, len); and when gf_session_timeout (s) passes,
+   gf_session_on_timeout (s, now_us ()). */
+.fi
+.PP
+A client with no
+.I host_key
+callback trusts nothing, so that forgetting it is not a vulnerability.
+The programs in the examples directory (see below) are complete and short.
+.SH SECURITY POLICY
+Absent by design, not disabled by default:
+SSH protocol 1; CBC and CTR ciphers and separate MACs in the transport (the
+ciphers are all AEAD); SHA-1 signatures and
+.IR ssh-rsa ;
+DSA; ECDSA over P-521; finite-field Diffie-Hellman; compression; agent and X11
+forwarding; host-based authentication; and the old password change.
+Keys are held to a minimum strength, and the Terrapin attack is closed by
+strict key exchange, which is required of the peer.
+.PP
+SHA-1 appears in three places only, to recognise names and keys and never to
+protect them: the hashed names of known_hosts, OCSP responder names, and the
+hashes in revocation lists.
+.PP
+The library needs libgcrypt 1.12.4 or later (earlier versions can be made to
+abort the process by a peer's Ed25519 key), checked when it is built and when
+it is first used.
+GnuTLS is optional, for X.509 keys.
+The complete statement is the chapter
+.I Security policy
+of the manual.
+.SH FILES
+.TP
+.I /usr/share/doc/foxtrot/examples/
+Example programs, in source:
+.B ssh-run
+(run a command on a host),
+.B sftp-get
+(fetch a file),
+.B ssh-serve
+(a small server using authorized_keys),
+.B keyinfo
+(what is in a key file, in any format),
+.B krl-check
+and
+.BR cert-sign .
+.B example.h
+is the part of an application that the library leaves out: sockets, a clock and
+an event loop.
+.SH BUGS
+Report bugs to <dog@gnu.org> until the project is accepted by GNU, and then to
+<bug-foxtrot@gnu.org>.
+.SH SEE ALSO
+.BR foxtrot_session (3),
+.BR info\~foxtrot ,
+.BR ssh (1),
+.BR sshd (8),
+.BR ssh-keygen (1)
+.SH COPYRIGHT
+Copyright \(co 2026 Chris Burdess.
+License GPLv3+: GNU GPL version 3 or later <https://www.gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
