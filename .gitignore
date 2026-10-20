@@ -68,6 +68,22 @@ Makefile
 !/tests/test-*.c
 .dirstamp
 
+# Fuzz targets (libtool wrappers and objects; the sources are kept), what the
+# driver saves when it finds a crash, and its working directory.  The corpus
+# is kept, including the inputs that found something (crash-*).
+/fuzz/fuzz-*
+!/fuzz/fuzz-*.c
+!/fuzz/fuzz-common.h
+/fuzz/fuzz-crash.bin
+/fuzz/out/
+
+# Made by "make dist" and "make distcheck"
+/foxtrot-*.tar.*
+/foxtrot-[0-9]*/
+
+# Downloaded by accident when generating test vectors
+*.whl
+
 # Manual: built by "make info", "make pdf", "make html"
 /doc/*.info
 /doc/*.info-*
