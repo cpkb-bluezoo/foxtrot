@@ -31,4 +31,21 @@
    itself, and an unchecked peer value is an invalid-curve attack.  */
 int gfi_ec_point_ok (const char *curve, const uint8_t *q, size_t qlen);
 
+/* Match S (SN bytes) against the pattern PAT (PN bytes), in which '*' stands
+   for any run of characters and '?' for any one.  Case sensitive.  */
+int gfi_wildmatch (const char *pat, size_t pn, const char *s, size_t sn);
+
+/* Base64 (RFC 4648).  Encode IN (N bytes) into OUT, which must hold 4*ceil(N/3)
+   characters; PAD nonzero for '=' padding.  No terminating NUL.  Returns the
+   length written.  */
+size_t gfi_b64_encode (const uint8_t *in, size_t n, char *out, int pad);
+
+/* Decode N characters into OUT (CAP bytes).  Returns the number of bytes, or
+   -1 for text that is not base64 or does not fit.  Not STRICT: white space is
+   ignored and the padding is not checked, as in PEM bodies.  STRICT: only the
+   alphabet, padded to a whole quad, nothing after the padding, and zero
+   bits after the data, so that each byte string has exactly one text.  */
+long gfi_b64_decode (const char *in, size_t n, uint8_t *out, size_t cap,
+                     int strict);
+
 #endif /* GF_INTERNAL_H */

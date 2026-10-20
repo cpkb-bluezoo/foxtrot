@@ -21,6 +21,7 @@
 # against sshd, and ssh against foxtrot's server, for the algorithms they
 # have in common, with public key (also host-bound), password and
 # keyboard-interactive authentication, with rekeying after authentication,
+# with OpenSSH user and host certificates (made by ssh-keygen -s) both ways,
 # and with the algorithms foxtrot refuses, to check that they are refused.  Needs ssh, ssh-keygen and sshd (set SSHD if it is not in
 # /usr/sbin); skips itself (exit 77) when they are missing, and when
 # GF_NO_INTEROP is set.
@@ -220,6 +221,155 @@ kill "$sshd_pid" 2>/dev/null
 wait "$sshd_pid" 2>/dev/null
 sshd_pid=
 
+
+# ---------------------------------------------------------------------
+# Certificates: foxtrot's client against sshd
+# ---------------------------------------------------------------------
+
+# One CA, certificates for the user keys (valid for the user, with the host
+# names for the host key) and some that must not work.
+$SSH_KEYGEN -q -t ed25519 -N '' -f "$dir/ca" || exit 99
+$SSH_KEYGEN -q -t ed25519 -N '' -f "$dir/ca2" || exit 99
+cert_user ()	# KEY ID OPTIONS...   -> KEY-cert.pub
+{
+  ck=$1; cid=$2; shift 2
+  $SSH_KEYGEN -q -s "$dir/ca" -I "$cid" -n "$user" "$@" "$dir/$ck.pub" || exit 99
+  command cp -f "$dir/$ck-cert.pub" "$dir/$cid.cert.pub"
+}
+for t in ed25519 ecdsa rsa; do
+  cert_user uk_$t "user-$t" -V -1h:+1h
+done
+cert_user uk_ed25519 other-principal -V -1h:+1h
+$SSH_KEYGEN -q -s "$dir/ca" -I otheruser -n nobody-at-all -V -1h:+1h "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/otheruser.cert.pub"
+$SSH_KEYGEN -q -s "$dir/ca" -I expired -n "$user" -V -3d:-2d "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/expired.cert.pub"
+$SSH_KEYGEN -q -s "$dir/ca2" -I wrongca -n "$user" -V -1h:+1h "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/wrongca.cert.pub"
+$SSH_KEYGEN -q -s "$dir/ca" -I forced -n "$user" -V -1h:+1h -O force-command="echo forced" \
+  -O source-address=127.0.0.0/8 "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/forced.cert.pub"
+$SSH_KEYGEN -q -s "$dir/ca" -I elsewhere -n "$user" -V -1h:+1h -O source-address=192.0.2.0/24 \
+  "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/elsewhere.cert.pub"
+# The host certificate, which names the host as it is dialled.
+$SSH_KEYGEN -q -s "$dir/ca" -h -I host-ed25519 -n 127.0.0.1,localhost -V -1h:+1h \
+  "$dir/hk_ed25519.pub" || exit 99
+$SSH_KEYGEN -q -s "$dir/ca" -h -I host-wrongname -n www.example.org -V -1h:+1h \
+  "$dir/hk_ecdsa.pub" || exit 99
+command cp -f "$dir/hk_ecdsa-cert.pub" "$dir/host-wrongname.cert.pub"
+$SSH_KEYGEN -q -s "$dir/ca" -h -I host-ecdsa -n 127.0.0.1,localhost -V -1h:+1h \
+  "$dir/hk_ecdsa.pub" || exit 99
+$SSH_KEYGEN -q -s "$dir/ca" -h -I host-rsa -n 127.0.0.1,localhost -V -1h:+1h \
+  "$dir/hk_rsa.pub" || exit 99
+
+port=$(pick_port)
+cat > "$dir/sshd_config3" <<EOT
+Port $port
+ListenAddress 127.0.0.1
+HostKey $dir/hk_ed25519
+HostKey $dir/hk_ecdsa
+HostKey $dir/hk_rsa
+HostCertificate $dir/hk_ed25519-cert.pub
+HostCertificate $dir/hk_ecdsa-cert.pub
+HostCertificate $dir/hk_rsa-cert.pub
+PidFile $dir/sshd3.pid
+TrustedUserCAKeys $dir/ca.pub
+AuthorizedKeysFile none
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+LogLevel ERROR
+Subsystem sftp internal-sftp
+EOT
+"$SSHD" -D -e -f "$dir/sshd_config3" > "$dir/sshd3.log" 2>&1 &
+sshd_pid=$!
+i=0
+while [ $i -lt 50 ]; do
+  (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+  kill -0 "$sshd_pid" 2>/dev/null || break
+  sleep 0.1
+  i=$((i + 1))
+done
+kill -0 "$sshd_pid" 2>/dev/null || { cat "$dir/sshd3.log"; fail "sshd with certificates would not start"; sshd_pid=; }
+
+if [ -n "$sshd_pid" ]; then
+  # A user certificate of each kind of key gets in; the key alone does not
+  # (sshd takes certificates only).
+  for t in ed25519 ecdsa rsa; do
+    client --user "$user" --key "$dir/uk_$t" --cert "$dir/user-$t.cert.pub" \
+      || { fail "client certificate $t"; cat "$dir/client.out"; }
+    grep -q '^AUTH OK' "$dir/client.out" || fail "client certificate $t: not authenticated"
+  done
+  client --user "$user" --key "$dir/uk_ed25519" --cert "$dir/user-ed25519.cert.pub" \
+    --exec "echo through a certificate" \
+    || { fail "client certificate exec"; cat "$dir/client.out"; }
+  grep -q '^OUT through a certificate' "$dir/client.out" || fail "client certificate exec: no output"
+  client --user "$user" --key "$dir/uk_ed25519" && fail "client got in with a key sshd has no authorization for"
+  # Certificates sshd turns down.
+  for c in otheruser expired wrongca elsewhere; do
+    client --user "$user" --key "$dir/uk_ed25519" --cert "$dir/$c.cert.pub" \
+      && fail "client got in with the $c certificate"
+    grep -q '^AUTH FAILED' "$dir/client.out" || fail "client $c certificate: no failure reported"
+  done
+  # sshd's forced command is its own business; the certificate is accepted.
+  client --user "$user" --key "$dir/uk_ed25519" --cert "$dir/forced.cert.pub" \
+    || { fail "client forced-command certificate"; cat "$dir/client.out"; }
+
+  # Host certificates: sshd presents them when the client asks for the
+  # certificate algorithm, and the client trusts one only if known_hosts has
+  # its CA for the host, the certificate is for a host, in its dates, and
+  # names the host dialled.
+  echo "@cert-authority * $(cut -d' ' -f1,2 "$dir/ca.pub")" > "$dir/kh_ca"
+  echo "@cert-authority * $(cut -d' ' -f1,2 "$dir/ca2.pub")" > "$dir/kh_ca2"
+  for h in ssh-ed25519-cert-v01@openssh.com ecdsa-sha2-nistp256-cert-v01@openssh.com \
+           rsa-sha2-512-cert-v01@openssh.com rsa-sha2-256-cert-v01@openssh.com; do
+    client --no-auth --hostkey $h --known-hosts "$dir/kh_ca" --host-name localhost \
+      || { fail "client host certificate $h"; cat "$dir/client.out"; }
+    grep -q '^HOSTCHECK MATCH' "$dir/client.out" || fail "client host certificate $h: not accepted"
+    grep -q "^KEX .* $h\$" "$dir/client.out" || fail "client host certificate $h: not negotiated"
+  done
+  # Given only the CA, the client asks for the certificate algorithms by itself.
+  client --no-auth --known-hosts "$dir/kh_ca" || { fail "client host certificate by default"; cat "$dir/client.out"; }
+  grep -q '^KEX .*-cert-v01@openssh.com$' "$dir/client.out" || fail "client did not ask for a certificate"
+  client --no-auth --hostkey ssh-ed25519-cert-v01@openssh.com && fail "client trusted a host certificate with nothing known"
+  grep -q '^HOSTCHECK UNTRUSTED' "$dir/client.out" || fail "host certificate without known_hosts: not refused"
+  client --no-auth --hostkey ssh-ed25519-cert-v01@openssh.com --known-hosts "$dir/kh_ca2" \
+    && fail "client trusted a host certificate from another CA"
+  grep -q '^HOSTCHECK CHANGED' "$dir/client.out" || fail "other CA: not reported as changed"
+  client --no-auth --hostkey ssh-ed25519-cert-v01@openssh.com --known-hosts "$dir/kh_ca" \
+    --host-name www.example.org && fail "client trusted a host certificate for another name"
+  # The authentication that follows is bound to the host certificate.
+  client --known-hosts "$dir/kh_ca" --user "$user" --key "$dir/uk_ed25519" \
+    --cert "$dir/user-ed25519.cert.pub" \
+    || { fail "client host and user certificates"; cat "$dir/client.out"; }
+  grep -q '^AUTH OK' "$dir/client.out" || fail "client host and user certificates: not authenticated"
+  # Plain host keys through known_hosts: it picks the algorithm of the key it
+  # knows among the several sshd has, and refuses any other key.
+  for t in ed25519 ecdsa rsa; do
+    echo "[127.0.0.1]:$port $(cut -d' ' -f1,2 "$dir/hk_$t.pub")" > "$dir/kh_$t"
+    client --no-auth --known-hosts "$dir/kh_$t" \
+      || { fail "client known_hosts $t"; cat "$dir/client.out"; }
+    grep -q '^HOSTCHECK MATCH' "$dir/client.out" || fail "client known_hosts $t: no match"
+  done
+  client --no-auth --known-hosts "$dir/kh_ed25519"
+  grep -q '^KEX .* ssh-ed25519$' "$dir/client.out" || fail "known_hosts ed25519: another algorithm offered"
+  client --no-auth --known-hosts "$dir/kh_ecdsa"
+  grep -q '^KEX .* ecdsa-sha2-nistp256$' "$dir/client.out" || fail "known_hosts ecdsa: another algorithm offered"
+  echo "[127.0.0.1]:$port $(cut -d' ' -f1,2 "$dir/stranger.pub")" > "$dir/kh_wrong"
+  client --no-auth --known-hosts "$dir/kh_wrong" && fail "client accepted a host key known_hosts does not have"
+  grep -q '^HOSTCHECK CHANGED' "$dir/client.out" || fail "wrong host key: not reported as changed"
+  echo "@revoked * $(cut -d' ' -f1,2 "$dir/hk_ed25519.pub")" > "$dir/kh_revoked"
+  echo "[127.0.0.1]:$port $(cut -d' ' -f1,2 "$dir/hk_ed25519.pub")" >> "$dir/kh_revoked"
+  client --no-auth --known-hosts "$dir/kh_revoked" && fail "client accepted a revoked host key"
+  grep -q '^HOSTCHECK REVOKED' "$dir/client.out" || fail "revoked host key: not reported"
+  kill "$sshd_pid" 2>/dev/null
+  wait "$sshd_pid" 2>/dev/null
+  sshd_pid=
+fi
+
 # ---------------------------------------------------------------------
 # ssh against foxtrot's server
 # ---------------------------------------------------------------------
@@ -302,6 +452,67 @@ grep -q '^AUTH OK' "$dir/server.out" && fail "ssh authenticated with a wrong cod
 ASKPASS_ANSWER=hunter2 run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" -- \
   -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1
 grep -q '^AUTH OK' "$dir/server.out" && fail "ssh used a method the server does not offer"
+
+# User certificates: ssh offers the certificate, foxtrot's server checks the
+# CA, the principal, the dates and the options before it asks the program.
+for t in ed25519 ecdsa rsa; do
+  run_ssh hk_ed25519 --ca-key "$dir/ca.pub" -- -o BatchMode=yes -i "$dir/uk_$t" \
+    -o CertificateFile="$dir/user-$t.cert.pub"
+  grep -q "^AUTH OK $user publickey\$" "$dir/server.out" \
+    || { fail "ssh certificate $t"; cat "$dir/ssh.out" "$dir/server.out"; }
+  grep -q "^CERT serial=0 id=user-$t\$" "$dir/server.out" || fail "ssh certificate $t: not seen as one"
+done
+run_ssh hk_ed25519 --ca-key "$dir/ca.pub" --hostbound -- -o BatchMode=yes -i "$dir/uk_ed25519" \
+  -o CertificateFile="$dir/user-ed25519.cert.pub"
+grep -q "^AUTH OK $user publickey-hostbound\$" "$dir/server.out" \
+  || { fail "ssh host-bound certificate"; cat "$dir/ssh.out" "$dir/server.out"; }
+# The ones foxtrot must refuse: not signed by its CA, for someone else, out
+# of date, for another address, and no CA configured at all.
+for c in otheruser expired wrongca elsewhere; do
+  run_ssh hk_ed25519 --ca-key "$dir/ca.pub" -- -o BatchMode=yes -i "$dir/uk_ed25519" \
+    -o CertificateFile="$dir/$c.cert.pub"
+  grep -q '^AUTH OK' "$dir/server.out" && fail "ssh got in with the $c certificate"
+done
+run_ssh hk_ed25519 --ca-key "$dir/ca2.pub" -- -o BatchMode=yes -i "$dir/uk_ed25519" \
+  -o CertificateFile="$dir/user-ed25519.cert.pub"
+grep -q '^AUTH OK' "$dir/server.out" && fail "ssh got in with a certificate from a CA the server does not trust"
+run_ssh hk_ed25519 --auth-key "$dir/uk_ecdsa" -- -o BatchMode=yes -i "$dir/uk_ed25519" \
+  -o CertificateFile="$dir/user-ed25519.cert.pub"
+grep -q '^AUTH OK' "$dir/server.out" && fail "ssh got in with a certificate and no CA configured"
+# The forced command replaces what the client asked for.
+SSH_CMD="echo requested" run_ssh hk_ed25519 --ca-key "$dir/ca.pub" -- -o BatchMode=yes \
+  -i "$dir/uk_ed25519" -o CertificateFile="$dir/forced.cert.pub"
+grep -q '^FORCE echo forced$' "$dir/server.out" && grep -q '^EXEC echo forced$' "$dir/server.out" \
+  && grep -q '^forced$' "$dir/ssh.out" && ! grep -q requested "$dir/ssh.out" \
+  || { fail "ssh forced command"; cat "$dir/ssh.out" "$dir/server.out"; }
+
+# Host certificates: ssh trusts the server's certificate because its CA is in
+# known_hosts as @cert-authority, with strict host key checking.
+echo "@cert-authority 127.0.0.1 $(cut -d' ' -f1,2 "$dir/ca.pub")" > "$dir/kh_ssh_ca"
+echo "@cert-authority 127.0.0.1 $(cut -d' ' -f1,2 "$dir/ca2.pub")" > "$dir/kh_ssh_ca2"
+saved_sshopts=$sshopts
+sshopts="-o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -o LogLevel=ERROR"
+for hk in ed25519 ecdsa rsa; do
+  run_ssh hk_$hk --auth-key "$dir/uk_ed25519" --host-cert "$dir/hk_$hk-cert.pub" -- \
+    -o BatchMode=yes -i "$dir/uk_ed25519" -o UserKnownHostsFile="$dir/kh_ssh_ca"
+  grep -q "^AUTH OK $user publickey\$" "$dir/server.out" \
+    || { fail "ssh trusting a $hk host certificate"; cat "$dir/ssh.out" "$dir/server.out"; }
+  grep -q "^KEX .*-cert-v01@openssh.com\$" "$dir/server.out" || fail "$hk host certificate not used"
+done
+# With the certificate and a user certificate, host-bound.
+run_ssh hk_ed25519 --ca-key "$dir/ca.pub" --hostbound --host-cert "$dir/hk_ed25519-cert.pub" -- \
+  -o BatchMode=yes -i "$dir/uk_ed25519" -o CertificateFile="$dir/user-ed25519.cert.pub" \
+  -o UserKnownHostsFile="$dir/kh_ssh_ca"
+grep -q "^AUTH OK $user publickey-hostbound\$" "$dir/server.out" \
+  || { fail "ssh with host and user certificates"; cat "$dir/ssh.out" "$dir/server.out"; }
+# A certificate from another CA, or for another name: ssh refuses the host.
+run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" --host-cert "$dir/hk_ed25519-cert.pub" -- \
+  -o BatchMode=yes -i "$dir/uk_ed25519" -o UserKnownHostsFile="$dir/kh_ssh_ca2"
+grep -q '^AUTH OK' "$dir/server.out" && fail "ssh trusted a host certificate from another CA"
+run_ssh hk_ecdsa --auth-key "$dir/uk_ed25519" --host-cert "$dir/host-wrongname.cert.pub" -- \
+  -o BatchMode=yes -i "$dir/uk_ed25519" -o UserKnownHostsFile="$dir/kh_ssh_ca"
+grep -q '^AUTH OK' "$dir/server.out" && fail "ssh trusted a host certificate for another name"
+sshopts=$saved_sshopts
 
 # Commands in session channels served by foxtrot, bulk data both ways with
 # rekeys, standard error, and exit status.

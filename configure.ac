@@ -77,9 +77,10 @@ dnl in 1.11).
 PKG_CHECK_MODULES([LIBGCRYPT], [libgcrypt >= 1.12.0],
   [], [AC_MSG_ERROR([libgcrypt >= 1.12.0 is required])])
 
-dnl Certificates.  Plain SSH keys need nothing but libgcrypt.  GnuTLS is
-dnl reserved for the X.509 host key and user key formats of RFC 6187, behind
-dnl the replaceable gf_trust interface; nothing uses it yet.
+dnl Certificates.  Plain SSH keys and OpenSSH certificates need nothing but
+dnl libgcrypt.  GnuTLS is for the X.509 host key and user key formats of
+dnl RFC 6187 (x509.h): chain parsing and validation.  Without it those keys
+dnl are not available.
 AC_ARG_WITH([gnutls],
   [AS_HELP_STRING([--with-gnutls],
      [use GnuTLS for X.509 keys (RFC 6187) @<:@default=check@:>@])],

@@ -39,6 +39,31 @@
      password              RFC 4252 section 8, without password change
      keyboard-interactive  RFC 4256
 
+   Certificates (key.h): a client may present an OpenSSH user certificate
+   in place of a plain key.  A server accepts one only if its config names
+   the CAs it trusts (trusted_user_cas); without any, certificate
+   signature algorithms are refused.  Before the application sees the
+   request, the machine checks that a trusted CA signed it, that it is a
+   user certificate good at the current time, that the user name is one of
+   its principals, that its "source-address" (if any) allows the client's
+   address, and that every critical option is one it understands, and the
+   application is told what it must itself honour: the "force-command"
+   option is in the request and is kept for gf_auth_server_force_command.
+   Whether to accept the certificate (a revocation list, say, by serial or
+   key id: gf_key_certificate_info) remains the application's decision.
+
+   X.509 chains (RFC 6187, x509.h) are accepted the same way if the server's
+   configuration has a trust store (x509_trust): the machine checks the chain
+   against it for a user (id-kp-secureShellClient), at the current time, before the
+   application sees the request, which is then marked x509 and left to the
+   application to map to a user from the subject (gf_x509_subject,
+   gf_x509_san).  Without a trust store no chain is accepted.
+
+   Security keys (FIDO, key.h) are accepted as public keys: the machine
+   verifies the token's signature, requires the user presence flag, and
+   hands the application the flags and counter.  There is no client side:
+   the library does not talk to tokens.
+
    Not implemented: hostbased (it trusts a client machine's identity on
    the word of its administrator and the DNS), and password change (a
    request to change the password is refused).  A signature algorithm
@@ -68,6 +93,7 @@
 #include <foxtrot/key.h>
 #include <foxtrot/policy.h>
 #include <foxtrot/wire.h>
+#include <foxtrot/x509.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,6 +147,26 @@ typedef struct gf_auth_request
   enum gf_sigalg sigalg;
   int has_signature;
   int hostbound;
+  /* The key is a certificate that passed the checks above.  Its other
+     properties are in gf_key_certificate_info (serial, key id).  */
+  int certificate;
+  /* The certificate's "force-command" (NUL-terminated), or an empty slice:
+     the application must run this and nothing else for the session.  */
+  gf_slice force_command;
+  /* The key is an X.509 chain that the server's trust store vouches for as a
+     user's.  Its subject is in gf_x509_subject and gf_x509_san.  */
+  int x509;
+  /* The certificate has "verify-required".  The machine enforces it for a
+     security key (its signature must show that the token verified its
+     user); for other keys, as in OpenSSH, it means nothing.  */
+  int verify_required;
+  /* A security key (key.h): the flags and counter the token signed, valid
+     when HAS_SIGNATURE.  The user presence flag is set, or the machine would
+     not have asked.  The application decides whether it wants more
+     (GF_SK_USER_VERIFIED) and what to make of the counter, which only a
+     server that remembers the last one can use.  */
+  uint8_t sk_flags;
+  uint32_t sk_counter;
   /* GF_AUTH_PASSWORD.  Valid only during the call: copy it if it is needed
      later, and wipe the copy.  */
   gf_slice password;
@@ -142,6 +188,10 @@ typedef struct gf_auth_server_events
   int (*kbdint_response) (void *user, const gf_slice *responses, size_t n);
   /* Authentication succeeded for USER.  The service is ssh-connection.  */
   int (*authenticated) (void *user, gf_slice username);
+  /* The wall clock in seconds since 1970, for the validity of
+     certificates.  Optional: without it the machine reads time(2), which
+     does no I/O.  */
+  uint64_t (*unix_time) (void *user);
   /* The machine wants the connection ended, for REASON (an
      enum gf_disconnect value).  Required.  */
   int (*disconnect) (void *user, uint32_t reason);
@@ -153,6 +203,16 @@ typedef struct gf_auth_server_config
   int hostbound;		/* Accept the host-bound public key method.  */
   unsigned max_failures;	/* 0: 6.  */
   uint64_t grace_us;		/* 0: 120 seconds.  */
+  /* The CA keys whose user certificates are accepted, and the client's
+     address in text (the "source-address" option is checked against it; a
+     certificate with that option fails if it is NULL).  Neither is copied:
+     they must outlive the machine.  */
+  const gf_key *const *trusted_user_cas;
+  size_t ntrusted_user_cas;
+  const char *peer_address;
+  /* The trust for X.509 chains as users' keys; not copied, and it must
+     outlive the machine.  */
+  const gf_x509_trust *x509_trust;
 } gf_auth_server_config;
 
 typedef struct gf_auth_server gf_auth_server;
@@ -189,6 +249,11 @@ int gf_auth_server_kbdint_prompt (gf_auth_server *a, uint64_t now_us,
    characters.  Allowed before success.  */
 int gf_auth_server_banner (gf_auth_server *a, uint64_t now_us,
                            const char *text);
+
+/* After the authenticated event for a user who presented a certificate:
+   its force-command (NUL-terminated; *CMD is empty if it has none).  The
+   command is valid until the machine is freed.  */
+int gf_auth_server_force_command (const gf_auth_server *a, gf_slice *cmd);
 
 uint64_t gf_auth_server_timeout (const gf_auth_server *a);
 int gf_auth_server_on_timeout (gf_auth_server *a, uint64_t now_us);

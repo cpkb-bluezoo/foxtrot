@@ -426,6 +426,12 @@ test_services_and_extensions (void)
   CHECK (strstr (p.cl.extension, "ssh-ed25519") != NULL);
   CHECK (strstr (p.cl.extension, "rsa-sha2-256") != NULL);
   CHECK (strstr (p.cl.extension, "ssh-rsa,") == NULL);
+  /* Plain names only: a certificate is signed for with its key's algorithm,
+     and the list is read that way by OpenSSH.  */
+  CHECK (strstr (p.cl.extension, "cert") == NULL);
+  /* And the two security keys, which users have and hosts do not.  */
+  CHECK (strstr (p.cl.extension, "sk-ssh-ed25519@openssh.com") != NULL);
+  CHECK (strstr (p.cl.extension, "sk-ecdsa-sha2-nistp256@openssh.com") != NULL);
 
   CHECK_EQ (gf_conn_request_service (p.sv.c, tst_now, "ssh-userauth"),
             GF_ERR_INVAL);

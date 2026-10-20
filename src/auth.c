@@ -22,6 +22,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <foxtrot/status.h>
 #include <foxtrot/crypto.h>
@@ -157,6 +158,8 @@ struct gf_auth_server
   enum pending pending;
   enum gf_auth_method pending_method;
   int pending_probe;		/* A public key query: not an attempt.  */
+  uint8_t *force;		/* The certificate's force-command, if any.  */
+  size_t forcelen;
   uint8_t *pk_blob;		/* For PK_OK.  */
   size_t pk_bloblen;
   enum gf_sigalg pk_alg;
@@ -168,6 +171,7 @@ gf_auth_server_new (gf_auth_server **out, const gf_auth_server_config *config,
                     const gf_auth_server_events *events)
 {
   gf_auth_server *a;
+  size_t i;
 
   if (out == NULL || config == NULL || events == NULL || events->send == NULL
       || events->request == NULL || events->disconnect == NULL)
@@ -184,6 +188,13 @@ gf_auth_server_new (gf_auth_server **out, const gf_auth_server_config *config,
       free (a);
       return GF_ERR_INVAL;
     }
+  for (i = 0; i < config->ntrusted_user_cas; i++)
+    if (config->trusted_user_cas == NULL || config->trusted_user_cas[i] == NULL
+        || gf_key_is_certificate (config->trusted_user_cas[i]))
+      {
+        free (a);
+        return GF_ERR_INVAL;
+      }
   *out = a;
   return GF_OK;
 }
@@ -196,6 +207,7 @@ gf_auth_server_free (gf_auth_server *a)
   free (a->host);
   free (a->user);
   free (a->pk_blob);
+  free (a->force);
   gf_wipe (a, sizeof *a);
   free (a);
 }
@@ -282,6 +294,59 @@ srv_request_app (gf_auth_server *a, gf_auth_request *req)
     ? srv_die (a, GF_DISCONNECT_BY_APPLICATION, GF_ERR_HANDLER) : GF_OK;
 }
 
+/* The wall clock, for the validity of certificates: the application's, or
+   time(2).  */
+static uint64_t
+now_unix (const gf_auth_server *a)
+{
+  time_t t;
+
+  if (a->ev.unix_time)
+    return a->ev.unix_time (a->ev.user);
+  t = time (NULL);
+  return t < 0 ? 0 : (uint64_t) t;
+}
+
+/* Is KEY, a certificate, one this server takes for USER?  Everything but
+   the application's own policy.  Sets the request's certificate fields.  */
+static int
+srv_certificate (gf_auth_server *a, const gf_key *key, gf_auth_request *req)
+{
+  gf_cert_info ci;
+  size_t i;
+  int trusted = 0, found;
+  uint64_t now = now_unix (a);
+  gf_slice v;
+
+  if (gf_key_certificate_info (key, &ci) != GF_OK)
+    return 0;
+  for (i = 0; i < a->cfg.ntrusted_user_cas; i++)
+    if (gf_key_equal (ci.ca, a->cfg.trusted_user_cas[i]))
+      trusted = 1;
+  if (!trusted || gf_cert_check (key, GF_CERT_USER, now, NULL) != GF_OK
+      || !gf_cert_has_principal (key, (const char *) req->user.data,
+                                 req->user.len, 0)
+      || !gf_cert_source_address_ok (key, a->cfg.peer_address))
+    return 0;
+  req->certificate = 1;
+  found = gf_cert_critical_option (key, "force-command", &v);
+  if (found == 1)
+    {
+      free (a->force);
+      a->force = malloc (v.len + 1);
+      if (a->force == NULL)
+        return 0;
+      memcpy (a->force, v.data, v.len);
+      a->force[v.len] = '\0';
+      a->forcelen = v.len;
+      req->force_command.data = a->force;
+      req->force_command.len = v.len;
+    }
+  req->verify_required =
+    gf_cert_critical_option (key, "verify-required", &v) == 1;
+  return 1;
+}
+
 static int
 srv_publickey (gf_auth_server *a, gf_reader *rd, gf_auth_request *req,
                int hostbound)
@@ -310,6 +375,24 @@ srv_publickey (gf_auth_server *a, gf_reader *rd, gf_auth_request *req,
       gf_key_free (key);
       return srv_attempt_failed (a, counted);
     }
+  if (gf_key_is_certificate (key) && !srv_certificate (a, key, req))
+    {
+      gf_key_free (key);
+      return srv_attempt_failed (a, counted);
+    }
+  if (gf_x509_chain_length (key) > 0)
+    {
+      /* A chain is only as good as the trust that vouches for it; with none
+         configured it is a stranger's claim.  */
+      if (a->cfg.x509_trust == NULL
+          || gf_x509_verify (a->cfg.x509_trust, key, GF_X509_CLIENT, NULL,
+                             now_unix (a), NULL) != GF_OK)
+        {
+          gf_key_free (key);
+          return srv_attempt_failed (a, counted);
+        }
+      req->x509 = 1;
+    }
   if (has_sig)
     {
       uint8_t *data;
@@ -321,7 +404,19 @@ srv_publickey (gf_auth_server *a, gf_reader *rd, gf_auth_request *req,
                        hostbound ? a->host : NULL, a->hostlen);
       if (r == GF_OK)
         {
-          r = gf_key_verify (key, alg, data, dl, sig.data, sig.len);
+          if (gf_sigalg_is_user_only (alg))
+            {
+              /* A security key: the token vouches for a person only if it
+                 was touched (checked), and for more if it checked a PIN or
+                 a fingerprint, which a certificate may demand.  */
+              r = gf_key_verify_sk (key, alg, data, dl, sig.data, sig.len,
+                                    &req->sk_flags, &req->sk_counter);
+              if (r == GF_OK && req->verify_required
+                  && !(req->sk_flags & GF_SK_USER_VERIFIED))
+                r = GF_ERR_HOSTKEY;
+            }
+          else
+            r = gf_key_verify (key, alg, data, dl, sig.data, sig.len);
           free (data);
         }
       if (r != GF_OK)
@@ -380,6 +475,9 @@ srv_handle_request (gf_auth_server *a, const uint8_t *p, size_t n)
   memset (&req, 0, sizeof req);
   req.user = user;
   req.service = service;
+  free (a->force);		/* A command belongs to the last request.  */
+  a->force = NULL;
+  a->forcelen = 0;
   if (user.len == 0)
     return srv_attempt_failed (a, 1);
 
@@ -488,6 +586,16 @@ gf_auth_server_accept (gf_auth_server *a, uint64_t now_us)
   user.len = a->userlen;
   if (a->ev.authenticated && a->ev.authenticated (a->ev.user, user))
     return GF_ERR_HANDLER;
+  return GF_OK;
+}
+
+int
+gf_auth_server_force_command (const gf_auth_server *a, gf_slice *cmd)
+{
+  if (a == NULL || cmd == NULL)
+    return GF_ERR_INVAL;
+  cmd->data = a->force;
+  cmd->len = a->forcelen;
   return GF_OK;
 }
 
@@ -761,7 +869,9 @@ cl_failed (gf_auth_client *a)
 }
 
 /* The algorithm to sign with: the first the key can make that the server
-   accepts, if it said.  0 if there is none.  */
+   accepts, if it said.  0 if there is none.  The server's list names plain
+   algorithms only, and a certificate is signed for with the algorithm of
+   its key, so a certificate algorithm is looked up by its plain one.  */
 static enum gf_sigalg
 pick_alg (const gf_auth_client *a, const gf_key *key)
 {
@@ -770,11 +880,13 @@ pick_alg (const gf_auth_client *a, const gf_key *key)
 
   for (i = 0; i < n; i++)
     {
-      if (a->sigalgs == NULL)
+      /* The list is OpenSSH's and has nothing of X.509 in it: a chain is the
+         key's own business and the server says no if it does not take it.  */
+      if (a->sigalgs == NULL || gf_sigalg_is_x509 (algs[i]))
         return algs[i];
       if (gf_namelist_contains ((gf_slice) { (const uint8_t *) a->sigalgs,
                                              a->sigalgs_len },
-                                gf_sigalg_name (algs[i])))
+                                gf_sigalg_name (gf_sigalg_base (algs[i]))))
         return algs[i];
     }
   return 0;

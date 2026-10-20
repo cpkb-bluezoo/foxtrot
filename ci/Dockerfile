@@ -12,7 +12,7 @@ FROM ubuntu:24.04 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          autoconf autopoint automake build-essential ca-certificates curl \
-         bzip2 gettext libtool pkg-config texinfo \
+         bzip2 gettext libgnutls28-dev libtool pkg-config texinfo \
     && rm -rf /var/lib/apt/lists/*
 
 # foxtrot needs libgcrypt 1.12 or newer (the final ML-KEM), and that needs a

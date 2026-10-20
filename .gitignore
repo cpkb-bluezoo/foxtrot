@@ -53,6 +53,7 @@ Makefile
 # Tests: per-test logs and results, and the test/interop programs
 /integration/interop-client
 /integration/interop-server
+/integration/interop-key
 *.log
 *.trs
 /test-suite.log

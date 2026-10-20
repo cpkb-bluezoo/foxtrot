@@ -28,6 +28,10 @@
 #include <foxtrot/conn.h>
 
 #include "tst-pair.h"
+#include "vectors-cert.h"
+#ifdef HAVE_GNUTLS
+# include "vectors-x509.h"
+#endif
 
 static gf_key *hostkey;
 static gf_key *ukeys[4];	/* ed25519, p256, p384, rsa: users' keys.  */
@@ -53,6 +57,17 @@ struct ap
   int srv_authenticated;
   uint32_t srv_disconnect;
   int srv_hostbound_seen;
+  int accept_certs;		/* Accept any certificate the machine passed.  */
+  int srv_cert_seen;		/* Requests with a verified certificate.  */
+  int srv_cert_keys;		/* Requests whose key is a certificate.  */
+  int srv_verify_required;
+  int srv_x509_seen;
+  char srv_subject[128];
+  enum gf_sigalg srv_sigalg;
+  uint8_t srv_sk_flags;
+  uint32_t srv_sk_counter;
+  char srv_force[64];
+  uint64_t unix_now;
   char srv_user[64];
   enum gf_auth_method last_method;
 
@@ -87,6 +102,32 @@ srv_request (void *user, const gf_auth_request *req)
   switch (req->method)
     {
     case GF_AUTH_PUBLICKEY:
+      x->srv_sigalg = req->sigalg;
+      if (req->has_signature)
+        {
+          x->srv_sk_flags = req->sk_flags;
+          x->srv_sk_counter = req->sk_counter;
+        }
+      if (gf_key_is_certificate (req->key))
+        x->srv_cert_keys++;
+      if (req->x509)
+        {
+          x->srv_x509_seen++;
+          x->srv_subject[0] = '\0';
+          (void) gf_x509_subject (req->key, x->srv_subject, sizeof x->srv_subject);
+          if (x->accept_certs)
+            ok = 1;
+        }
+      if (req->certificate)
+        {
+          x->srv_cert_seen++;
+          x->srv_verify_required = req->verify_required;
+          snprintf (x->srv_force, sizeof x->srv_force, "%.*s",
+                    (int) req->force_command.len,
+                    (const char *) req->force_command.data);
+          if (x->accept_certs)
+            ok = 1;
+        }
       if (req->hostbound)
         x->srv_hostbound_seen++;
       if (req->has_signature)
@@ -135,6 +176,12 @@ srv_kbd_response (void *user, const gf_slice *r, size_t n)
 
   return (ok ? gf_auth_server_accept (x->srv, tst_now)
              : gf_auth_server_reject (x->srv, tst_now, 0)) != GF_OK;
+}
+
+static uint64_t
+srv_unix_time (void *user)
+{
+  return ((struct ap *) user)->unix_now;
 }
 
 static int
@@ -307,6 +354,7 @@ ap_new (struct ap *x, const gf_auth_server_config *scfg,
   x->sc.host_keys = &hostkey;
   x->sc.nhost_keys = 1;
   x->sc.announce_hostbound = scfg->hostbound;
+  x->unix_now = 1700000000;
   CHECK_EQ (pair_new (&x->p, &x->cc, &x->sc), GF_OK);
   x->p.sv.hook = x->p.cl.hook = x;
   x->p.sv.on_established = srv_on_established;
@@ -323,6 +371,7 @@ ap_new (struct ap *x, const gf_auth_server_config *scfg,
   se.kbdint_response = srv_kbd_response;
   se.authenticated = srv_authenticated;
   se.disconnect = srv_disconnect;
+  se.unix_time = srv_unix_time;
   CHECK_EQ (gf_auth_server_new (&x->srv, scfg, &se), GF_OK);
 
   if (cr != NULL)
@@ -1388,6 +1437,713 @@ test_construction (void)
   gf_key_free (pub);
 }
 
+/* ---------------------------------------------------------------- */
+/* Certificates                                                       */
+/* ---------------------------------------------------------------- */
+
+static gf_key *
+blob_key (const char *hex)
+{
+  static uint8_t b[4096];
+  gf_key *k = NULL;
+  size_t n = tst_unhex (hex, b, sizeof b);
+
+  CHECK_EQ (gf_key_from_blob (&k, b, n), GF_OK);
+  return k;
+}
+
+/* The key from the private key text with the certificate attached.  */
+static gf_key *
+cert_key (const char *priv, const char *cert_hex)
+{
+  gf_key *plain = NULL, *cert = blob_key (cert_hex), *both = NULL;
+
+  CHECK_EQ (gf_key_from_openssh_private (&plain, priv, strlen (priv)), GF_OK);
+  CHECK_EQ (gf_key_with_certificate (plain, cert, &both), GF_OK);
+  gf_key_free (plain);
+  gf_key_free (cert);
+  return both;
+}
+
+/* Run a client with the key against a server that trusts CAS, for USER,
+   with the peer at ADDRESS.  X is left for the caller to run, look at and
+   free.  */
+static void
+cert_login (struct ap *x, const gf_key *const *cas, size_t ncas,
+            const gf_key *key, const char *user, const char *address,
+            int hostbound)
+{
+  gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+  /* The client keeps pointers into this for as long as X lives.  */
+  static struct cli_creds cr;
+
+  cr = (struct cli_creds) { user, { key }, 1, NULL, 0, 0 };
+  sc.trusted_user_cas = cas;
+  sc.ntrusted_user_cas = ncas;
+  sc.peer_address = address;
+  sc.hostbound = hostbound;
+  ap_new (x, &sc, &cr);
+  x->accept_certs = 1;
+}
+
+static void
+test_certificates (void)
+{
+  gf_key *ca_ed = blob_key (vec_ca_ed_blob), *ca_rsa = blob_key (vec_ca_rsa_blob);
+  gf_key *ca_p256 = blob_key (vec_ca_p256_blob);
+  const gf_key *both[] = { ca_ed, ca_rsa };
+  const gf_key *only_p256[] = { ca_p256 };
+  gf_key *ck[4];
+  static const enum gf_sigalg want[4][2] = {
+    { GF_SIG_ED25519_CERT, 0 }, { GF_SIG_ECDSA_NISTP256_CERT, 0 },
+    { GF_SIG_ECDSA_NISTP384_CERT, 0 }, { GF_SIG_RSA_SHA2_512_CERT,
+                                         GF_SIG_RSA_SHA2_256_CERT }
+  };
+  struct ap x;
+  gf_slice fc;
+  size_t i;
+
+  ck[0] = cert_key (vec_ed_private, vec_ed_user_cert);
+  ck[1] = cert_key (vec_p256_private, vec_p256_user_cert);
+  ck[2] = cert_key (vec_p384_private, vec_p384_user_cert);
+  ck[3] = cert_key (vec_rsa_private, vec_rsa_user_cert);
+
+  /* A certificate of each type gets in, for either principal; the
+     application sees a verified certificate and its forced command, and the
+     machine keeps the command.  */
+  for (i = 0; i < 4; i++)
+    {
+      static const char *const users[] = { "alice", "bob" };
+      size_t u;
+
+      for (u = 0; u < 2; u++)
+        {
+          cert_login (&x, both, 2, ck[i], users[u], "192.0.2.77", 0);
+          ap_run (&x);
+          CHECK_EQ (x.cli_authenticated, 1);
+          CHECK_EQ (x.srv_authenticated, 1);
+          CHECK_EQ (x.srv_queries, 1);
+          CHECK_EQ (x.srv_signed, 1);
+          CHECK_EQ (x.srv_cert_seen, 2);
+          CHECK (strcmp (x.srv_force, "/bin/true") == 0);
+          CHECK (x.srv_sigalg == want[i][0] || x.srv_sigalg == want[i][1]);
+          CHECK (!x.srv_verify_required);
+          CHECK_EQ (gf_auth_server_force_command (x.srv, &fc), GF_OK);
+          CHECK (gf_slice_equals (fc, "/bin/true"));
+          CHECK_EQ (fc.data[fc.len], 0);
+          ap_free (&x);
+        }
+    }
+
+  /* With the host-bound method as well.  */
+  cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 1);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.srv_hostbound_seen, 2);
+  ap_free (&x);
+
+  /* A user the certificate does not name.  The application is not asked.  */
+  cert_login (&x, both, 2, ck[0], "carol", "192.0.2.77", 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 0);
+  CHECK_EQ (x.cli_failed, 1);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "ali", "192.0.2.77", 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+
+  /* A CA that is not trusted; no CAs at all.  */
+  cert_login (&x, only_p256, 1, ck[0], "alice", "192.0.2.77", 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 0);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, NULL, 0, ck[0], "alice", "192.0.2.77", 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 0);
+  CHECK_EQ (x.cli_failed, 1);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.srv_disconnect, 0);	/* Refused, not an offence.  */
+  ap_free (&x);
+
+  /* Before and after the validity period, and at its last second.  */
+  cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 0);
+  x.unix_now = 1500000000;
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.cli_authenticated, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 0);
+  x.unix_now = 4102358400u;
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 0);
+  x.unix_now = 4102358399u;
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  ap_free (&x);
+
+  /* source-address: outside the range, no address known, an IPv4 client
+     seen through an IPv6 socket, not an address at all.  */
+  cert_login (&x, both, 2, ck[0], "alice", "198.51.100.1", 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "alice", NULL, 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "alice", "localhost", 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  cert_login (&x, both, 2, ck[0], "alice", "::ffff:192.0.2.5", 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  ap_free (&x);
+
+  /* A certificate with neither option needs no address and forces nothing.  */
+  {
+    gf_key *free_key = cert_key (vec_ed_private, vec_forever_cert);
+
+    cert_login (&x, both, 2, free_key, "alice", NULL, 0);
+    ap_run (&x);
+    CHECK_EQ (x.cli_authenticated, 1);
+    CHECK_EQ (x.srv_force[0], 0);
+    CHECK_EQ (gf_auth_server_force_command (x.srv, &fc), GF_OK);
+    CHECK_EQ (fc.len, 0);
+    ap_free (&x);
+    gf_key_free (free_key);
+  }
+
+  /* verify-required is passed on for the application to enforce.  */
+  {
+    gf_key *k = cert_key (vec_ed_private, vec_verify_cert);
+
+    cert_login (&x, both, 2, k, "alice", NULL, 0);
+    ap_run (&x);
+    CHECK_EQ (x.cli_authenticated, 1);
+    CHECK (x.srv_verify_required);
+    ap_free (&x);
+    gf_key_free (k);
+  }
+
+  /* Certificates that are not usable: an unknown critical
+     option, a certificate for hosts, one past its time.  */
+  {
+    static const struct
+    {
+      const char *cert;
+      uint64_t now;
+    } bad[] = {
+      { vec_unknown_critical_cert, 1700000000 },
+      { vec_expired_cert, 1700000000 },
+      { vec_future_cert, 1700000000 },
+      { vec_ed_host_cert, 1700000000 }
+    };
+
+    for (i = 0; i < 4; i++)
+      {
+        gf_key *k = cert_key (vec_ed_private, bad[i].cert);
+
+        cert_login (&x, both, 2, k, "alice", "192.0.2.77", 0);
+        x.unix_now = bad[i].now;
+        ap_run (&x);
+        CHECK_EQ (x.cli_authenticated, 0);
+        CHECK_EQ (x.srv_requests, 0);
+        ap_free (&x);
+        gf_key_free (k);
+      }
+  }
+
+  /* The application can still say no to a good certificate (a revocation
+     list, say); the command was set aside by the request, and is gone
+     once another request replaces it.  */
+  cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 0);
+  x.accept_certs = 0;
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 0);
+  CHECK_EQ (x.srv_cert_seen, 1);
+  ap_free (&x);
+
+  /* A client with a certificate and a plain key: the server wants the plain
+     one, and a command from the certificate it turned down is not kept.  */
+  {
+    gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+    static struct cli_creds cr;
+
+    cr = (struct cli_creds) { "alice", { ck[0], ukeys[0] }, 2, NULL, 0, 0 };
+
+    sc.trusted_user_cas = both;
+    sc.ntrusted_user_cas = 2;
+    sc.peer_address = "192.0.2.77";
+    ap_new (&x, &sc, &cr);
+    x.authorized[0] = ukeys[0];
+    x.nauthorized = 1;
+    ap_run (&x);
+    CHECK_EQ (x.cli_authenticated, 1);
+    CHECK_EQ (x.srv_cert_seen, 1);
+    CHECK_EQ (gf_auth_server_force_command (x.srv, &fc), GF_OK);
+    CHECK_EQ (fc.len, 0);
+    ap_free (&x);
+  }
+
+  /* The wire: a certificate under the algorithm of its plain key is not a
+     certificate request at all.  */
+  {
+    gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+    uint8_t m[2048];
+    gf_writer w;
+    size_t bl;
+    const uint8_t *b = gf_key_blob (ck[0], &bl);
+
+    sc.trusted_user_cas = both;
+    sc.ntrusted_user_cas = 2;
+    sc.peer_address = "192.0.2.77";
+    ap_new (&x, &sc, NULL);
+    pair_start (&x.p);
+    pump (&x.p, 0);
+    CHECK_EQ (gf_conn_request_service (x.p.cl.c, tst_now, "ssh-userauth"), GF_OK);
+    pump (&x.p, 0);
+    gf_writer_init (&w, m, sizeof m);
+    gf_wr_u8 (&w, 50);
+    gf_wr_cstring (&w, "alice");
+    gf_wr_cstring (&w, "ssh-connection");
+    gf_wr_cstring (&w, "publickey");
+    gf_wr_bool (&w, 0);
+    gf_wr_cstring (&w, "ssh-ed25519");
+    gf_wr_string (&w, b, bl);
+    CHECK_EQ (gf_conn_send (x.p.cl.c, tst_now, m, w.len), GF_OK);
+    pump (&x.p, 0);
+    CHECK_EQ (x.srv_requests, 0);
+    /* And the same request under the right name does reach it.  */
+    gf_writer_init (&w, m, sizeof m);
+    gf_wr_u8 (&w, 50);
+    gf_wr_cstring (&w, "alice");
+    gf_wr_cstring (&w, "ssh-connection");
+    gf_wr_cstring (&w, "publickey");
+    gf_wr_bool (&w, 0);
+    gf_wr_cstring (&w, "ssh-ed25519-cert-v01@openssh.com");
+    gf_wr_string (&w, b, bl);
+    CHECK_EQ (gf_conn_send (x.p.cl.c, tst_now, m, w.len), GF_OK);
+    pump (&x.p, 0);
+    CHECK_EQ (x.srv_requests, 1);
+    CHECK_EQ (x.srv_cert_seen, 1);
+    ap_free (&x);
+  }
+
+  /* Configuration: a trusted CA must be a plain key.  */
+  {
+    gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+    gf_auth_server_events se;
+    gf_auth_server *a = NULL;
+    const gf_key *bad_cas[] = { ck[0] };
+    const gf_key *null_ca[] = { NULL };
+
+    memset (&se, 0, sizeof se);
+    se.send = srv_send;
+    se.request = srv_request;
+    se.disconnect = srv_disconnect;
+    sc.trusted_user_cas = bad_cas;
+    sc.ntrusted_user_cas = 1;
+    CHECK_EQ (gf_auth_server_new (&a, &sc, &se), GF_ERR_INVAL);
+    sc.trusted_user_cas = null_ca;
+    CHECK_EQ (gf_auth_server_new (&a, &sc, &se), GF_ERR_INVAL);
+    sc.trusted_user_cas = NULL;
+    CHECK_EQ (gf_auth_server_new (&a, &sc, &se), GF_ERR_INVAL);
+    sc.ntrusted_user_cas = 0;
+    CHECK_EQ (gf_auth_server_new (&a, &sc, &se), GF_OK);
+    gf_auth_server_free (a);
+  }
+
+  for (i = 0; i < 4; i++)
+    gf_key_free (ck[i]);
+  gf_key_free (ca_ed);
+  gf_key_free (ca_rsa);
+  gf_key_free (ca_p256);
+}
+
+/* ---------------------------------------------------------------- */
+/* Security keys                                                      */
+/* ---------------------------------------------------------------- */
+
+/* A token in software: a plain Ed25519 key stands in for the hardware, and
+   the security key has its public key and an application.  */
+static gf_key *
+soft_sk_public (const gf_key *plain, const char *app)
+{
+  uint8_t b[256];
+  size_t pl;
+  const uint8_t *pb = gf_key_blob (plain, &pl);
+  gf_writer w;
+  gf_key *k = NULL;
+
+  gf_writer_init (&w, b, sizeof b);
+  gf_wr_cstring (&w, "sk-ssh-ed25519@openssh.com");
+  gf_wr_string (&w, pb + 4 + 11 + 4, 32);
+  gf_wr_string (&w, app, strlen (app));
+  CHECK_EQ (gf_key_from_blob (&k, b, w.len), GF_OK);
+  return k;
+}
+
+/* What the token signs for MSG, as a signature blob. */
+static size_t
+token_sign (const gf_key *plain, const char *app, const uint8_t *m, size_t ml,
+            uint8_t flags, uint32_t counter, uint8_t *out, size_t cap)
+{
+  uint8_t buf[69], sig[GF_SIG_MAX];
+  size_t sl;
+  gf_reader r;
+  gf_slice name, raw;
+  gf_writer w;
+
+  CHECK_EQ (gf_hash_compute (GF_HASH_SHA256, app, strlen (app), buf, 32), GF_OK);
+  buf[32] = flags;
+  buf[33] = (uint8_t) (counter >> 24);
+  buf[34] = (uint8_t) (counter >> 16);
+  buf[35] = (uint8_t) (counter >> 8);
+  buf[36] = (uint8_t) counter;
+  CHECK_EQ (gf_hash_compute (GF_HASH_SHA256, m, ml, buf + 37, 32), GF_OK);
+  CHECK_EQ (gf_key_sign (plain, GF_SIG_ED25519, buf, sizeof buf, sig, sizeof sig,
+                         &sl), GF_OK);
+  gf_reader_init (&r, sig, sl);
+  CHECK_EQ (gf_rd_string (&r, &name), GF_OK);
+  CHECK_EQ (gf_rd_string (&r, &raw), GF_OK);
+  gf_writer_init (&w, out, cap);
+  gf_wr_cstring (&w, "sk-ssh-ed25519@openssh.com");
+  gf_wr_string (&w, raw.data, raw.len);
+  gf_wr_u8 (&w, flags);
+  gf_wr_u32 (&w, counter);
+  return w.len;
+}
+
+/* A user certificate for the security key, signed by CA.  */
+static gf_key *
+soft_sk_cert (gf_key *ca, const gf_key *plain, const char *app,
+              const char *principal, int verify_required)
+{
+  uint8_t b[1024], sig[GF_SIG_MAX], pr[64], crit[64];
+  size_t pl, cl, sl, signed_len, cabl;
+  const uint8_t *pb = gf_key_blob (plain, &pl), *cab = gf_key_blob (ca, &cabl);
+  gf_writer w, pw, cw;
+  uint8_t nonce[32];
+  gf_key *k = NULL;
+
+  memset (nonce, 0x17, sizeof nonce);
+  gf_writer_init (&pw, pr, sizeof pr);
+  gf_wr_string (&pw, principal, strlen (principal));
+  gf_writer_init (&cw, crit, sizeof crit);
+  if (verify_required)
+    {
+      gf_wr_cstring (&cw, "verify-required");
+      gf_wr_string (&cw, "", 0);
+    }
+  cl = cw.len;
+  gf_writer_init (&w, b, sizeof b);
+  gf_wr_cstring (&w, "sk-ssh-ed25519-cert-v01@openssh.com");
+  gf_wr_string (&w, nonce, sizeof nonce);
+  gf_wr_string (&w, pb + 4 + 11 + 4, 32);
+  gf_wr_string (&w, app, strlen (app));
+  gf_wr_u64 (&w, 3);
+  gf_wr_u32 (&w, GF_CERT_USER);
+  gf_wr_cstring (&w, "sk-test");
+  gf_wr_string (&w, pr, pw.len);
+  gf_wr_u64 (&w, 0);
+  gf_wr_u64 (&w, UINT64_MAX);
+  gf_wr_string (&w, crit, cl);
+  gf_wr_string (&w, "", 0);
+  gf_wr_string (&w, "", 0);
+  gf_wr_string (&w, cab, cabl);
+  signed_len = w.len;
+  CHECK_EQ (gf_key_sign (ca, GF_SIG_ED25519, b, signed_len, sig, sizeof sig, &sl),
+            GF_OK);
+  gf_wr_string (&w, sig, sl);
+  CHECK_EQ (gf_key_from_blob (&k, b, w.len), GF_OK);
+  return k;
+}
+
+/* A public key request from nobody in particular: the client end is not
+   used, and the message is written by hand.  KEY is what is offered (a
+   security key or its certificate), PLAIN and APP are the token's.  */
+static void
+sk_request (struct ap *x, const char *user, const gf_key *key,
+            const gf_key *plain, const char *app, const char *algname,
+            int with_sig, uint8_t flags, uint32_t counter)
+{
+  uint8_t m[2048], sd[2048], sig[256];
+  size_t bl, sl;
+  const uint8_t *b = gf_key_blob (key, &bl);
+  const gf_conn_info *in = &x->p.sv.info;
+  gf_writer w, d;
+
+  gf_writer_init (&w, m, sizeof m);
+  gf_wr_u8 (&w, 50);
+  gf_wr_cstring (&w, user);
+  gf_wr_cstring (&w, "ssh-connection");
+  gf_wr_cstring (&w, "publickey");
+  gf_wr_bool (&w, with_sig);
+  gf_wr_cstring (&w, algname);
+  gf_wr_string (&w, b, bl);
+  if (with_sig)
+    {
+      gf_writer_init (&d, sd, sizeof sd);
+      gf_wr_string (&d, in->session_id, in->session_id_len);
+      gf_wr_u8 (&d, 50);
+      gf_wr_cstring (&d, user);
+      gf_wr_cstring (&d, "ssh-connection");
+      gf_wr_cstring (&d, "publickey");
+      gf_wr_bool (&d, 1);
+      gf_wr_cstring (&d, algname);
+      gf_wr_string (&d, b, bl);
+      sl = token_sign (plain, app, sd, d.len, flags, counter, sig, sizeof sig);
+      gf_wr_string (&w, sig, sl);
+    }
+  CHECK_EQ (gf_wr_status (&w), GF_OK);
+  CHECK_EQ (gf_conn_send (x->p.cl.c, tst_now, m, w.len), GF_OK);
+  pump (&x->p, 0);
+}
+
+static void
+sk_server (struct ap *x, const gf_auth_server_config *sc)
+{
+  ap_new (x, sc, NULL);
+  pair_start (&x->p);
+  pump (&x->p, 0);
+  CHECK_EQ (gf_conn_request_service (x->p.cl.c, tst_now, "ssh-userauth"), GF_OK);
+  pump (&x->p, 0);
+}
+
+static void
+test_security_keys (void)
+{
+  gf_key *plain = NULL, *sk, *ca = NULL, *cert, *other_app;
+  gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+  const gf_key *cas[1];
+  struct ap x;
+
+  CHECK_EQ (gf_key_generate (&plain, GF_KEY_ED25519, 0), GF_OK);
+  CHECK_EQ (gf_key_generate (&ca, GF_KEY_ED25519, 0), GF_OK);
+  sk = soft_sk_public (plain, "ssh:");
+  other_app = soft_sk_public (plain, "ssh:other");
+
+  /* The query, then the signature; the application sees the token's flags
+     and counter, and the algorithm.  */
+  sk_server (&x, &sc);
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  sk_request (&x, "dave", sk, plain, "ssh:", "sk-ssh-ed25519@openssh.com", 0, 0, 0);
+  CHECK_EQ (x.srv_queries, 1);
+  sk_request (&x, "dave", sk, plain, "ssh:", "sk-ssh-ed25519@openssh.com", 1,
+              GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED, 0x01020304);
+  CHECK_EQ (x.srv_signed, 1);
+  CHECK_EQ (x.srv_authenticated, 1);
+  CHECK_EQ (x.srv_sigalg, GF_SIG_SK_ED25519);
+  CHECK_EQ (x.srv_sk_flags, GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED);
+  CHECK_EQ (x.srv_sk_counter, 0x01020304);
+  CHECK_EQ (x.srv_cert_keys, 0);
+  ap_free (&x);
+
+  /* The token not touched: genuine, refused before the application is asked,
+     and a failed attempt, not an offence.  */
+  sk_server (&x, &sc);
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  sk_request (&x, "dave", sk, plain, "ssh:", "sk-ssh-ed25519@openssh.com", 1, 0, 1);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.srv_authenticated, 0);
+  CHECK_EQ (x.srv_disconnect, 0);
+  /* And then it is touched.  */
+  sk_request (&x, "dave", sk, plain, "ssh:", "sk-ssh-ed25519@openssh.com", 1,
+              GF_SK_USER_PRESENT, 2);
+  CHECK_EQ (x.srv_authenticated, 1);
+  ap_free (&x);
+
+  /* A signature for another application is not a signature for this key. */
+  sk_server (&x, &sc);
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  sk_request (&x, "dave", sk, plain, "ssh:other", "sk-ssh-ed25519@openssh.com", 1, 1, 1);
+  CHECK_EQ (x.srv_requests, 0);
+  sk_request (&x, "dave", other_app, plain, "ssh:", "sk-ssh-ed25519@openssh.com", 1, 1, 1);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.srv_authenticated, 0);
+  ap_free (&x);
+
+  /* Under the plain algorithm name the key is not an Ed25519 key. */
+  sk_server (&x, &sc);
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  sk_request (&x, "dave", sk, plain, "ssh:", "ssh-ed25519", 0, 0, 0);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+
+  /* Certificates for the security key: a trusted CA, and verify-required
+     which only a token that verified its user satisfies.  */
+  cas[0] = ca;
+  sc.trusted_user_cas = cas;
+  sc.ntrusted_user_cas = 1;
+  cert = soft_sk_cert (ca, plain, "ssh:", "erin", 0);
+  sk_server (&x, &sc);
+  x.accept_certs = 1;
+  sk_request (&x, "erin", cert, plain, "ssh:", "sk-ssh-ed25519-cert-v01@openssh.com", 1, 1, 9);
+  CHECK_EQ (x.srv_authenticated, 1);
+  CHECK_EQ (x.srv_cert_seen, 1);
+  CHECK_EQ (x.srv_cert_keys, 1);
+  CHECK_EQ (x.srv_sigalg, GF_SIG_SK_ED25519_CERT);
+  CHECK_EQ (x.srv_sk_counter, 9);
+  CHECK (!x.srv_verify_required);
+  ap_free (&x);
+  /* Not for this user. */
+  sk_server (&x, &sc);
+  x.accept_certs = 1;
+  sk_request (&x, "dave", cert, plain, "ssh:", "sk-ssh-ed25519-cert-v01@openssh.com", 1, 1, 9);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  gf_key_free (cert);
+  cert = soft_sk_cert (ca, plain, "ssh:", "erin", 1);
+  sk_server (&x, &sc);
+  x.accept_certs = 1;
+  sk_request (&x, "erin", cert, plain, "ssh:", "sk-ssh-ed25519-cert-v01@openssh.com", 1,
+              GF_SK_USER_PRESENT, 9);
+  CHECK_EQ (x.srv_authenticated, 0);
+  CHECK_EQ (x.srv_requests, 0);
+  sk_request (&x, "erin", cert, plain, "ssh:", "sk-ssh-ed25519-cert-v01@openssh.com", 1,
+              GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED, 10);
+  CHECK_EQ (x.srv_authenticated, 1);
+  CHECK (x.srv_verify_required);
+  ap_free (&x);
+  gf_key_free (cert);
+
+  gf_key_free (sk);
+  gf_key_free (other_app);
+  gf_key_free (plain);
+  gf_key_free (ca);
+}
+
+#ifdef HAVE_GNUTLS
+/* ---------------------------------------------------------------- */
+/* X.509 chains                                                       */
+/* ---------------------------------------------------------------- */
+
+static gf_key *
+x509_user_key (const char *priv_pem, const char *blob_hex)
+{
+  static uint8_t b[16384];
+  gf_key *priv = NULL, *chain = NULL, *k = NULL;
+  const uint8_t *cd[8];
+  size_t cl[8], i, n;
+
+  CHECK_EQ (gf_key_from_openssh_private (&priv, priv_pem, strlen (priv_pem)), GF_OK);
+  n = tst_unhex (blob_hex, b, sizeof b);
+  CHECK_EQ (gf_key_from_blob (&chain, b, n), GF_OK);
+  n = gf_x509_chain_length (chain);
+  for (i = 0; i < n; i++)
+    CHECK_EQ (gf_x509_chain_cert (chain, i, &cd[i], &cl[i]), GF_OK);
+  CHECK_EQ (gf_key_with_x509 (priv, cd, cl, n, &k), GF_OK);
+  gf_key_free (priv);
+  gf_key_free (chain);
+  return k;
+}
+
+static gf_x509_trust *
+x509_trust_of (const char *der_hex)
+{
+  static uint8_t d[8192];
+  gf_x509_trust *t = NULL;
+
+  CHECK_EQ (gf_x509_trust_new (&t), GF_OK);
+  CHECK_EQ (gf_x509_trust_add_ca (t, d, tst_unhex (der_hex, d, sizeof d)), GF_OK);
+  return t;
+}
+
+static void
+x509_login (struct ap *x, const gf_x509_trust *trust, const gf_key *key,
+            int hostbound)
+{
+  gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+  static struct cli_creds cr;
+
+  cr = (struct cli_creds) { "alice", { key }, 1, NULL, 0, 0 };
+  sc.x509_trust = trust;
+  sc.hostbound = hostbound;
+  ap_new (x, &sc, &cr);
+  x->accept_certs = 1;
+}
+
+static void
+test_x509 (void)
+{
+  gf_x509_trust *root = x509_trust_of (vec_x_root), *other = x509_trust_of (vec_x_ca2);
+  gf_key *user = x509_user_key (vec_x_client_private, vec_x_client_blob);
+  gf_key *server = x509_user_key (vec_x_p256_private, vec_x_p256_blob);
+  struct ap x;
+
+  /* A user with a chain the server's trust vouches for: the application sees
+     the subject, the algorithm is the chain's, and (when the server
+     announced the host-bound method) the signature is bound to the host.  */
+  x509_login (&x, root, user, 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.srv_authenticated, 1);
+  CHECK_EQ (x.srv_x509_seen, 2);		/* The query, then the signed request. */
+  CHECK (strcmp (x.srv_subject, "CN=alice") == 0);
+  CHECK_EQ (x.srv_sigalg, GF_SIG_X509_ECDSA_NISTP256);
+  CHECK_EQ (x.srv_cert_keys, 0);		/* Not an OpenSSH certificate.  */
+  ap_free (&x);
+  x509_login (&x, root, user, 1);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.srv_hostbound_seen, 2);
+  ap_free (&x);
+
+  /* No trust configured: no chain is a user. */
+  x509_login (&x, NULL, user, 0);
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 0);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.srv_disconnect, 0);
+  ap_free (&x);
+  /* A trust that is another CA's. */
+  x509_login (&x, other, user, 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.cli_authenticated, 0);
+  ap_free (&x);
+  /* A host's chain is not a user's. */
+  x509_login (&x, root, server, 0);
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  CHECK_EQ (x.cli_authenticated, 0);
+  ap_free (&x);
+  /* By the server's clock: before the certificates and after them. */
+  x509_login (&x, root, user, 0);
+  x.unix_now = 1500000000;
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  x509_login (&x, root, user, 0);
+  x.unix_now = 4200000000u;
+  ap_run (&x);
+  CHECK_EQ (x.srv_requests, 0);
+  ap_free (&x);
+  /* The application can still say no. */
+  x509_login (&x, root, user, 0);
+  x.accept_certs = 0;
+  ap_run (&x);
+  CHECK_EQ (x.srv_x509_seen, 1);
+  CHECK_EQ (x.cli_authenticated, 0);
+  ap_free (&x);
+
+  gf_key_free (user);
+  gf_key_free (server);
+  gf_x509_trust_free (root);
+  gf_x509_trust_free (other);
+}
+#endif /* HAVE_GNUTLS */
+
 int
 main (void)
 {
@@ -1412,6 +2168,11 @@ main (void)
   test_protocol_errors ();
   test_refused_keys ();
   test_limits_and_timeout ();
+  test_certificates ();
+  test_security_keys ();
+#ifdef HAVE_GNUTLS
+  test_x509 ();
+#endif
   for (i = 0; i < 4; i++)
     gf_key_free (ukeys[i]);
   gf_key_free (stranger);

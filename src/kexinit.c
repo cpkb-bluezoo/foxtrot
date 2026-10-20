@@ -148,7 +148,8 @@ gf_kexinit_make (uint8_t *buf, size_t cap, size_t *len, int server,
     {
       const char *name = gf_sigalg_name (sig[i]);
 
-      if (name == NULL)
+      /* A security key signs on a token for a user; a host has none.  */
+      if (name == NULL || gf_sigalg_is_user_only (sig[i]))
         return GF_ERR_UNSUPPORTED;
       if ((r = append (list, &n, name)) != GF_OK)
         return r;
@@ -215,7 +216,9 @@ kex_from (const char *s, size_t n)
 static unsigned
 sig_from (const char *s, size_t n)
 {
-  return (unsigned) gf_sigalg_from_name (s, n);
+  enum gf_sigalg a = gf_sigalg_from_name (s, n);
+
+  return gf_sigalg_is_user_only (a) ? 0 : (unsigned) a;
 }
 
 static unsigned

@@ -95,6 +95,10 @@ typedef struct gf_session_events
   int (*rekeyed) (void *user, const gf_conn_info *info);
   /* Client: trust this host key?  Return 0 to trust it.  */
   int (*host_key) (void *user, const gf_key *key);
+  /* The wall clock in seconds since 1970, for the validity of
+     certificates (a server's user certificates; see auth.h).  Optional:
+     without it the library reads time(2).  */
+  uint64_t (*unix_time) (void *user);
   /* SSH_MSG_DEBUG from the peer.  The text is the peer's; sanitize it.  */
   void (*debug) (void *user, int always_display, gf_slice text);
   /* The peer did not understand our packet number SEQ.  */
@@ -156,7 +160,8 @@ typedef struct gf_session_events
 typedef struct gf_session_config
 {
   gf_conn_config conn;
-  /* Server: what to offer (methods, host-bound, limits).  */
+  /* Server: what to offer (methods, host-bound, limits, the user CAs and
+     the client's address).  */
   gf_auth_server_config server_auth;
   /* Client: who to be and how (user, keys, password, methods).  */
   gf_auth_client_config client_auth;
@@ -192,6 +197,12 @@ const gf_conn_info *gf_session_info (const gf_session *s);
 /* The authenticated user, as a NUL-terminated string, on a server after
    authentication; else NULL.  */
 const char *gf_session_user (const gf_session *s);
+/* A server, after authentication: the command the user's certificate
+   forces ("force-command"), or NULL if there is none.  If there is one the
+   application must run it, and only it, in place of whatever the client
+   asks for in an exec, shell or subsystem request.  Valid until the
+   session is freed.  */
+const char *gf_session_force_command (const gf_session *s);
 
 /* The layers underneath, for what the session does not wrap: channel
    operations (open, send data, requests, close: see chan.h) and transport

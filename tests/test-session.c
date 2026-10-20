@@ -27,6 +27,11 @@
 #include <foxtrot/session.h>
 
 #include "tst-util.h"
+#include "vectors-cert.h"
+#ifdef HAVE_GNUTLS
+# include <foxtrot/x509.h>
+# include "vectors-x509.h"
+#endif
 
 /* Two sessions wired to each other on a virtual clock, with a small
    application on each side.  */
@@ -54,6 +59,12 @@ struct node
   int hold_auth;		/* Do not answer authentication requests.  */
   int no_open_cb;
   int deny_global;
+  int accept_cert;		/* Accept a certificate the library verified.  */
+  int host_was_cert, host_cert_ok;
+  int host_was_x509, host_x509_ok;
+#ifdef HAVE_GNUTLS
+  const gf_x509_trust *x509_trust;
+#endif
 
   /* Events seen.  */
   int established, authenticated, auth_failed, banners, closed;
@@ -100,8 +111,24 @@ w_host_key (void *u, const gf_key *k)
 {
   struct node *x = u;
 
-  (void) k;
   x->host_key_calls++;
+  /* What a client does with a host certificate: it is for a host, it is good
+     now, and it names the host we meant to reach.  */
+  x->host_was_cert = gf_key_is_certificate (k);
+  x->host_cert_ok = x->host_was_cert
+    && gf_cert_check (k, GF_CERT_HOST, 1700000000, NULL) == GF_OK
+    && gf_cert_has_principal (k, "www.example.org", 15, 1);
+#ifdef HAVE_GNUTLS
+  /* A chain is trusted when the store vouches for it as a server, by name. */
+  if (gf_x509_chain_length (k) > 0)
+    {
+      x->host_was_x509 = 1;
+      x->host_x509_ok = x->x509_trust != NULL
+        && gf_x509_verify (x->x509_trust, k, GF_X509_SERVER, "host.example.org",
+                           1700000000, NULL) == GF_OK;
+      return x->trust && x->host_x509_ok ? 0 : 1;
+    }
+#endif
   return x->trust ? 0 : 1;
 }
 
@@ -135,7 +162,8 @@ w_auth_request (void *u, const gf_auth_request *r)
   switch (r->method)
     {
     case GF_AUTH_PUBLICKEY:
-      ok = x->authorized && gf_key_equal (x->authorized, r->key);
+      ok = (x->authorized && gf_key_equal (x->authorized, r->key))
+        || (x->accept_cert && r->certificate);
       if (!r->has_signature)
         return (ok ? gf_session_auth_pk_ok (x->s)
                    : gf_session_auth_reject (x->s, 0)) != GF_OK;
@@ -365,6 +393,13 @@ struct opts
   int hostbound;
   int no_channel_cb;
   int kbd;
+  gf_key *host_key;		/* Instead of the plain one.  */
+#ifdef HAVE_GNUTLS
+  const gf_x509_trust *x509_trust;	/* The client's.  */
+#endif
+  const gf_key *const *cas;	/* The server's trusted user CAs.  */
+  size_t ncas;
+  const char *peer_address;
 };
 
 static void
@@ -373,16 +408,24 @@ world_new (struct world *w, const struct opts *o)
   gf_session_config cc, sc;
   gf_session_events ce, se;
   static const gf_key *keys[1];	/* Must outlive the session.  */
+  static gf_key *host_keys[1];
 
   memset (w, 0, sizeof *w);
   w->c.peer = &w->sv;
   w->sv.peer = &w->c;
   w->sv.is_server = 1;
   w->c.trust = o->client_trusts;
+#ifdef HAVE_GNUTLS
+  w->c.x509_trust = o->x509_trust;
+#endif
   memset (&cc, 0, sizeof cc);
   memset (&sc, 0, sizeof sc);
-  sc.conn.host_keys = &hostkey;
+  host_keys[0] = o->host_key ? o->host_key : hostkey;
+  sc.conn.host_keys = host_keys;
   sc.conn.nhost_keys = 1;
+  sc.server_auth.trusted_user_cas = o->cas;
+  sc.server_auth.ntrusted_user_cas = o->ncas;
+  sc.server_auth.peer_address = o->peer_address;
   sc.conn.rekey_bytes = cc.conn.rekey_bytes = o->rekey_bytes;
   sc.server_auth.methods = o->methods ? o->methods : GF_AUTH_PUBLICKEY;
   sc.server_auth.hostbound = o->hostbound;
@@ -443,6 +486,7 @@ world_new (struct world *w, const struct opts *o)
   CHECK_EQ (gf_session_client_new (&w->c.s, &cc, &ce), GF_OK);
   CHECK_EQ (gf_session_server_new (&w->sv.s, &sc, &se), GF_OK);
   w->sv.authorized = userkey;
+  w->sv.accept_cert = o->ncas > 0;
   w->sv.password = o->authorized_pw;
   w->sv.code = "4711";
   w->c.kbd_answer = "4711";
@@ -513,8 +557,12 @@ test_full_flow (void)
   for (i = 0; i < sizeof chunks / sizeof chunks[0]; i++)
     {
       struct world w;
-      struct opts o = { 1, userkey, NULL, NULL, GF_AUTH_PUBLICKEY, 0, 0, 0, 0,
-                        0, 0 };
+      struct opts o;
+
+      memset (&o, 0, sizeof o);
+      o.client_trusts = 1;
+      o.client_key = userkey;
+      o.methods = GF_AUTH_PUBLICKEY;
 
       world_new (&w, &o);
       CHECK_EQ (gf_session_phase (w.c.s), GF_PHASE_HANDSHAKE);
@@ -1326,6 +1374,191 @@ test_resume (void)
   world_free (&w);
 }
 
+/* Certificates, through the session: a user certificate (the server learns
+   its forced command), and a server whose host key is a certificate.  */
+static gf_key *
+cert_of (const char *priv, const char *cert_hex)
+{
+  static uint8_t b[4096];
+  gf_key *plain = NULL, *cert = NULL, *both = NULL;
+  size_t n = tst_unhex (cert_hex, b, sizeof b);
+
+  CHECK_EQ (gf_key_from_openssh_private (&plain, priv, strlen (priv)), GF_OK);
+  CHECK_EQ (gf_key_from_blob (&cert, b, n), GF_OK);
+  CHECK_EQ (gf_key_with_certificate (plain, cert, &both), GF_OK);
+  gf_key_free (plain);
+  gf_key_free (cert);
+  return both;
+}
+
+static void
+test_certificates (void)
+{
+  struct world w;
+  struct opts o;
+  gf_key *ca = NULL, *ukey, *hkey;
+  const gf_key *cas[1];
+  static uint8_t cab[256];
+  size_t n = tst_unhex (vec_ca_ed_blob, cab, sizeof cab);
+
+  CHECK_EQ (gf_key_from_blob (&ca, cab, n), GF_OK);
+  cas[0] = ca;
+  ukey = cert_of (vec_ed_private, vec_ed_user_cert);
+  hkey = cert_of (vec_ed_private, vec_ed_host_cert);
+
+  memset (&o, 0, sizeof o);
+  o.client_trusts = 1;
+  o.client_key = ukey;
+  o.cas = cas;
+  o.ncas = 1;
+  o.peer_address = "192.0.2.50";
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.c.authenticated, 1);
+  CHECK_EQ (w.sv.authenticated, 1);
+  CHECK (!w.c.host_was_cert);
+  CHECK (gf_session_force_command (w.sv.s) != NULL
+         && strcmp (gf_session_force_command (w.sv.s), "/bin/true") == 0);
+  CHECK (gf_session_force_command (w.c.s) == NULL);
+  CHECK (strcmp (gf_session_user (w.sv.s), "alice") == 0);
+  world_free (&w);
+
+  /* The wrong address: the certificate is not taken.  */
+  o.peer_address = "198.51.100.9";
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.c.authenticated, 0);
+  CHECK_EQ (w.sv.authenticated, 0);
+  CHECK (gf_session_force_command (w.sv.s) == NULL);
+  world_free (&w);
+
+  /* No CAs: the same client is not let in, and no command is invented.  */
+  o.peer_address = "192.0.2.50";
+  o.cas = NULL;
+  o.ncas = 0;
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.sv.authenticated, 0);
+  world_free (&w);
+
+  /* A host certificate: the client is shown the certificate, and the key
+     exchange and everything after it work as with a plain key.  */
+  memset (&o, 0, sizeof o);
+  o.client_trusts = 1;
+  o.client_key = userkey;
+  o.host_key = hkey;
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.c.host_key_calls, 1);
+  CHECK (w.c.host_was_cert);
+  CHECK (w.c.host_cert_ok);
+  CHECK_EQ (w.c.authenticated, 1);
+  CHECK (gf_session_force_command (w.sv.s) == NULL);
+  world_free (&w);
+  /* With the host-bound public key method, which signs over the host key
+     blob: the certificate's.  */
+  o.hostbound = 1;
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.c.authenticated, 1);
+  world_free (&w);
+  /* The client, not trusting it, ends the connection.  */
+  o.client_trusts = 0;
+  world_new (&w, &o);
+  run (&w);
+  CHECK_EQ (w.c.host_key_calls, 1);
+  CHECK_EQ (w.c.authenticated, 0);
+  world_free (&w);
+
+  gf_key_free (ukey);
+  gf_key_free (hkey);
+  gf_key_free (ca);
+}
+
+#ifdef HAVE_GNUTLS
+/* An X.509 chain as the host key: the transport signs with the chain's key
+   under the RFC 6187 algorithm and the client decides with the store.  */
+static gf_key *
+x509_host_key (const char *priv_pem, const char *blob_hex)
+{
+  static uint8_t b[16384];
+  gf_key *priv = NULL, *chain = NULL, *k = NULL;
+  const uint8_t *cd[8];
+  size_t cl[8], i, n;
+
+  CHECK_EQ (gf_key_from_openssh_private (&priv, priv_pem, strlen (priv_pem)), GF_OK);
+  n = tst_unhex (blob_hex, b, sizeof b);
+  CHECK_EQ (gf_key_from_blob (&chain, b, n), GF_OK);
+  n = gf_x509_chain_length (chain);
+  for (i = 0; i < n; i++)
+    CHECK_EQ (gf_x509_chain_cert (chain, i, &cd[i], &cl[i]), GF_OK);
+  CHECK_EQ (gf_key_with_x509 (priv, cd, cl, n, &k), GF_OK);
+  gf_key_free (priv);
+  gf_key_free (chain);
+  return k;
+}
+
+static void
+test_x509_host_keys (void)
+{
+  static const struct
+  {
+    const char *priv, *blob;
+    enum gf_sigalg alg;
+  } v[] = {
+    { vec_x_p256_private, vec_x_p256_blob, GF_SIG_X509_ECDSA_NISTP256 },
+    { vec_x_p384_private, vec_x_p384_blob, GF_SIG_X509_ECDSA_NISTP384 },
+    { vec_x_rsa_private, vec_x_rsa_blob, GF_SIG_X509_RSA2048_SHA256 }
+  };
+  static uint8_t d[8192];
+  gf_x509_trust *root = NULL, *other = NULL;
+  size_t i;
+
+  CHECK_EQ (gf_x509_trust_new (&root), GF_OK);
+  CHECK_EQ (gf_x509_trust_add_ca (root, d, tst_unhex (vec_x_root, d, sizeof d)), GF_OK);
+  CHECK_EQ (gf_x509_trust_new (&other), GF_OK);
+  CHECK_EQ (gf_x509_trust_add_ca (other, d, tst_unhex (vec_x_ca2, d, sizeof d)), GF_OK);
+  for (i = 0; i < 3; i++)
+    {
+      struct world w;
+      struct opts o;
+      gf_key *hk = x509_host_key (v[i].priv, v[i].blob);
+
+      memset (&o, 0, sizeof o);
+      o.client_trusts = 1;
+      o.client_key = userkey;
+      o.host_key = hk;
+      o.x509_trust = root;
+      world_new (&w, &o);
+      run (&w);
+      CHECK_EQ (w.c.host_key_calls, 1);
+      CHECK (w.c.host_was_x509 && w.c.host_x509_ok);
+      CHECK_EQ (gf_session_info (w.c.s)->hostkey_alg, v[i].alg);
+      CHECK_EQ (w.c.authenticated, 1);
+      CHECK_EQ (w.sv.authenticated, 1);
+      world_free (&w);
+      /* Another CA's store: the callback refuses, nothing goes further.  */
+      o.x509_trust = other;
+      world_new (&w, &o);
+      run (&w);
+      CHECK (w.c.host_was_x509 && !w.c.host_x509_ok);
+      CHECK_EQ (w.c.authenticated, 0);
+      CHECK_EQ (w.sv.authenticated, 0);
+      world_free (&w);
+      /* Host-bound authentication signs over the chain's blob. */
+      o.x509_trust = root;
+      o.hostbound = 1;
+      world_new (&w, &o);
+      run (&w);
+      CHECK_EQ (w.c.authenticated, 1);
+      world_free (&w);
+      gf_key_free (hk);
+    }
+  gf_x509_trust_free (root);
+  gf_x509_trust_free (other);
+}
+#endif /* HAVE_GNUTLS */
+
 int
 main (void)
 {
@@ -1342,6 +1575,10 @@ main (void)
   test_resume ();
   test_sftp (0);
   test_sftp (400000);
+  test_certificates ();
+#ifdef HAVE_GNUTLS
+  test_x509_host_keys ();
+#endif
   gf_key_free (hostkey);
   gf_key_free (userkey);
   gf_key_free (otherkey);

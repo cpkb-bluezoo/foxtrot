@@ -65,22 +65,77 @@ struct sig_entry
   enum gf_sigalg alg;
   const char *name;
   const char *key_type;		/* Name of the key type in a key blob.  */
+  enum gf_sigalg base;		/* The plain algorithm; itself if plain.  */
+  int cert;
+  int user_only;		/* Never a host key.  */
+  int x509;
 };
 
 static const struct sig_entry sigs[] = {
-  { GF_SIG_ED25519,        "ssh-ed25519",         "ssh-ed25519" },
-  { GF_SIG_ECDSA_NISTP256, "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256" },
-  { GF_SIG_ECDSA_NISTP384, "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384" },
-  { GF_SIG_RSA_SHA2_512,   "rsa-sha2-512",        "ssh-rsa" },
-  { GF_SIG_RSA_SHA2_256,   "rsa-sha2-256",        "ssh-rsa" }
+  { GF_SIG_ED25519,        "ssh-ed25519",         "ssh-ed25519",
+    GF_SIG_ED25519, 0, 0, 0 },
+  { GF_SIG_ECDSA_NISTP256, "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256",
+    GF_SIG_ECDSA_NISTP256, 0, 0, 0 },
+  { GF_SIG_ECDSA_NISTP384, "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384",
+    GF_SIG_ECDSA_NISTP384, 0, 0, 0 },
+  { GF_SIG_RSA_SHA2_512,   "rsa-sha2-512",        "ssh-rsa",
+    GF_SIG_RSA_SHA2_512, 0, 0, 0 },
+  { GF_SIG_RSA_SHA2_256,   "rsa-sha2-256",        "ssh-rsa",
+    GF_SIG_RSA_SHA2_256, 0, 0, 0 },
+  { GF_SIG_ED25519_CERT,   "ssh-ed25519-cert-v01@openssh.com",
+    "ssh-ed25519-cert-v01@openssh.com", GF_SIG_ED25519, 1, 0, 0 },
+  { GF_SIG_ECDSA_NISTP256_CERT, "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com", GF_SIG_ECDSA_NISTP256, 1, 0, 0 },
+  { GF_SIG_ECDSA_NISTP384_CERT, "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com", GF_SIG_ECDSA_NISTP384, 1, 0, 0 },
+  { GF_SIG_RSA_SHA2_512_CERT, "rsa-sha2-512-cert-v01@openssh.com",
+    "ssh-rsa-cert-v01@openssh.com", GF_SIG_RSA_SHA2_512, 1, 0, 0 },
+  { GF_SIG_RSA_SHA2_256_CERT, "rsa-sha2-256-cert-v01@openssh.com",
+    "ssh-rsa-cert-v01@openssh.com", GF_SIG_RSA_SHA2_256, 1, 0, 0 },
+  { GF_SIG_SK_ED25519, "sk-ssh-ed25519@openssh.com",
+    "sk-ssh-ed25519@openssh.com", GF_SIG_SK_ED25519, 0, 1, 0 },
+  { GF_SIG_SK_ECDSA_NISTP256, "sk-ecdsa-sha2-nistp256@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com", GF_SIG_SK_ECDSA_NISTP256, 0, 1, 0 },
+  { GF_SIG_SK_ED25519_CERT, "sk-ssh-ed25519-cert-v01@openssh.com",
+    "sk-ssh-ed25519-cert-v01@openssh.com", GF_SIG_SK_ED25519, 1, 1, 0 },
+  { GF_SIG_SK_ECDSA_NISTP256_CERT, "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com", GF_SIG_SK_ECDSA_NISTP256, 1, 1, 0 },
+  { GF_SIG_X509_ECDSA_NISTP256, "x509v3-ecdsa-sha2-nistp256",
+    "x509v3-ecdsa-sha2-nistp256", GF_SIG_X509_ECDSA_NISTP256, 0, 0, 1 },
+  { GF_SIG_X509_ECDSA_NISTP384, "x509v3-ecdsa-sha2-nistp384",
+    "x509v3-ecdsa-sha2-nistp384", GF_SIG_X509_ECDSA_NISTP384, 0, 0, 1 },
+  { GF_SIG_X509_RSA2048_SHA256, "x509v3-rsa2048-sha256",
+    "x509v3-rsa2048-sha256", GF_SIG_X509_RSA2048_SHA256, 0, 0, 1 }
 };
 
+/* Plain algorithms first: a client with no certificate authority to trust
+   must not be steered to a certificate by a server that offers both, and
+   the X.509 chains, which need a whole PKI to trust, last.  */
 static const enum gf_sigalg default_sigs[] = {
   GF_SIG_ED25519,
   GF_SIG_ECDSA_NISTP256,
   GF_SIG_ECDSA_NISTP384,
   GF_SIG_RSA_SHA2_512,
-  GF_SIG_RSA_SHA2_256
+  GF_SIG_RSA_SHA2_256,
+  GF_SIG_ED25519_CERT,
+  GF_SIG_ECDSA_NISTP256_CERT,
+  GF_SIG_ECDSA_NISTP384_CERT,
+  GF_SIG_RSA_SHA2_512_CERT,
+  GF_SIG_RSA_SHA2_256_CERT,
+  GF_SIG_X509_ECDSA_NISTP256,
+  GF_SIG_X509_ECDSA_NISTP384,
+  GF_SIG_X509_RSA2048_SHA256
+};
+
+/* What users may sign with: the plain algorithms, the security keys.  */
+static const enum gf_sigalg user_sigs[] = {
+  GF_SIG_ED25519,
+  GF_SIG_ECDSA_NISTP256,
+  GF_SIG_ECDSA_NISTP384,
+  GF_SIG_RSA_SHA2_512,
+  GF_SIG_RSA_SHA2_256,
+  GF_SIG_SK_ED25519,
+  GF_SIG_SK_ECDSA_NISTP256
 };
 
 struct cipher_entry
@@ -181,6 +236,56 @@ gf_sigalg_key_type (enum gf_sigalg alg)
   return NULL;
 }
 
+int
+gf_sigalg_is_x509 (enum gf_sigalg alg)
+{
+  size_t i;
+
+  for (i = 0; i < ARRAY_LEN (sigs); i++)
+    if (sigs[i].alg == alg)
+      return sigs[i].x509;
+  return 0;
+}
+
+int
+gf_sigalg_is_user_only (enum gf_sigalg alg)
+{
+  size_t i;
+
+  for (i = 0; i < ARRAY_LEN (sigs); i++)
+    if (sigs[i].alg == alg)
+      return sigs[i].user_only;
+  return 0;
+}
+
+int
+gf_sigalg_is_cert (enum gf_sigalg alg)
+{
+  size_t i;
+
+  for (i = 0; i < ARRAY_LEN (sigs); i++)
+    if (sigs[i].alg == alg)
+      return sigs[i].cert;
+  return 0;
+}
+
+enum gf_sigalg
+gf_sigalg_base (enum gf_sigalg alg)
+{
+  size_t i;
+
+  for (i = 0; i < ARRAY_LEN (sigs); i++)
+    if (sigs[i].alg == alg)
+      return sigs[i].base;
+  return alg;
+}
+
+const char *
+gf_sigalg_signature_name (enum gf_sigalg alg)
+{
+  return gf_sigalg_name (gf_sigalg_base (alg));
+}
+
 enum gf_sigalg
 gf_sigalg_from_name (const char *name, size_t n)
 {
@@ -235,6 +340,13 @@ gf_policy_default_sigalgs (size_t *n)
 {
   *n = ARRAY_LEN (default_sigs);
   return default_sigs;
+}
+
+const enum gf_sigalg *
+gf_policy_user_sigalgs (size_t *n)
+{
+  *n = ARRAY_LEN (user_sigs);
+  return user_sigs;
 }
 
 const enum gf_cipher *

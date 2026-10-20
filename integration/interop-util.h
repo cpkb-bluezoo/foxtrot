@@ -123,4 +123,23 @@ drive (gf_session *s, int fd, int (*done) (void *), void *user, int timeout_ms)
     }
 }
 
+/* A public key (or certificate) from a file in the text form of ssh-keygen's
+   .pub files.  */
+static gf_key *
+read_pub (const char *file)
+{
+  char text[16384];
+  FILE *f = fopen (file, "r");
+  size_t n;
+  gf_key *key = NULL;
+
+  if (f == NULL)
+    return NULL;
+  n = fread (text, 1, sizeof text, f);
+  fclose (f);
+  if (gf_key_from_text (&key, text, n, NULL) != GF_OK)
+    return NULL;
+  return key;
+}
+
 #endif /* GF_INTEROP_UTIL_H */

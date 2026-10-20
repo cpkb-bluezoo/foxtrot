@@ -23,7 +23,8 @@
    The lists here are closed.  Anything absent (SSH-1, CBC and CTR
    ciphers, RC4, 3DES, Blowfish, separate MACs of any kind, hmac-sha1,
    finite-field Diffie-Hellman groups and group exchange, SHA-1 anywhere,
-   ssh-rsa, ssh-dss, ECDSA over P-521, zlib compression, the "none"
+   ssh-rsa (as an algorithm; the name remains as a key type), ssh-dss,
+   ECDSA over P-521, zlib compression, the "none"
    cipher, "none" authentication of the host) is not a configuration
    option; it is not implemented.  The "Security policy" chapter of the
    manual gives the reasoning behind each choice.
@@ -62,14 +63,35 @@ enum gf_kex
 };
 
 /* Signature algorithms for host keys and for public key authentication.
-   Each names a key type and a signature format at once, as SSH does.  */
+   Each names a key type and a signature format at once, as SSH does.  The
+   certificate algorithms (OpenSSH PROTOCOL.certkeys) present a certificate
+   as the key and sign with the key inside it, in the format of the plain
+   algorithm: the signature of "ssh-ed25519-cert-v01@openssh.com" is an
+   "ssh-ed25519" signature.  */
 enum gf_sigalg
 {
   GF_SIG_ED25519 = 1,		/* ssh-ed25519, RFC 8709 */
   GF_SIG_ECDSA_NISTP256,	/* ecdsa-sha2-nistp256, RFC 5656 */
   GF_SIG_ECDSA_NISTP384,	/* ecdsa-sha2-nistp384, RFC 5656 */
   GF_SIG_RSA_SHA2_256,		/* rsa-sha2-256, RFC 8332 */
-  GF_SIG_RSA_SHA2_512		/* rsa-sha2-512, RFC 8332 */
+  GF_SIG_RSA_SHA2_512,		/* rsa-sha2-512, RFC 8332 */
+  GF_SIG_ED25519_CERT,		/* ssh-ed25519-cert-v01@openssh.com */
+  GF_SIG_ECDSA_NISTP256_CERT,	/* ecdsa-sha2-nistp256-cert-v01@openssh.com */
+  GF_SIG_ECDSA_NISTP384_CERT,	/* ecdsa-sha2-nistp384-cert-v01@openssh.com */
+  GF_SIG_RSA_SHA2_256_CERT,	/* rsa-sha2-256-cert-v01@openssh.com */
+  GF_SIG_RSA_SHA2_512_CERT,	/* rsa-sha2-512-cert-v01@openssh.com */
+  /* FIDO security keys (OpenSSH PROTOCOL.u2f), which sign on a token and
+     are for user authentication only: never a host key.  */
+  GF_SIG_SK_ED25519,		/* sk-ssh-ed25519@openssh.com */
+  GF_SIG_SK_ECDSA_NISTP256,	/* sk-ecdsa-sha2-nistp256@openssh.com */
+  GF_SIG_SK_ED25519_CERT,	/* sk-ssh-ed25519-cert-v01@openssh.com */
+  GF_SIG_SK_ECDSA_NISTP256_CERT,	/* sk-ecdsa-sha2-nistp256-cert-v01@openssh.com */
+  /* X.509 certificate chains as keys (RFC 6187), with the signatures of the
+     key in the end certificate.  x509v3-ssh-rsa (SHA-1), x509v3-ssh-dss and
+     the P-521 curve are not here.  */
+  GF_SIG_X509_ECDSA_NISTP256,	/* x509v3-ecdsa-sha2-nistp256 */
+  GF_SIG_X509_ECDSA_NISTP384,	/* x509v3-ecdsa-sha2-nistp384 */
+  GF_SIG_X509_RSA2048_SHA256	/* x509v3-rsa2048-sha256 */
 };
 
 /* Ciphers.  AEAD only: the packet is authenticated by the cipher itself,
@@ -112,7 +134,12 @@ enum gf_cipher gf_cipher_from_name (const char *name, size_t n);
    stores its length in *N.  An application may pass a list of its own
    to a connection (any subset, any order), but only of these.  */
 const enum gf_kex *gf_policy_default_kex (size_t *n);
+/* The sigalgs list is for host keys: it has no security-key algorithm,
+   which a host cannot have.  The user list is what a server takes from
+   users and announces in server-sig-algs: plain names only, a certificate
+   being signed for with the algorithm of its key.  */
 const enum gf_sigalg *gf_policy_default_sigalgs (size_t *n);
+const enum gf_sigalg *gf_policy_user_sigalgs (size_t *n);
 const enum gf_cipher *gf_policy_default_ciphers (size_t *n);
 
 /* Key exchange properties.  */
@@ -124,8 +151,21 @@ const char *gf_kex_names (enum gf_kex kex);
    key type name of an RSA key, which only its signature names refine).  */
 int gf_sigalg_matches_key_type (enum gf_sigalg alg, const char *key_type,
                                 size_t n);
-/* The key type name of an algorithm's keys.  */
+/* The key type name of an algorithm's keys: the name in the key blob, which
+   for the certificate algorithms is the certificate's type
+   ("ssh-rsa-cert-v01@openssh.com" for both RSA ones).  */
 const char *gf_sigalg_key_type (enum gf_sigalg alg);
+/* 1 for an OpenSSH certificate algorithm.  */
+int gf_sigalg_is_cert (enum gf_sigalg alg);
+/* 1 for an X.509 algorithm (RFC 6187).  */
+int gf_sigalg_is_x509 (enum gf_sigalg alg);
+/* 1 for an algorithm that is for users only (the security keys): it is
+   never negotiated for a host key, and gf_kexinit_make refuses it.  */
+int gf_sigalg_is_user_only (enum gf_sigalg alg);
+/* The plain algorithm of a certificate algorithm (itself otherwise), and
+   the name in the signature, which is that algorithm's.  */
+enum gf_sigalg gf_sigalg_base (enum gf_sigalg alg);
+const char *gf_sigalg_signature_name (enum gf_sigalg alg);
 
 #ifdef __cplusplus
 }

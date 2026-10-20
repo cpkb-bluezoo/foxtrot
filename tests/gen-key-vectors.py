@@ -34,9 +34,10 @@ def keygen(kind, args):
         f = os.path.join(d, 'k')
         subprocess.check_call(['ssh-keygen', '-q', '-t', kind, '-N', '', '-C', 'foxtrot-test', '-f', f] + args)
         priv = open(f).read()
-        pub = open(f + '.pub').read().split()
+        pubtext = open(f + '.pub').read()
+        pub = pubtext.split()
         fp = subprocess.check_output(['ssh-keygen', '-l', '-f', f + '.pub']).decode().split()[1]
-        return priv, base64.b64decode(pub[1]), fp
+        return priv, base64.b64decode(pub[1]), fp, pubtext
 
 def sigblob(name, data): return s(name.encode()) + s(data)
 
@@ -46,10 +47,11 @@ emit('vec_msg', MSG)
 
 for tag, kind, args in (('ed', 'ed25519', []), ('p256', 'ecdsa', ['-b', '256']),
                         ('p384', 'ecdsa', ['-b', '384']), ('rsa', 'rsa', ['-b', '2048'])):
-    priv, blob, fp = keygen(kind, args)
+    priv, blob, fp, pubtext = keygen(kind, args)
     key = serialization.load_ssh_private_key(priv.encode(), None)
     text('vec_%s_private' % tag, priv)
     emit('vec_%s_blob' % tag, blob)
+    print('static const char vec_%s_pub[] = "%s";' % (tag, pubtext.replace('\n', '\\n')))
     print('static const char vec_%s_fp[] = "%s";' % (tag, fp))
     if tag == 'ed':
         emit('vec_ed_sig', sigblob('ssh-ed25519', key.sign(MSG)))

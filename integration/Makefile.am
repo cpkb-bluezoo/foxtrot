@@ -30,16 +30,17 @@ AM_CPPFLAGS = -I$(top_srcdir)/include
 AM_CFLAGS = $(STD_CFLAGS) $(WARN_CFLAGS)
 LDADD = $(top_builddir)/src/libfoxtrot.la
 
-INTEGRATION_PROGS = interop-server interop-client
-INTEGRATION_TESTS = interop-openssh.sh
+INTEGRATION_PROGS = interop-server interop-client interop-key
+INTEGRATION_TESTS = interop-openssh.sh interop-keyfiles.sh
 
 interop_server_SOURCES = interop-server.c interop-util.h
 interop_client_SOURCES = interop-client.c interop-util.h
+interop_key_SOURCES = interop-key.c
 
 check_PROGRAMS = $(INTEGRATION_PROGS)
 TESTS = $(INTEGRATION_TESTS)
 
-EXTRA_DIST = interop-openssh.sh
+EXTRA_DIST = interop-openssh.sh interop-keyfiles.sh
 
 ## The test scripts find the programs next to them.
 TESTS_ENVIRONMENT = srcdir=$(srcdir) builddir=$(builddir)

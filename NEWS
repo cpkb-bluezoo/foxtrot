@@ -7,3 +7,9 @@ foxtrot NEWS - history of user-visible changes.
 ** The connection protocol: gf_chans.
 ** SFTP version 3: gf_sftp_server and gf_sftp_client.
 ** The session object: gf_session.
+** OpenSSH certificates (user and host), public key text form.
+** known_hosts: gf_knownhosts, with @cert-authority and @revoked.
+** FIDO security keys (sk-ssh-ed25519, sk-ecdsa-sha2-nistp256) for server-side verification.
+** Passphrase-protected private key files (the application supplies bcrypt-pbkdf).
+** New status GF_ERR_PASSPHRASE.
+** X.509 chains as keys (RFC 6187), with GnuTLS: gf_key_with_x509, gf_x509_trust, gf_x509_verify.

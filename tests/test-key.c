@@ -281,9 +281,18 @@ test_blob_refusals (void)
   CHECK_EQ (gf_key_from_blob (&k, blob, n), GF_ERR_UNSUPPORTED);
   n = mkblob (blob, sizeof blob, "ecdsa-sha2-nistp521", "nistp521", q, 67);
   CHECK_EQ (gf_key_from_blob (&k, blob, n), GF_ERR_UNSUPPORTED);
-  n = mkblob (blob, sizeof blob, "ssh-ed25519-cert-v01@openssh.com", NULL, q, 32);
+  n = mkblob (blob, sizeof blob, "ssh-dss-cert-v01@openssh.com", NULL, q, 20);
   CHECK_EQ (gf_key_from_blob (&k, blob, n), GF_ERR_UNSUPPORTED);
+  n = mkblob (blob, sizeof blob, "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+              "nistp521", q, 67);
+  CHECK_EQ (gf_key_from_blob (&k, blob, n), GF_ERR_UNSUPPORTED);
+  /* A certificate that is not one (test-cert.c has the rest).  */
+  n = mkblob (blob, sizeof blob, "ssh-ed25519-cert-v01@openssh.com", NULL, q, 32);
+  CHECK (gf_key_from_blob (&k, blob, n) != GF_OK);
+  /* A security key with no application is not one (test-sk.c has the rest). */
   n = mkblob (blob, sizeof blob, "sk-ssh-ed25519@openssh.com", NULL, q, 32);
+  CHECK (gf_key_from_blob (&k, blob, n) != GF_OK);
+  n = mkblob (blob, sizeof blob, "sk-ecdsa-sha2-nistp384@openssh.com", "nistp384", q, 97);
   CHECK_EQ (gf_key_from_blob (&k, blob, n), GF_ERR_UNSUPPORTED);
 
   /* Ed25519: wrong length.  */
@@ -497,6 +506,175 @@ test_openssh_file_refusals (void)
   free (tampered);
 }
 
+/* The one-line text form (.pub files, authorized_keys). */
+static void
+test_text (void)
+{
+  static const struct
+  {
+    const char *pub, *blob;
+    enum gf_keytype type;
+  } v[] = {
+    { vec_ed_pub, vec_ed_blob, GF_KEY_ED25519 },
+    { vec_p256_pub, vec_p256_blob, GF_KEY_ECDSA_P256 },
+    { vec_p384_pub, vec_p384_blob, GF_KEY_ECDSA_P384 },
+    { vec_rsa_pub, vec_rsa_blob, GF_KEY_RSA }
+  };
+  static uint8_t want[2048];
+  char buf[2048], out[2048];
+  size_t i, n, len;
+
+  for (i = 0; i < 4; i++)
+    {
+      gf_key *k = NULL;
+      gf_slice comment;
+      const uint8_t *b;
+      size_t bl, sp;
+      const char *second;
+
+      len = strlen (v[i].pub);
+      CHECK_EQ (gf_key_from_text (&k, v[i].pub, len, &comment), GF_OK);
+      if (k == NULL)
+        continue;
+      CHECK_EQ (gf_key_type (k), v[i].type);
+      CHECK (!gf_key_has_private (k));
+      CHECK (gf_slice_equals (comment, "foxtrot-test"));
+      n = tst_unhex (v[i].blob, want, sizeof want);
+      b = gf_key_blob (k, &bl);
+      CHECK (bl == n && memcmp (b, want, n) == 0);
+      /* Back to text: the line without its comment and line end.  */
+      CHECK_EQ (gf_key_to_text (k, out, sizeof out, &n), GF_OK);
+      second = strchr (strchr (v[i].pub, ' ') + 1, ' ');
+      sp = (size_t) (second - v[i].pub);
+      CHECK (n == sp && memcmp (out, v[i].pub, sp) == 0 && out[n] == 0);
+      CHECK_EQ (gf_key_to_text (k, out, n, NULL), GF_ERR_BUFSIZE);
+      CHECK_EQ (gf_key_to_text (k, out, n + 1, NULL), GF_OK);
+      /* Without asking for the comment, and in other layouts.  */
+      CHECK_EQ (gf_key_from_text (&k, out, n, NULL) == GF_OK, 1);
+      snprintf (buf, sizeof buf, "  \t%.*s\t \t  c o m m e n t  \r\n", (int) sp,
+                v[i].pub);
+      {
+        gf_key *k2 = NULL;
+
+        CHECK_EQ (gf_key_from_text (&k2, buf, strlen (buf), &comment), GF_OK);
+        CHECK (gf_slice_equals (comment, "c o m m e n t"));
+        CHECK (k2 != NULL && gf_key_equal (k, k2));
+        gf_key_free (k2);
+        snprintf (buf, sizeof buf, "%.*s", (int) sp, v[i].pub);
+        CHECK_EQ (gf_key_from_text (&k2, buf, strlen (buf), &comment), GF_OK);
+        CHECK_EQ (comment.len, 0);
+        CHECK (k2 != NULL && gf_key_equal (k, k2));
+        gf_key_free (k2);
+      }
+      gf_key_free (k);
+
+      /* Refused: damage anywhere in it.  */
+      {
+        static const char *const bad_prefix[] = {
+          "", " ", "\n", "ssh-ed25519", "ssh-ed25519 ", "ssh-ed25519\n",
+          "ssh-dss AAAAB3NzaC1kc3MAAAAA", "nonsense AAAA"
+        };
+        size_t j;
+
+        for (j = 0; j < sizeof bad_prefix / sizeof bad_prefix[0]; j++)
+          {
+            gf_key *k2 = NULL;
+
+            CHECK (gf_key_from_text (&k2, bad_prefix[j], strlen (bad_prefix[j]),
+                                     NULL) != GF_OK);
+          }
+      }
+      {
+        gf_key *k2 = NULL;
+        char *sp1;
+
+        /* A type that is not the key's.  */
+        snprintf (buf, sizeof buf, "%s", v[i].pub);
+        sp1 = strchr (buf, ' ');
+        snprintf (out, sizeof out, "%s%s", i == 0 ? "ssh-rsa" : "ssh-ed25519", sp1);
+        CHECK_EQ (gf_key_from_text (&k2, out, strlen (out), NULL), GF_ERR_ENCODING);
+        /* No blank between the type and the key; a second line; text after
+           the newline; a NUL.  */
+        snprintf (out, sizeof out, "%.*s%s", (int) (sp1 - buf), buf, sp1 + 1);
+        CHECK (gf_key_from_text (&k2, out, strlen (out), NULL) != GF_OK);
+        snprintf (out, sizeof out, "%s\n%s", v[i].pub, v[i].pub);
+        CHECK (gf_key_from_text (&k2, out, strlen (out), NULL) != GF_OK);
+        snprintf (out, sizeof out, "%s\n# more", v[i].pub);
+        CHECK (gf_key_from_text (&k2, out, strlen (out), NULL) != GF_OK);
+        snprintf (out, sizeof out, "%s", v[i].pub);
+        out[strlen (out) - 1] = 0;
+        CHECK (gf_key_from_text (&k2, out, strlen (v[i].pub), NULL) != GF_OK);
+        /* The base64: a character not in the alphabet, whitespace inside, a
+           missing or extra character, padding missing or doubled.  */
+        for (n = 0; n < 7; n++)
+          {
+            char *b64, *end;
+            size_t bl2;
+
+            snprintf (buf, sizeof buf, "%.*s", (int) sp, v[i].pub);
+            b64 = strchr (buf, ' ') + 1;
+            end = b64 + strlen (b64);
+            bl2 = (size_t) (end - b64);
+            switch (n)
+              {
+              case 0: b64[bl2 / 2] = '*'; break;
+              case 1: b64[bl2 / 2] = '-'; break;	/* URL alphabet.  */
+              case 2: memmove (b64 + 4, b64 + 5, bl2 - 4); break;
+              case 3: memmove (b64 + 6, b64 + 5, bl2 - 4); b64[5] = 'A'; break;
+              case 4: memmove (b64 + 3, b64 + 2, bl2 - 1); b64[2] = '\n'; break;
+              case 5: b64[bl2 / 2] = '='; break;	/* Padding inside.  */
+              default: strcat (b64, "="); break;
+              }
+            CHECK (gf_key_from_text (&k2, buf, strlen (buf), NULL) != GF_OK);
+          }
+        gf_key_free (k2);
+      }
+    }
+  /* Padding removed from a key that needs it; stray bits in its last
+     character (the same bytes with another spelling).  */
+  for (i = 1; i < 3; i++)
+    {
+      gf_key *k2 = NULL;
+      char *eq;
+
+      snprintf (buf, sizeof buf, "%s", v[i].pub);
+      *strchr (strchr (buf, ' ') + 1, ' ') = 0;
+      eq = strchr (buf, '=');
+      CHECK (eq != NULL);
+      if (eq == NULL)
+        continue;
+      memmove (eq, eq + 1, strlen (eq));
+      CHECK (gf_key_from_text (&k2, buf, strlen (buf), NULL) != GF_OK);
+      snprintf (buf, sizeof buf, "%s", v[i].pub);
+      *strchr (strchr (buf, ' ') + 1, ' ') = 0;
+      eq = strchr (buf, '=');
+      {
+        static const char alpha[] =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        /* The same data bits with a low bit set that no key has: another
+           spelling of the same bytes.  */
+        eq[-1] = alpha[(strchr (alpha, eq[-1]) - alpha) | 1];
+      }
+      CHECK (gf_key_from_text (&k2, buf, strlen (buf), NULL) != GF_OK);
+      /* And it is only the stray bits: the right letter is accepted.  */
+      snprintf (buf, sizeof buf, "%s", v[i].pub);
+      *strchr (strchr (buf, ' ') + 1, ' ') = 0;
+      CHECK_EQ (gf_key_from_text (&k2, buf, strlen (buf), NULL), GF_OK);
+      gf_key_free (k2);
+    }
+  /* A text longer than any key is refused outright.  */
+  {
+    static char big[70000];
+    gf_key *k = NULL;
+
+    memset (big, 'A', sizeof big);
+    memcpy (big, "ssh-ed25519 ", 12);
+    CHECK_EQ (gf_key_from_text (&k, big, sizeof big, NULL), GF_ERR_INVAL);
+  }
+  CHECK_EQ (gf_key_from_text (NULL, "x", 1, NULL), GF_ERR_INVAL);
+}
+
 int
 main (void)
 {
@@ -507,5 +685,6 @@ main (void)
   test_blob_refusals ();
   test_signature_refusals ();
   test_openssh_file_refusals ();
+  test_text ();
   TST_DONE ();
 }

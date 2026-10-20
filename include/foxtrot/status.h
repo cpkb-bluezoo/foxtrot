@@ -52,7 +52,8 @@ enum gf_status
   GF_ERR_STATE = -13,		/* Call not allowed in the current state.  */
   GF_ERR_CLOSED = -14,		/* The connection is closed.  */
   GF_ERR_AUTH = -15,		/* Authentication failed.  */
-  GF_ERR_AGAIN = -16		/* Out of room for now; retry after events.  */
+  GF_ERR_AGAIN = -16,		/* Out of room for now; retry after events.  */
+  GF_ERR_PASSPHRASE = -17	/* The passphrase is wrong for the key file.  */
 };
 
 /* Return a description of STATUS, translated into the current locale.  */

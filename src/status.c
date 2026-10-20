@@ -47,6 +47,7 @@ gf_strerror (int status)
     case GF_ERR_CLOSED:		return _("connection closed");
     case GF_ERR_AUTH:		return _("authentication failed");
     case GF_ERR_AGAIN:		return _("try again after the next event");
+    case GF_ERR_PASSPHRASE:	return _("wrong passphrase");
     default:			return _("unknown status");
     }
 }

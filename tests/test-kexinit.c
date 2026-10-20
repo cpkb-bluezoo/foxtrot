@@ -203,7 +203,11 @@ test_negotiate_openssh (void)
   struct gf_algs a;
   uint8_t cb[2048], sb[2048];
   struct gf_kexinit c, s;
-  size_t sn = ours (sb, sizeof sb, 1, 1, NULL), cn;
+  /* A server whose host key is a plain Ed25519 one: it offers no
+     certificate algorithms, which OpenSSH lists first.  */
+  static const enum gf_sigalg plain[] = { GF_SIG_ED25519 };
+  static const struct gf_kex_prefs plain_prefs = { NULL, 0, plain, 1, NULL, 0 };
+  size_t sn = ours (sb, sizeof sb, 1, 1, &plain_prefs), cn;
 
   /* An OpenSSH 9.6 client against us: the sntrup hybrid under the name it
      knows, the first of its ciphers that we also have.  */
@@ -215,6 +219,13 @@ test_negotiate_openssh (void)
   CHECK_EQ (a.hostkey, GF_SIG_ED25519);
   CHECK_EQ (a.c2s, GF_CIPHER_CHACHA20_POLY1305);
   CHECK (a.ext_info);
+
+  /* Offering the certificate algorithms too (a server with a host
+     certificate): the client's preference puts the certificate first.  */
+  sn = ours (sb, sizeof sb, 1, 1, NULL);
+  CHECK_EQ (gf_kexinit_parse (sb, sn, &s), GF_OK);
+  CHECK_EQ (gf_kexinit_negotiate (&c, &s, 1, &a), GF_OK);
+  CHECK_EQ (a.hostkey, GF_SIG_ED25519_CERT);
 
   /* The same client without the sntrup hybrid: curve25519-sha256.  */
   {
@@ -251,6 +262,32 @@ test_negotiate_refusals (void)
 
   CHECK_EQ (negotiate (&good, &sgood, 1, &a), GF_OK);
   CHECK (!a.ext_info);
+
+  /* A security key signs for users, on a token; no host has one.  Offered as
+     a host key by a peer it is not taken, and if the peer has another
+     algorithm that one is.  */
+  c = good;
+  s = sgood;
+  c.hostkey = "sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com";
+  s.hostkey = c.hostkey;
+  CHECK_EQ (negotiate (&c, &s, 1, &a), GF_ERR_UNSUPPORTED);
+  c.hostkey = "sk-ssh-ed25519@openssh.com,ssh-ed25519";
+  s.hostkey = "sk-ssh-ed25519@openssh.com,ssh-ed25519";
+  CHECK_EQ (negotiate (&c, &s, 1, &a), GF_OK);
+  CHECK_EQ (a.hostkey, GF_SIG_ED25519);
+  {
+    /* Nor will we offer one.  */
+    static const enum gf_sigalg sk[] = { GF_SIG_ED25519, GF_SIG_SK_ED25519 };
+    static const enum gf_sigalg skc[] = { GF_SIG_SK_ECDSA_NISTP256_CERT };
+    struct gf_kex_prefs p = { NULL, 0, sk, 2, NULL, 0 };
+    uint8_t buf[2048];
+    size_t n;
+
+    CHECK_EQ (gf_kexinit_make (buf, sizeof buf, &n, 1, 1, &p), GF_ERR_UNSUPPORTED);
+    p.sigalgs = skc;
+    p.nsigalgs = 1;
+    CHECK_EQ (gf_kexinit_make (buf, sizeof buf, &n, 1, 1, &p), GF_ERR_UNSUPPORTED);
+  }
 
   /* Only legacy algorithms in common: nothing is negotiated, whatever
      the lists say.  */

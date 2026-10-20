@@ -21,12 +21,18 @@
      interop-server HOSTKEY PORT [--auth-key PRIVATEKEY] [--password PW]
                                  [--code CODE] [--hostbound]
                                  [--rekey-bytes N] [--sftp-root DIR]
+                                 [--ca-key PUBFILE] [--host-cert CERTFILE]
 
    HOSTKEY is an unencrypted OpenSSH private key file.  The server accepts
    one connection on 127.0.0.1:PORT, completes the transport handshake and
    accepts the ssh-userauth service.  Users authenticate with the public key
-   of the private key file given by --auth-key, with the password PW, or by
-   answering a keyboard-interactive question with CODE, as given.  Once
+   of the private key file given by --auth-key, with a certificate signed by
+   the CA whose public key file is given by --ca-key (the user must be a
+   principal; the peer address is 127.0.0.1), with the password PW, or by
+   answering a keyboard-interactive question with CODE, as given.  With
+   --host-cert the host key is presented with that certificate.  If the
+   user's certificate forces a command, "FORCE command" is printed and that
+   command is run for any exec request.  Once
    authentication succeeds it says so and serves session channels with a
    few commands of its own:
 
@@ -69,6 +75,7 @@ struct ctx
   gf_chans *chans;
   gf_key *authorized;
   const char *password, *code;
+  const char *forced;
   int established, authed, hostbound_used;
   const char *method;
   /* The one channel being served.  */
@@ -124,7 +131,16 @@ auth_request (void *user, const gf_auth_request *req)
     {
     case GF_AUTH_PUBLICKEY:
       x->method = req->hostbound ? "publickey-hostbound" : "publickey";
-      ok = x->authorized && gf_key_equal (x->authorized, req->key);
+      ok = (x->authorized && gf_key_equal (x->authorized, req->key))
+        || req->certificate;
+      if (req->certificate && req->has_signature)
+        {
+          gf_cert_info ci;
+
+          gf_key_certificate_info (req->key, &ci);
+          printf ("CERT serial=%llu id=%.*s\n", (unsigned long long) ci.serial,
+                  (int) ci.key_id.len, (const char *) ci.key_id.data);
+        }
       if (!req->has_signature)
         return (ok ? gf_session_auth_pk_ok (x->s)
                    : gf_session_auth_reject (x->s, 0)) != GF_OK;
@@ -171,6 +187,10 @@ auth_done (void *user, gf_slice username)
           (const char *) username.data, x->method);
   fflush (stdout);
   x->authed = 1;
+  x->forced = gf_session_force_command (x->s);
+  if (x->forced)
+    printf ("FORCE %s\n", x->forced);
+  fflush (stdout);
   return 0;
 }
 
@@ -656,8 +676,12 @@ chan_request (void *user, const gf_chan_request *q)
   switch (q->type)
     {
     case GF_REQ_EXEC:
-      snprintf (cmd, sizeof cmd, "%.*s", (int) q->command.len,
-                (const char *) q->command.data);
+      /* A certificate that forces a command gets that and nothing else.  */
+      if (x->forced)
+        snprintf (cmd, sizeof cmd, "%s", x->forced);
+      else
+        snprintf (cmd, sizeof cmd, "%.*s", (int) q->command.len,
+                  (const char *) q->command.data);
       printf ("EXEC %s\n", cmd);
       fflush (stdout);
       if (strcmp (cmd, "true") == 0)
@@ -827,6 +851,8 @@ main (int argc, char **argv)
   struct sockaddr_in sa;
   int ls, one = 1, port, r, i, hostbound = 0;
   uint64_t rekey_bytes = 0;
+  gf_key *user_ca = NULL, *host_cert = NULL;
+  const gf_key *cas[1];
   char fp[64];
   struct ctx x;
   gf_key *key;
@@ -864,11 +890,41 @@ main (int argc, char **argv)
         rekey_bytes = strtoull (argv[++i], NULL, 10);
       else if (strcmp (argv[i], "--sftp-root") == 0 && i + 1 < argc)
         x.sftp_root = argv[++i];
+      else if (strcmp (argv[i], "--ca-key") == 0 && i + 1 < argc)
+        {
+          user_ca = read_pub (argv[++i]);
+          if (user_ca == NULL)
+            {
+              fprintf (stderr, "cannot read the CA key\n");
+              return 2;
+            }
+        }
+      else if (strcmp (argv[i], "--host-cert") == 0 && i + 1 < argc)
+        {
+          host_cert = read_pub (argv[++i]);
+          if (host_cert == NULL)
+            {
+              fprintf (stderr, "cannot read the host certificate\n");
+              return 2;
+            }
+        }
       else
         {
           fprintf (stderr, "bad option %s\n", argv[i]);
           return 2;
         }
+    }
+  if (host_cert != NULL)
+    {
+      gf_key *both = NULL;
+
+      if (gf_key_with_certificate (key, host_cert, &both) != GF_OK)
+        {
+          fprintf (stderr, "the certificate is not for the host key\n");
+          return 2;
+        }
+      gf_key_free (key);
+      key = both;
     }
   gf_key_fingerprint (key, fp, sizeof fp);
   printf ("HOSTKEY %s\n", fp);
@@ -900,6 +956,14 @@ main (int argc, char **argv)
   cfg.server_auth.methods = (x.authorized ? GF_AUTH_PUBLICKEY : 0)
     | (x.password ? GF_AUTH_PASSWORD : 0) | (x.code ? GF_AUTH_KBDINT : 0);
   cfg.server_auth.hostbound = hostbound;
+  if (user_ca != NULL)
+    {
+      cas[0] = user_ca;
+      cfg.server_auth.trusted_user_cas = cas;
+      cfg.server_auth.ntrusted_user_cas = 1;
+      cfg.server_auth.peer_address = "127.0.0.1";
+      cfg.server_auth.methods |= GF_AUTH_PUBLICKEY;
+    }
   memset (&ev, 0, sizeof ev);
   ev.user = &x;
   ev.write = on_write;
@@ -928,6 +992,8 @@ main (int argc, char **argv)
   gf_session_free (x.s);
   gf_key_free (key);
   gf_key_free (x.authorized);
+  gf_key_free (user_ca);
+  gf_key_free (host_cert);
   close (x.fd);
   return x.established ? 0 : 1;
 }

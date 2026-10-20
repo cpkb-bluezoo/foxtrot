@@ -141,6 +141,14 @@ as_kbd_response (void *user, const gf_slice *r, size_t n)
     ? s->ev.auth_kbdint_response (s->ev.user, r, n) : 1;
 }
 
+static uint64_t
+as_unix_time (void *user)
+{
+  gf_session *s = user;
+
+  return s->ev.unix_time (s->ev.user);
+}
+
 static int
 as_authenticated (void *user, gf_slice username)
 {
@@ -668,6 +676,7 @@ session_new (gf_session **out, int server, const gf_session_config *config,
       ae.kbdint_response = events->auth_kbdint_response ? as_kbd_response : NULL;
       ae.authenticated = as_authenticated;
       ae.disconnect = as_disconnect;
+      ae.unix_time = events->unix_time ? as_unix_time : NULL;
       r = gf_auth_server_new (&s->as, &config->server_auth, &ae);
     }
   else if (r == GF_OK)
@@ -809,6 +818,17 @@ const char *
 gf_session_user (const gf_session *s)
 {
   return s->user;
+}
+
+const char *
+gf_session_force_command (const gf_session *s)
+{
+  gf_slice cmd;
+
+  if (s == NULL || s->as == NULL
+      || gf_auth_server_force_command (s->as, &cmd) != GF_OK || cmd.len == 0)
+    return NULL;
+  return (const char *) cmd.data;
 }
 
 gf_chans *

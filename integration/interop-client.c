@@ -24,13 +24,18 @@
                          [--kbd ANSWER] [--rekey] [--rekey-bytes N]
                          [--exec COMMAND [--send N] [--check-pattern]]
                          [--sftp "COMMAND; COMMAND; ..."]
+                         [--cert FILE] [--known-hosts FILE] [--host-name NAME]
 
    Connects to 127.0.0.1:PORT, completes the transport handshake with the
    given algorithms (default: the policy's), asks the application to trust
-   the host key (it does, unless --fingerprint says which one to expect),
+   the host key (it does, unless --fingerprint says which one to expect, or
+   --known-hosts names a known_hosts file, which must then say MATCH for the
+   name given by --host-name, default 127.0.0.1, and the port, and limits the
+   host key algorithms offered to what the file knows of that host),
    and requests the ssh-userauth service.  With --no-auth it stops there.
    Otherwise it authenticates as NAME (default "nobody") with the OpenSSH
-   private key in FILE, the password PW, or by answering every
+   private key in FILE (with the certificate in the file given by --cert, if
+   any), the password PW, or by answering every
    keyboard-interactive prompt with ANSWER, as given; with --rekey it then
    forces a key exchange and waits for it; --rekey-bytes N makes the
    connection rekey by itself every N bytes.  With --exec it then runs
@@ -61,6 +66,7 @@
 
 #include <foxtrot/session.h>
 #include <foxtrot/key.h>
+#include <foxtrot/knownhosts.h>
 #include <foxtrot/policy.h>
 #include <foxtrot/wire.h>
 
@@ -70,6 +76,9 @@ struct ctx
   gf_session *s;
   gf_chans *chans;
   const char *expect_fp, *kbd_answer, *command;
+  gf_knownhosts *kh;
+  const char *host_name;	/* The name looked up in it.  */
+  unsigned port;
   int rekey, no_auth, check_pattern;
   int established, service, authed, auth_failed, rekeyed, banners;
   uint64_t send_total, sent, received, stderr_bytes;
@@ -108,6 +117,33 @@ on_host_key (void *user, const gf_key *key)
 
   gf_key_fingerprint (key, fp, sizeof fp);
   printf ("HOSTKEY %s %s\n", gf_key_type_name (key), fp);
+  if (gf_key_is_certificate (key))
+    {
+      gf_cert_info ci;
+
+      gf_key_certificate_info (key, &ci);
+      printf ("HOSTCERT serial=%llu id=%.*s\n", (unsigned long long) ci.serial,
+              (int) ci.key_id.len, (const char *) ci.key_id.data);
+    }
+  if (x->kh != NULL)
+    {
+      static const char *const names[] = { "UNKNOWN", "MATCH", "CHANGED", "REVOKED" };
+      time_t now = time (NULL);
+      enum gf_hostcheck r = gf_knownhosts_check (x->kh,
+                                                 x->host_name ? x->host_name : "127.0.0.1",
+                                                 x->port, key,
+                                                 now < 0 ? 0 : (uint64_t) now);
+
+      printf ("HOSTCHECK %s\n", names[r]);
+      if (r != GF_HOST_MATCH)
+        return 1;
+    }
+  else if (gf_key_is_certificate (key))
+    {
+      /* A certificate is trusted only because of a CA in a known_hosts file.  */
+      printf ("HOSTCHECK UNTRUSTED\n");
+      return 1;
+    }
   if (x->expect_fp && strcmp (x->expect_fp, fp) != 0)
     {
       printf ("HOSTKEY MISMATCH\n");
@@ -716,9 +752,11 @@ main (int argc, char **argv)
   enum gf_kex kex = 0;
   enum gf_cipher cipher = 0;
   enum gf_sigalg alg = 0;
-  const char *user = "nobody", *keyfile = NULL, *password = NULL;
+  const char *user = "nobody", *keyfile = NULL, *certfile = NULL, *password = NULL;
   gf_key *key = NULL;
   const gf_key *keys[1];
+  enum gf_sigalg known_algs[16];
+  gf_key *ckey = NULL;		/* The key with its certificate.  */
   int i, r;
 
   if (argc < 2)
@@ -767,6 +805,27 @@ main (int argc, char **argv)
         x.send_total = strtoull (argv[++i], NULL, 10);
       else if (strcmp (argv[i], "--check-pattern") == 0)
         x.check_pattern = 1;
+      else if (strcmp (argv[i], "--cert") == 0 && i + 1 < argc)
+        certfile = argv[++i];
+      else if (strcmp (argv[i], "--known-hosts") == 0 && i + 1 < argc)
+        {
+          char text[65536];
+          FILE *f = fopen (argv[++i], "r");
+          size_t n;
+
+          if (f == NULL)
+            {
+              perror (argv[i]);
+              return 2;
+            }
+          n = fread (text, 1, sizeof text, f);
+          fclose (f);
+          if (gf_knownhosts_new (&x.kh) != GF_OK
+              || gf_knownhosts_load (x.kh, text, n, NULL) != GF_OK)
+            return 2;
+        }
+      else if (strcmp (argv[i], "--host-name") == 0 && i + 1 < argc)
+        x.host_name = argv[++i];
       else if (strcmp (argv[i], "--no-auth") == 0)
         x.no_auth = 1;
       else
@@ -785,10 +844,18 @@ main (int argc, char **argv)
       cfg.conn.prefs.ciphers = &cipher;
       cfg.conn.prefs.nciphers = 1;
     }
+  x.port = (unsigned) atoi (argv[1]);
   if (alg)
     {
       cfg.conn.prefs.sigalgs = &alg;
       cfg.conn.prefs.nsigalgs = 1;
+    }
+  else if (x.kh != NULL)
+    {
+      /* Ask only for what the file knows of the host.  */
+      cfg.conn.prefs.nsigalgs = gf_knownhosts_sigalgs (x.kh,
+        x.host_name ? x.host_name : "127.0.0.1", x.port, known_algs, 16);
+      cfg.conn.prefs.sigalgs = known_algs;
     }
   if (keyfile)
     {
@@ -809,6 +876,18 @@ main (int argc, char **argv)
           return 2;
         }
       keys[0] = key;
+      if (certfile != NULL)
+        {
+          gf_key *cert = read_pub (certfile);
+
+          if (cert == NULL || gf_key_with_certificate (key, cert, &ckey) != GF_OK)
+            {
+              fprintf (stderr, "cannot use certificate %s\n", certfile);
+              return 2;
+            }
+          gf_key_free (cert);
+          keys[0] = ckey;
+        }
     }
 
   x.fd = socket (AF_INET, SOCK_STREAM, 0);
@@ -876,7 +955,9 @@ main (int argc, char **argv)
     }
   printf ("DONE %d authed=%d rekeyed=%d\n", r, x.authed, x.rekeyed);
   gf_session_free (x.s);
+  gf_key_free (ckey);
   gf_key_free (key);
+  gf_knownhosts_free (x.kh);
   close (x.fd);
   if (x.no_auth)
     return x.service && r >= 0 ? 0 : 1;

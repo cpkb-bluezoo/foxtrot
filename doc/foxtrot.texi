@@ -330,8 +330,257 @@ Absent: @code{ssh-rsa} (RSA with SHA-1) and the SHA-1 signatures of the
 and RSA keys under 2048 bits.  The key type name @samp{ssh-rsa} appears in
 an RSA key's blob and is accepted there; the signature algorithm
 @samp{ssh-rsa} is refused, and a signature's name must be the algorithm
-that was negotiated.  OpenSSH certificates, security-key types and X.509
-(RFC 6187) are not supported yet.
+that was negotiated.
+
+@node Certificates
+@subsection OpenSSH certificates
+@cindex certificates
+
+@file{key.h} reads and verifies the certificate types of OpenSSH's
+@file{PROTOCOL.certkeys} for Ed25519, ECDSA (P-256 and P-384) and RSA keys,
+and signs with them.  A certificate is a key, from @code{gf_key_from_blob},
+whose blob is the certificate and whose algorithms are
+@samp{ssh-ed25519-cert-v01@@openssh.com} and the like; the signature it makes
+is the one of the key inside it.  Parsing refuses a certificate whose
+structure is wrong (a type other than user or host, an empty nonce, critical
+options or extensions not in strictly increasing order, principals that are
+not whole strings, bytes after the end), whose key or CA key the policy
+refuses, whose CA is itself a certificate (there are no chains), or whose
+signature does not verify; a CA that signed with SHA-1 is refused, since
+@samp{ssh-rsa} is not an algorithm here.
+
+That a certificate verifies shows only what the CA made.  Nothing trusts
+anything by itself: @code{gf_cert_check} says whether it is a certificate of
+the wanted type, in its dates (it is valid from its start up to but not
+including its end) and carries no critical option this library does not
+know, and the caller decides about the CA and the names.  The critical
+options of a user certificate that are known are @samp{force-command},
+@samp{source-address} (checked against an address, IPv4 or IPv6, by
+@code{gf_cert_source_address_ok}; an entry that is malformed anywhere makes
+the whole option fail, and so does having no address to check) and
+@samp{verify-required}.  A host certificate with a critical option is not
+usable.  A certificate with no principals names nobody.
+
+A server that lists CAs in @code{trusted_user_cas} accepts user
+certificates, and checks everything it can before the application sees the
+request: the CA, the type and dates, that the user name is one of the
+principals (literally; no wildcards), the source address (from
+@code{peer_address}; a certificate that has the option fails without one),
+and the critical options.  The application is then told that the key is a
+verified certificate, what its @samp{force-command} is
+(@code{gf_session_force_command}, which it must run in place of whatever
+the client requested), and whether @samp{verify-required} is set, and may
+still say no (a revocation list, by serial or key id).  With no CAs
+configured no certificate is accepted.  The wall clock is
+@code{unix_time} in the events, or @code{time(2)}.
+
+A client presents a certificate by putting the key with the certificate
+attached (@code{gf_key_with_certificate}) in its list.  A server presents a
+host certificate by putting such a key in its host keys: it is offered
+only under the certificate algorithms, so that a client that does not trust
+the CA never sees it.  The client's @code{host_key} callback is handed the
+certificate and must check the CA, @code{gf_cert_check} for a host
+certificate, and that a principal (with wildcards) matches the name it
+dialled; nothing is trusted by default.  The server-sig-algs list names
+plain algorithms only, which is how OpenSSH reads it: a certificate is
+signed for with its key's algorithm.
+
+@node Security keys
+@subsection FIDO security keys
+@cindex FIDO
+@cindex security keys
+
+A server accepts @samp{sk-ssh-ed25519@@openssh.com} and
+@samp{sk-ecdsa-sha2-nistp256@@openssh.com} keys (OpenSSH's
+@file{PROTOCOL.u2f}), and their certificates, for user authentication.
+These are Ed25519 and P-256 keys held in a token whose signature carries a
+flags byte and a counter after the signature proper, and covers
+@code{SHA256(application) || flags || counter || SHA256(message)}.  The
+library never talks to a token (it does no I/O), so there is no client
+side: such a key cannot be generated, read from a private key file (its
+private part is a key handle) or used to sign.
+
+@itemize @bullet
+@item
+The application must begin @samp{ssh:}.  A key whose application is a web
+site's is a credential for that site.
+@item
+A signature made without the @dfn{user presence} flag (the token was not
+touched) is refused, however genuine: it proves a token and not a person.
+@item
+The @dfn{user verified} flag (a PIN or a fingerprint) is passed to the
+application with the counter in the request; the application decides what it
+wants.  A certificate with @samp{verify-required} makes the machine require
+it, as OpenSSH does; the option means nothing for other keys.
+@item
+They are for users only.  @code{gf_sigalg_is_user_only} marks the
+algorithms, and they are not in the host key lists: a peer that offers one as
+a host key algorithm gets no agreement on it, and @code{gf_kexinit_make}
+refuses to offer one.  The @code{server-sig-algs} extension lists the plain
+algorithms and the two security keys.
+@item
+The counter is reported but not checked: only a server that remembers the
+last one per key can use it.
+@end itemize
+
+The signature format was checked against OpenSSH's own verifier: the test
+vectors are made by an independent implementation from the format, and the
+generator wraps the same kind of signature as an @command{ssh-keygen -Y}
+signature file, which OpenSSH accepts, and does not when a flag is changed
+after signing.
+
+@node Private key files
+@subsection Passphrase-protected private key files
+@cindex private key files
+@cindex bcrypt-pbkdf
+
+OpenSSH protects a private key file with a key derived from the passphrase by
+@dfn{bcrypt-pbkdf}, the key derivation built on OpenBSD's bcrypt password hash.
+libgcrypt does not have it (it would need the internals of its Blowfish) and
+a cryptographic primitive is not something this library writes for itself,
+so the application supplies it: @code{gf_key_from_openssh_private_encrypted}
+and @code{gf_key_to_openssh_private_encrypted} take a
+@code{gf_bcrypt_pbkdf_fn}, which OpenBSD's libc, OpenSSH's
+@file{openbsd-compat}, @file{libbcrypt} and Python's @code{bcrypt} module all
+provide in one form or another.  The library does the rest: the file format,
+the check of the key count, the ciphers, the check that the passphrase was
+right and the checks that came before.
+
+@itemize @bullet
+@item
+Ciphers: @samp{aes128-ctr}, @samp{aes192-ctr}, @samp{aes256-ctr} (what
+@command{ssh-keygen} writes by default), @samp{aes128-gcm@@openssh.com} and
+@samp{aes256-gcm@@openssh.com}.  CBC, 3DES, ChaCha20 and anything else are
+refused.  The rule that forbids counter mode on the network does not apply
+to a file on a disk, which has no attacker who can change it without having
+the file's owner's rights.  Files are written with AES-256-GCM.
+@item
+Counter mode does not authenticate: a wrong passphrase shows only in two
+check values in the plaintext, which fail one time in 2^32 to notice.
+GCM does, and a wrong passphrase or damage to the file fails its tag.  Both
+give @code{GF_ERR_PASSPHRASE}.  A file with no passphrase supplied, or no
+function, is @code{GF_ERR_UNSUPPORTED}, and a function that fails
+@code{GF_ERR_HANDLER}.
+@item
+The key derivation must be bcrypt, with a salt of 8 to 64 bytes and 1 to
+10000 rounds (the default of @command{ssh-keygen -a} is 16); a file that asks
+for more is refused, so that a file from somewhere else cannot make the
+application spend minutes in the key derivation.
+@item
+The passphrase is not copied or kept, the derived key and IV are wiped
+after use, and the decrypted private section is wiped with the rest of the
+file's buffers.
+@item
+A file holds one key.  Security keys (FIDO) have a key handle for their
+private part, not a key, and are refused.
+@end itemize
+
+Checked against @command{ssh-keygen}: in the unit tests, files it wrote with
+each of the five ciphers and each key type are read by this library with
+the output of bcrypt-pbkdf computed by another implementation, and give the
+key that @command{ssh-keygen -p} writes without a passphrase; in the
+integration suite, with the real function, @command{ssh-keygen} reads the
+files this library writes.
+
+@node X.509 keys
+@subsection X.509 certificate chains (RFC 6187)
+@cindex X.509
+@cindex RFC 6187
+@cindex GnuTLS
+
+With GnuTLS (3.8 or later; @command{configure} looks for it, and
+@option{--without-gnutls} turns it off) a key can be a chain of X.509
+certificates, as in RFC 6187: @samp{x509v3-ecdsa-sha2-nistp256},
+@samp{x509v3-ecdsa-sha2-nistp384} and @samp{x509v3-rsa2048-sha256}.  The key
+blob is the RFC's, the signature the key in the end certificate makes, with the
+algorithm name in it.  @file{x509.h} reads the chains, attaches one to a private key
+(@code{gf_key_with_x509}) for a server's host key or a client's user key, and
+validates one against trust the application gives it.  Absent on purpose:
+@samp{x509v3-ssh-rsa} and @samp{x509v3-ssh-dss} (SHA-1 and DSA), P-521, and
+RSA keys under 2048 bits.
+
+They are also the part of the library with the largest trust surface, and the
+one with no independent implementation to test against: OpenSSH does not
+speak RFC 6187.  The validation is GnuTLS's; the tests compare chains against
+@command{openssl verify}, with certificates made by another implementation,
+and the signatures against ones made by another implementation from the RFC's
+format.
+
+@itemize @bullet
+@item
+Nothing is trusted by default and nothing is read from the system:
+@code{gf_x509_trust_add_ca} and @code{gf_x509_trust_add_crl} build the store.
+A client's @code{host_key} callback is handed the key and calls
+@code{gf_x509_verify} for @code{GF_X509_SERVER}, with the name it dialled and
+its clock; a server that lists a store in @code{x509_trust} in its
+authentication configuration does the same for @code{GF_X509_CLIENT} before
+the application sees a user's request, and then the application maps the subject
+(@code{gf_x509_subject}, @code{gf_x509_san}) to a user.  Without a store no
+chain is accepted for a user.
+@item
+The chain must lead from the end certificate, each issued by the next, to a CA
+in the store (the root may be left out of the chain, or put at the end);
+every certificate, the CA's too, must be in its dates by the caller's clock; no
+signature may be MD5 or SHA-1; keys are held to 112 bits of strength.
+@item
+The purpose is the one of RFC 6187, id-kp-secureShellServer or
+id-kp-secureShellClient.  A certificate with no extended key usage is taken;
+one with a list must have the right entry in it, for the end certificate and for
+the CAs above it.  TLS server authentication and
+@samp{anyExtendedKeyUsage} do not count, because certificates meant for the web
+are not meant for this.  A key usage extension on the end certificate must
+include digitalSignature.
+@item
+A host name is matched against the subject alternative names only: a
+dNSName, case-blind, with a @samp{*.} in front that covers exactly one label
+and at least two labels after it, or an iPAddress.  The common name is not
+looked at.
+@item
+Revocation is by the CRLs in the store (their signatures are checked against
+the CAs).  OCSP responses that come with the chain are parsed and ignored,
+and nothing is fetched: a PKI that relies on OCSP alone should not rely on
+this.
+@end itemize
+
+@node Known hosts
+@subsection Known hosts
+@cindex known_hosts
+
+@file{knownhosts.h} reads the text of an OpenSSH @file{known_hosts} file
+(the library does no I/O: the application reads the file and passes its
+text) and says what it makes of the key a server presented:
+@code{GF_HOST_MATCH}, @code{_UNKNOWN} (nothing in the file concerns the
+host), @code{_CHANGED} or @code{_REVOKED}.  It supports host patterns with
+@samp{*}, @samp{?} and @samp{!}, @samp{[host]:port} for ports other than 22,
+hashed names, @samp{@@cert-authority} lines, which make a host's certificate
+acceptable if it is signed by that CA, is a host certificate in its dates and
+names the host, and @samp{@@revoked} lines, which win over everything and
+cover the CA of a certificate as well as a key.
+
+The rule for @code{_CHANGED} is deliberately stricter than OpenSSH's:
+a host the file knows by any key or CA, and which shows one the file does
+not have, is changed, whatever the types.  A host known by an Ed25519 key
+that shows an ECDSA key has given no reason to think the second is its
+own.  To keep honest servers from tripping on this, the application asks
+@code{gf_knownhosts_sigalgs} for the algorithms to offer, which are those of
+the keys it knows for the host (and the certificate algorithms if it has
+a CA for it), and puts them in the connection's preferences; a server with
+several host keys then answers with the one that is known.  Lines that are
+malformed, whose key the policy refuses, or whose key is itself a
+certificate are skipped and counted, and make nothing known.  Empty items in
+a pattern list are tolerated, as OpenSSH does.
+
+@code{gf_knownhosts_format} writes lines, optionally hashed, for the
+application to append to the file after the user has accepted a key
+(@code{gf_knownhosts_add} adds it to the table meanwhile).
+
+@cindex SHA-1, in hashed host names
+Hashed names (@samp{|1|salt|hash}) are HMAC-SHA-1 of the lower-cased name.
+This is the one use of SHA-1 anywhere in the library, and it is not a
+signature, a key derivation or an authenticator of anything: it only
+recognises a name in files that @command{ssh-keygen -H} and
+@samp{HashKnownHosts} write.  Nothing about which key is trusted depends on
+it.
 
 A client has no default trust in a host key.  The signature on the exchange
 hash is verified first, then the application is asked through the
@@ -402,6 +651,11 @@ signature obtained for one server cannot be replayed to another through a
 forwarding agent.  The server announces it in EXT_INFO
 (@code{announce_hostbound} in the connection's configuration) and the
 client then uses it; a request that names a different host key is refused.
+@item
+A public key request that is a certificate is checked against the
+server's trusted CAs as well (@pxref{Certificates}); one with no CA
+configured is refused, as is one that names a user the certificate does
+not.
 @item
 Password change is not supported: such a request fails without the
 application seeing it.  Hostbased authentication is not implemented.
@@ -583,9 +837,38 @@ channels together with one event interface; the interoperability programs
 use it, and are some 200 lines shorter for it.
 
 @item
-OpenSSH certificates, FIDO security keys, passphrase-protected private key
-files (which needs bcrypt-pbkdf, not in libgcrypt), a @file{known_hosts}
-parser, and the X.509 formats of RFC 6187 through GnuTLS.
+@strong{Done.}  OpenSSH user and host certificates for Ed25519, ECDSA and
+RSA keys, with the CA, validity, principal, @samp{source-address},
+@samp{force-command} and @samp{verify-required} handling above, and the
+text form of public keys.  Verified against OpenSSH 9.6 in both directions
+(@command{ssh-keygen -s}, @samp{TrustedUserCAKeys}, @samp{HostCertificate},
+and @samp{@@cert-authority} in @file{known_hosts}).
+
+@item
+@strong{Done.}  A @file{known_hosts} reader and checker (patterns, hashed
+names, @samp{@@cert-authority}, @samp{@@revoked}, port syntax, algorithm
+selection), agreeing with @command{ssh-keygen -F} on which lines apply to
+which names; the interoperability client uses it, against @command{sshd}
+with plain and certificate host keys.
+
+@item
+@strong{Done.}  FIDO security keys (@samp{sk-ssh-ed25519@@openssh.com},
+@samp{sk-ecdsa-sha2-nistp256@@openssh.com}, and certificates for them) for
+verification: a server takes them, with the presence and verification flags
+and the counter.  There is no signing side: it would be a callback to
+whatever drives the token.
+
+@item
+@strong{Done.}  Passphrase-protected private key files, read and written, with
+the key derivation (bcrypt-pbkdf, which libgcrypt lacks) supplied by the
+application through a function.
+
+@item
+@strong{Done.}  X.509 chains as keys (RFC 6187) through GnuTLS: parsing,
+signing and verifying, validation against a trust store with CRLs, names and
+purposes, as host keys and user keys.  Not tested against any other SSH
+implementation, which would have to be a commercial one; see the section on
+them.  OCSP is not evaluated.
 @end enumerate
 
 @node Internationalization

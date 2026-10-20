@@ -417,12 +417,13 @@ send_ext_info (gf_conn *c)
 {
   uint8_t buf[512];
   char list[256];
-  const enum gf_sigalg *base = c->cfg.prefs.sigalgs;
-  size_t nbase = c->cfg.prefs.nsigalgs, i, n = 0;
+  size_t nbase, i, n = 0;
+  const enum gf_sigalg *base = gf_policy_user_sigalgs (&nbase);
   gf_writer w;
 
-  if (base == NULL)
-    base = gf_policy_default_sigalgs (&nbase);
+  /* What the authentication layer takes from users.  The list names plain
+     algorithms: a certificate is signed for with the algorithm of its key,
+     and OpenSSH, whose list this is, reads it so.  */
   list[0] = '\0';
   for (i = 0; i < nbase; i++)
     {
