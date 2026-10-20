@@ -43,7 +43,13 @@ Pre-alpha.  What exists today:
             host-bound, password and keyboard-interactive, client and
             server; interoperating with OpenSSH 9.6
 
-Not yet written: channels and SFTP.  See the manual
+  chan      the connection protocol (RFC 4254): channels with strict flow
+            control, session requests, TCP forwarding; interoperating with
+            OpenSSH 9.6
+  sftp      SFTP version 3, client and server, over a channel; interoperating
+            with OpenSSH's sftp and internal-sftp
+
+Not yet written: a session object that ties the layers together.  See the manual
 (doc/foxtrot.texi) for the design, security policy and roadmap.
 
 Building

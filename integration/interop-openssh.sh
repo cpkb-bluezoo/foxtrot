@@ -34,6 +34,7 @@ SSH_KEYGEN=${SSH_KEYGEN:-ssh-keygen}
 SSHD=${SSHD:-/usr/sbin/sshd}
 command -v "$SSH" >/dev/null 2>&1 || exit 77
 command -v "$SSH_KEYGEN" >/dev/null 2>&1 || exit 77
+command -v sftp >/dev/null 2>&1 || exit 77
 [ -x "$SSHD" ] || exit 77
 
 CLIENT=$builddir/interop-client
@@ -94,6 +95,7 @@ KbdInteractiveAuthentication no
 UsePAM no
 StrictModes no
 LogLevel ERROR
+Subsystem sftp internal-sftp
 EOT
 "$SSHD" -D -e -f "$dir/sshd_config" > "$dir/sshd.log" 2>&1 &
 sshd_pid=$!
@@ -153,6 +155,51 @@ grep -q '^REKEYED' "$dir/client.out" || fail "client rekey: no rekey"
 client --user "$user" --key "$dir/uk_ecdsa" --rekey --kex curve25519-sha256 \
   --cipher aes256-gcm@openssh.com \
   || { fail "client rekey aes-gcm"; cat "$dir/client.out"; }
+# Commands in session channels: output, exit status, standard error, and
+# bulk data both ways through the flow control, with rekeys on the way.
+cli_exec ()
+{
+  client --user "$user" --key "$dir/uk_ed25519" "$@" \
+    || { fail "client exec $*"; cat "$dir/client.out"; }
+}
+cli_exec --exec "echo hello"
+grep -q '^OUT hello' "$dir/client.out" || fail "client exec: no output"
+cli_exec --exec "echo oops 1>&2; exit 3"
+grep -q '^EXIT 3$' "$dir/client.out" && grep -q '^STDERR 5$' "$dir/client.out" \
+  || { fail "client exec: exit status or stderr"; cat "$dir/client.out"; }
+cli_exec --exec "head -c 5000000 /dev/zero"
+grep -q '^RECEIVED 5000000$' "$dir/client.out" || { fail "client download"; cat "$dir/client.out"; }
+cli_exec --exec "wc -c" --send 3000000
+grep -q '^OUT 3000000' "$dir/client.out" || { fail "client upload"; cat "$dir/client.out"; }
+cli_exec --exec "head -c 8000000 /dev/zero" --rekey-bytes 1000000
+grep -q '^RECEIVED 8000000$' "$dir/client.out" && grep -q '^REKEYED' "$dir/client.out" \
+  || { fail "client download with rekeys"; cat "$dir/client.out"; }
+cli_exec --exec cat --send 6000000 --check-pattern --rekey-bytes 1500000 \
+  --cipher aes256-gcm@openssh.com
+grep -q '^RECEIVED 6000000$' "$dir/client.out" && grep -q '^SENT 6000000$' "$dir/client.out" \
+  && grep -q '^REKEYED' "$dir/client.out" && ! grep -q 'BAD DATA' "$dir/client.out" \
+  || { fail "client cat roundtrip with rekeys"; cat "$dir/client.out"; }
+# A command that does not exist is a status, not a failure of the protocol.
+cli_exec --exec "exit 7"
+grep -q '^EXIT 7$' "$dir/client.out" || fail "client exit 7"
+# SFTP: a big file both ways through pipelined reads and writes, with rekeys,
+# the other operations, and the statuses of the ones that fail.
+mkdir "$dir/cr" "$dir/cr/d"
+head -c 12000000 /dev/urandom > "$dir/cr/up.bin"
+echo "from sshd" > "$dir/cr/remote.txt"
+cli_exec --sftp "put $dir/cr/up.bin $dir/cr/up.copy; get $dir/cr/up.copy $dir/cr/down.bin" \
+  --rekey-bytes 3000000
+cmp -s "$dir/cr/up.bin" "$dir/cr/up.copy" || fail "sftp put of 12 MB"
+cmp -s "$dir/cr/up.bin" "$dir/cr/down.bin" || fail "sftp get of 12 MB"
+grep -q '^REKEYED' "$dir/client.out" || fail "sftp: no rekey during the transfer"
+cli_exec --sftp "stat $dir/cr/up.copy; chmod 600 $dir/cr/up.copy; stat $dir/cr/up.copy; mkdir $dir/cr/d/e; ls $dir/cr/d; mv $dir/cr/up.copy $dir/cr/d/e/moved; ln remote.txt $dir/cr/lnk; readlink $dir/cr/lnk; realpath $dir/cr/d/../remote.txt; rm $dir/cr/lnk; rmdir $dir/cr/d/e; get $dir/cr/nosuch $dir/cr/x; rmdir $dir/cr/nodir; stat $dir/cr/nosuch"
+grep -q '^STAT size=12000000 perms=644$' "$dir/client.out" \
+  && grep -q '^STAT size=12000000 perms=600$' "$dir/client.out" \
+  && grep -q '^LS e ' "$dir/client.out" && grep -q '^NAME remote.txt$' "$dir/client.out" \
+  && grep -q "^NAME $dir/cr/remote.txt\$" "$dir/client.out" \
+  || { fail "sftp operations"; cat "$dir/client.out"; }
+[ "$(grep -c '^RESULT .* 2$' "$dir/client.out")" = 3 ] || fail "sftp: missing-file statuses"
+grep -q '^RESULT rmdir 4$' "$dir/client.out" || fail "sftp: rmdir of a non-empty directory"
 # Keys alone offer nothing sshd (password and k-i off) would take.
 client --user "$user" --password hunter2 && fail "client authenticated with a password sshd does not take"
 
@@ -205,8 +252,9 @@ run_ssh ()
   done
   # shellcheck disable=SC2086
   SSH_ASKPASS="$dir/askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=none \
-  timeout 30 "$SSH" $sshopts -p "$sport" "$@" "$user@127.0.0.1" true \
-    > "$dir/ssh.out" 2>&1 < /dev/null
+  timeout 60 "$SSH" $sshopts -p "$sport" "$@" "$user@127.0.0.1" ${SSH_CMD:-true} \
+    > "${SSH_OUT:-$dir/ssh.out}" 2> "$dir/ssh.err" < "${SSH_IN:-/dev/null}"
+  cat "$dir/ssh.err" >> "$dir/ssh.out" 2>/dev/null
   sleep 0.3
   kill "$server_pid" 2>/dev/null
   wait "$server_pid" 2>/dev/null
@@ -254,6 +302,102 @@ grep -q '^AUTH OK' "$dir/server.out" && fail "ssh authenticated with a wrong cod
 ASKPASS_ANSWER=hunter2 run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" -- \
   -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1
 grep -q '^AUTH OK' "$dir/server.out" && fail "ssh used a method the server does not offer"
+
+# Commands in session channels served by foxtrot, bulk data both ways with
+# rekeys, standard error, and exit status.
+SSH_CMD="echo hello world" run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" -- -o BatchMode=yes -i "$dir/uk_ed25519"
+grep -q '^hello world$' "$dir/ssh.out" || { fail "ssh exec echo"; cat "$dir/ssh.out" "$dir/server.out"; }
+SSH_CMD="exit 5" run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" -- -o BatchMode=yes -i "$dir/uk_ed25519"
+grep -q '^EXEC exit 5$' "$dir/server.out" || fail "ssh exec exit 5: not run"
+SSH_CMD="stderr oops" run_ssh hk_ed25519 --auth-key "$dir/uk_ed25519" -- -o BatchMode=yes -i "$dir/uk_ed25519"
+grep -q '^oops' "$dir/ssh.out" || fail "ssh exec stderr"
+head -c 3000000 /dev/urandom > "$dir/big.bin"
+SSH_CMD=cat SSH_IN="$dir/big.bin" SSH_OUT="$dir/big.out" run_ssh hk_ed25519 \
+  --auth-key "$dir/uk_ed25519" --rekey-bytes 700000 -- -o BatchMode=yes -i "$dir/uk_ed25519"
+cmp -s "$dir/big.bin" "$dir/big.out" || { fail "ssh cat roundtrip of 3 MB with rekeys"; ls -l "$dir/big.out"; cat "$dir/server.out"; }
+SSH_CMD="bytes 5000000" SSH_OUT="$dir/bytes.out" run_ssh hk_ed25519 \
+  --auth-key "$dir/uk_ed25519" -- -o BatchMode=yes -i "$dir/uk_ed25519"
+[ "$(wc -c < "$dir/bytes.out")" = 5000000 ] || fail "ssh bytes 5000000"
+# SFTP served by foxtrot to OpenSSH's sftp client, over a directory.
+mkdir "$dir/sroot" "$dir/local"
+echo "hello sftp" > "$dir/sroot/small.txt"
+head -c 20000000 /dev/urandom > "$dir/local/big.bin"
+cat > "$dir/batch" <<EOT
+pwd
+ls
+get small.txt $dir/local/small.copy
+put $dir/local/big.bin up.bin
+mkdir sub
+rename up.bin sub/up2.bin
+ls -l sub
+chmod 600 sub/up2.bin
+ln -s small.txt sub/lnk
+get sub/up2.bin $dir/local/big.back
+rm sub/lnk
+rm sub/up2.bin
+rmdir sub
+get ../../../../etc/passwd $dir/local/escape
+EOT
+sport=$(pick_port)
+"$SERVER" "$dir/hk_ed25519" "$sport" --auth-key "$dir/uk_ed25519" --sftp-root "$dir/sroot" \
+  --rekey-bytes 5000000 > "$dir/server.out" 2>&1 &
+server_pid=$!
+i=0
+while [ $i -lt 30 ] && ! grep -q READY "$dir/server.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+# shellcheck disable=SC2086
+timeout 120 sftp $sshopts -o BatchMode=yes -i "$dir/uk_ed25519" -P "$sport" -b "$dir/batch" \
+  "$user@127.0.0.1" > "$dir/sftp.out" 2>&1
+sleep 0.3
+kill "$server_pid" 2>/dev/null
+wait "$server_pid" 2>/dev/null
+server_pid=
+cmp -s "$dir/local/big.bin" "$dir/local/big.back" || { fail "sftp 20 MB roundtrip through foxtrot"; cat "$dir/sftp.out" "$dir/server.out"; }
+[ "$(cat "$dir/local/small.copy" 2>/dev/null)" = "hello sftp" ] || fail "sftp get of a small file"
+[ -e "$dir/sroot/sub" ] && fail "sftp: directory left behind"
+[ -e "$dir/local/escape" ] && fail "sftp: a path with .. left the root"
+grep -q 'Remote working directory: /' "$dir/sftp.out" || { fail "sftp pwd"; cat "$dir/sftp.out"; }
+grep -q '^SFTP START' "$dir/server.out" || fail "sftp: server did not start it"
+
+# Port forwarding: ssh -L through a direct-tcpip channel that foxtrot echoes,
+# and -R, which foxtrot grants.
+if command -v python3 >/dev/null 2>&1; then
+  sport=$(pick_port)
+  "$SERVER" "$dir/hk_ed25519" "$sport" --auth-key "$dir/uk_ed25519" > "$dir/server.out" 2>&1 &
+  server_pid=$!
+  i=0
+  while [ $i -lt 30 ] && ! grep -q READY "$dir/server.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  lport=$((sport + 1000))
+  rport=$((sport + 2000))
+  # shellcheck disable=SC2086
+  $SSH $sshopts -o BatchMode=yes -o ExitOnForwardFailure=yes -i "$dir/uk_ed25519" \
+    -N -L "$lport:echo.example:7" -R "$rport:localhost:9" -p "$sport" \
+    "$user@127.0.0.1" > "$dir/fwd.out" 2>&1 &
+  fwd_pid=$!
+  sleep 1.5
+  python3 - "$lport" > "$dir/fwd.py.out" 2>&1 <<'EOT'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+data = bytes(range(256)) * 4000
+s.sendall(data)
+s.shutdown(socket.SHUT_WR)
+got = b""
+while True:
+    d = s.recv(65536)
+    if not d:
+        break
+    got += d
+print("OK" if got == data else "MISMATCH")
+EOT
+  grep -q '^OK$' "$dir/fwd.py.out" || { fail "ssh -L through foxtrot"; cat "$dir/fwd.py.out" "$dir/fwd.out"; }
+  kill "$fwd_pid" 2>/dev/null
+  wait "$fwd_pid" 2>/dev/null
+  sleep 0.3
+  grep -q '^FORWARD echo.example 7$' "$dir/server.out" || fail "ssh -L: no direct-tcpip request"
+  grep -q '^TCPIP-FORWARD localhost' "$dir/server.out" || fail "ssh -R: no tcpip-forward request"
+  kill "$server_pid" 2>/dev/null
+  wait "$server_pid" 2>/dev/null
+  server_pid=
+fi
 
 # Each cipher and key exchange OpenSSH can offer that foxtrot accepts.
 for c in chacha20-poly1305@openssh.com aes128-gcm@openssh.com aes256-gcm@openssh.com; do

@@ -95,8 +95,10 @@ never touches:
                       foxtrot's server (interop-client and interop-server
                       are our side), through key exchange, public key
                       (also host-bound), password and keyboard-interactive
-                      authentication, and rekeying; needs ssh, ssh-keygen
-                      and sshd.  Passwords and codes reach ssh through
+                      authentication, commands, bulk transfers with
+                      rekeying, port forwarding and SFTP; needs ssh, sftp,
+                      ssh-keygen and sshd (python3 for the forwarding
+                      test).  Passwords and codes reach ssh through
                       SSH_ASKPASS, so no tty is needed.
 
 It skips itself (exit 77) when what it needs is missing, and when

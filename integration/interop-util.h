@@ -47,6 +47,13 @@ now_us (void)
   return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
 }
 
+/* The test pattern for bulk transfers: byte I of the stream.  */
+static uint8_t
+pattern_at (uint64_t i)
+{
+  return (uint8_t) (i * 7 + i / 251);
+}
+
 static int
 sock_write (int fd, const uint8_t *data, size_t len)
 {

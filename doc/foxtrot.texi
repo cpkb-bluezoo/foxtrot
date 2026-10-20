@@ -110,13 +110,18 @@ why for each.
 @item @file{key.h} @tab Host and user keys: blobs, signatures, OpenSSH private key files.
 @item @file{conn.h} @tab The transport as a state machine.
 @item @file{auth.h} @tab User authentication, client and server.
+@item @file{chan.h} @tab The connection protocol: channels, flow control, requests, forwarding.
+@item @file{sftp.h} @tab SFTP version 3, client and server, over a channel.
 @end multitable
 
 Each header below @file{conn.h} can be used on its own and is tested on
 its own.  @file{conn.h} ties them together.  Layers above it see only
 messages numbered 50 and up through one callback and send with
-@code{gf_conn_send}.  @file{auth.h} is the first of them; channels and
-SFTP are still to come (@pxref{Roadmap}).
+@code{gf_conn_send}.  @file{auth.h} takes the messages 50 to 79,
+@file{chan.h} those from 80; @file{sftp.h} sits on the byte stream of a
+channel and knows nothing of the transport.  Each attaches to the one below
+through a send callback, an input call and its events, so the application
+decides how they are routed, and nothing is hidden in the library.
 
 @node Crypto
 @section Crypto: libgcrypt only
@@ -163,7 +168,10 @@ use libraries independent of libgcrypt.
 @node Testing
 @section Testing
 
-@code{make check} runs the unit tests: known answers from independent
+@code{make check} runs the unit tests (the channel and SFTP layers are
+tested with two instances wired back to back, a file system in memory and
+every chunking of the stream, and against scripted peers that break every
+rule): known answers from independent
 implementations (OpenSSL through python's cryptography package, and
 OpenSSH's @command{ssh-keygen}) for the packet layer, the keys and the key
 derivation; every key exchange method between a client and a server in
@@ -174,9 +182,10 @@ and the Terrapin attack's injection and deletion.  Each protection was
 checked by removing it and seeing a test fail.
 
 @code{make check-integration} runs foxtrot's client against OpenSSH's
-@command{sshd} and OpenSSH's @command{ssh} against foxtrot's server, for
-the algorithms they share, and checks that every algorithm foxtrot
-refuses is refused.
+@command{sshd} and OpenSSH's @command{ssh} and @command{sftp} against
+foxtrot's server, for the algorithms they share, through authentication,
+commands, bulk transfers with rekeying, port forwarding and SFTP, and
+checks that every algorithm foxtrot refuses is refused.
 
 @node Security policy
 @chapter Security policy
@@ -195,6 +204,8 @@ rejected by name.
 * Strict key exchange::
 * Rekeying::
 * Authentication::
+* The connection protocol::
+* SFTP::
 * Other rules::
 @end menu
 
@@ -345,6 +356,96 @@ whether each would be accepted, then keyboard-interactive if it can answer,
 then the password, within the methods the server says continue, and uses
 the RSA hash the server lists in @code{server-sig-algs}.
 
+@node The connection protocol
+@section The connection protocol
+@cindex channels
+@cindex flow control
+
+@file{chan.h} implements RFC 4254: session channels, @samp{direct-tcpip}
+and @samp{forwarded-tcpip} channels, the requests on session channels
+(@samp{exec}, @samp{shell}, @samp{subsystem}, @samp{pty-req}, @samp{env},
+@samp{window-change}, @samp{signal}, @samp{exit-status}, @samp{exit-signal},
+@samp{break}) and the global requests @samp{tcpip-forward},
+@samp{cancel-tcpip-forward} and @samp{no-more-sessions@@openssh.com}.
+
+@itemize @bullet
+@item
+@strong{Flow control is strict and is the application's.}  The peer may
+send only as much as the window we gave it.  More, or more in one message
+than the packet size we announced, is a protocol error and ends the
+connection.  The window is given back as the application says it has dealt
+with the data (@code{gf_chans_consumed}), not as it arrives, so a slow
+consumer slows the sender instead of filling memory.  Sending buffers
+nothing: @code{gf_chans_send_data} takes what the peer's window and packet
+size allow and says how much that was.
+@item
+The peer can do nothing on a channel that is not open: data, requests or
+window changes for an unknown channel, for one that is still being opened
+or for one it has closed, data after its own EOF, a window beyond
+@math{2^32 - 1}, a confirmation of nothing or of a channel already open, a
+reply to a request nobody made, and more unanswered requests or channels
+than the configured limits (64 channels, 16 requests) all end the connection.
+@item
+@strong{What is refused.}  X11 forwarding and agent forwarding, in channels
+and in requests: both extend the trust of the connection to other
+credentials of the machine at the other end.  So is every channel type
+other than the three above, and every request or global request the library
+does not know, which is also how the @samp{keepalive@@openssh.com} request
+is answered.  A refusal is sent in order behind the answers still owed for
+earlier requests, as RFC 4254 requires.
+@item
+A channel number is reused only after the channel is closed on both sides.
+A CLOSE is answered with a CLOSE; data in flight when a channel is closed
+is dropped without a word to an application that has let go of it.
+@item
+A transport that cannot take a message during a key exchange (its queue
+is full) makes @code{gf_chans_send_data} return @code{GF_ERR_AGAIN}; call
+@code{gf_chans_resume} from the transport's @code{rekeyed} event.
+@end itemize
+
+@node SFTP
+@section SFTP
+@cindex SFTP
+
+@file{sftp.h} speaks version 3 of the protocol
+(draft-ietf-secsh-filexfer-02), the one every implementation speaks.  Later
+drafts were never standardized and are not implemented; a peer that offers
+nothing older than 3 is served, and one that cannot speak 3 is refused.  The
+file system is the application's: a server gets each request parsed and
+answers with a function; a client gets each response with the tag of its
+request.
+
+@itemize @bullet
+@item
+Packets are bounded (256 KiB by default) when the length can be read,
+before the body arrives.  A client's requests and a server's unanswered
+ones are bounded too, and so is the output kept for a peer that is not
+reading.
+@item
+A client accepts only a response that fits its request: a READ is answered
+with DATA or STATUS, never NAME, and DATA is never longer than the length
+asked for.  A response for an id that is not outstanding, or one already
+answered, ends the session.
+@item
+A server answers each request once and with a response that fits it; the
+functions refuse anything else.  A malformed request that has an id is
+answered with @samp{BAD_MESSAGE} and the session goes on; one that does not
+ends it.
+@item
+@strong{A client refuses a directory listing with an empty name or a name
+with a slash.}  A malicious server could otherwise name @file{../../.bashrc}
+and have a naive recursive download write outside its target.  @samp{.} and
+@samp{..} are left to the application, which has always had to skip them.
+@item
+@strong{Paths are not confined.}  That is the application's job, and it is
+where the security of an SFTP server lies.  The interoperability server
+resolves paths lexically under a root without leaving it; a real server
+must also decide what to do about symbolic links.
+@item
+The target of SYMLINK comes first on the wire, as in OpenSSH, whatever the
+draft's text says.
+@end itemize
+
 @node Other rules
 @section Other rules
 
@@ -389,20 +490,25 @@ directions, including rekeying after authentication.  Hostbased
 authentication will not be implemented.
 
 @item
-The connection protocol (RFC 4254): channels with flow control, requests
-(@samp{exec}, @samp{shell}, @samp{subsystem}, @samp{pty-req}, @samp{env},
-@samp{window-change}, signals, exit status), and direct and forwarded TCP.
-Agent forwarding and X11 forwarding are not planned: both extend the
-trust of the connection to a machine's other credentials.
+@strong{Done.}  The connection protocol (RFC 4254): channels with strict flow
+control, the requests of session channels, direct and forwarded TCP and
+the global requests.  Verified against OpenSSH 9.6 in both directions:
+commands, exit status, standard error, 8 MB through the windows with
+rekeys every megabyte, and @command{ssh -L} and @command{ssh -R}.  Agent
+and X11 forwarding are not planned: both extend the trust of the
+connection to a machine's other credentials.
 
 @item
-SFTP version 3 (draft-ietf-secsh-filexfer-02, the version in use) as a
-packet codec and client and server state machines over a channel, with
-the file system left to the application.
+@strong{Done.}  SFTP version 3 as client and server state machines over a
+channel, with the file system left to the application.  Verified in both
+directions against OpenSSH's @command{sftp} client and @samp{internal-sftp}:
+20 MB each way with rekeys, listing, rename, links, permissions, and the
+statuses of what fails.
 
 @item
-A session object tying the transport, authentication and channels together
-with one event interface.
+@strong{Next.}  A session object tying the transport, authentication and
+channels together with one event interface, so that an application sets
+callbacks and does not route messages.
 
 @item
 OpenSSH certificates, FIDO security keys, passphrase-protected private key

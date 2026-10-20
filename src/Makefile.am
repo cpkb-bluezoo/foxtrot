@@ -21,6 +21,7 @@ lib_LTLIBRARIES = libfoxtrot.la
 
 libfoxtrot_la_SOURCES = \
   auth.c \
+  chan.c \
   conn.c \
   crypto.c \
   gettext.h \
@@ -31,6 +32,7 @@ libfoxtrot_la_SOURCES = \
   key.c \
   packet.c \
   policy.c \
+  sftp.c \
   status.c \
   wire.c
 
@@ -44,6 +46,7 @@ libfoxtrot_la_LDFLAGS = -version-info $(LIBFOXTROT_LTVERSION) \
 foxtrotincludedir = $(includedir)/foxtrot
 foxtrotinclude_HEADERS = \
   $(top_srcdir)/include/foxtrot/auth.h \
+  $(top_srcdir)/include/foxtrot/chan.h \
   $(top_srcdir)/include/foxtrot/conn.h \
   $(top_srcdir)/include/foxtrot/crypto.h \
   $(top_srcdir)/include/foxtrot/ident.h \
@@ -52,5 +55,6 @@ foxtrotinclude_HEADERS = \
   $(top_srcdir)/include/foxtrot/key.h \
   $(top_srcdir)/include/foxtrot/packet.h \
   $(top_srcdir)/include/foxtrot/policy.h \
+  $(top_srcdir)/include/foxtrot/sftp.h \
   $(top_srcdir)/include/foxtrot/status.h \
   $(top_srcdir)/include/foxtrot/wire.h
