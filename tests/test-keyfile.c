@@ -262,7 +262,7 @@ struct file
 static int
 read_built (const struct file *f)
 {
-  static uint8_t raw[8192], salt[64], priv[256], pub[256];
+  static uint8_t raw[8192], salt[128], priv[256], pub[256];
   static char pem[16384];
   gf_writer w;
   gf_key *k = NULL, *src = NULL;
@@ -385,6 +385,77 @@ test_refused_files (void)
   CHECK_EQ (read_built (&f), GF_ERR_UNSUPPORTED);	/* One key per file. */
 }
 
+/* An unencrypted RSA key file that has the public key of a real key but
+   whatever primes P and Q (as bytes; length 0 is the number zero).  The
+   fuzzer found that zero primes crashed libgcrypt in the modular inverse.  */
+static int
+read_primes (const gf_key *src, const uint8_t *p, size_t pl, const uint8_t *q,
+             size_t ql)
+{
+  static uint8_t raw[8192], priv[2048];
+  static char pem[16384];
+  gf_reader r;
+  gf_slice type, e, n;
+  gf_writer w, pw;
+  gf_key *k = NULL;
+  size_t bl, o = 0, km;
+  const uint8_t *blob = gf_key_blob (src, &bl);
+  int rc;
+
+  gf_reader_init (&r, blob, bl);
+  CHECK_EQ (gf_rd_string (&r, &type), GF_OK);
+  CHECK_EQ (gf_rd_mpint (&r, &e), GF_OK);
+  CHECK_EQ (gf_rd_mpint (&r, &n), GF_OK);
+  gf_writer_init (&pw, priv, sizeof priv);
+  gf_wr_u32 (&pw, 0x01020304);
+  gf_wr_u32 (&pw, 0x01020304);
+  gf_wr_cstring (&pw, "ssh-rsa");
+  gf_wr_mpint (&pw, n.data, n.len);
+  gf_wr_mpint (&pw, e.data, e.len);
+  gf_wr_mpint (&pw, n.data, n.len);	/* d: anything */
+  gf_wr_mpint (&pw, e.data, e.len);	/* iqmp: unused */
+  gf_wr_mpint (&pw, p, pl);
+  gf_wr_mpint (&pw, q, ql);
+  gf_wr_cstring (&pw, "");
+  while (pw.len % 8 != 0)
+    gf_wr_u8 (&pw, (uint8_t) (pw.len % 8 + 1));
+  CHECK_EQ (gf_wr_status (&pw), GF_OK);
+
+  gf_writer_init (&w, raw, sizeof raw);
+  gf_wr_bytes (&w, "openssh-key-v1", 15);
+  gf_wr_cstring (&w, "none");
+  gf_wr_cstring (&w, "none");
+  km = gf_wr_string_begin (&w);
+  gf_wr_string_end (&w, km);
+  gf_wr_u32 (&w, 1);
+  gf_wr_string (&w, blob, bl);
+  gf_wr_string (&w, priv, pw.len);
+  CHECK_EQ (gf_wr_status (&w), GF_OK);
+  o += (size_t) snprintf (pem, sizeof pem, "-----BEGIN OPENSSH PRIVATE KEY-----\n");
+  o += b64 (raw, w.len, pem + o);
+  o += (size_t) snprintf (pem + o, sizeof pem - o, "-----END OPENSSH PRIVATE KEY-----\n");
+  rc = gf_key_from_openssh_private_encrypted (&k, pem, o, NULL, NULL, NULL);
+  CHECK (k == NULL);
+  return rc;
+}
+
+static void
+test_degenerate_primes (void)
+{
+  static const uint8_t one[1] = { 1 }, five[1] = { 5 }, seven[1] = { 7 };
+  gf_key *src = NULL;
+
+  CHECK_EQ (gf_key_generate (&src, GF_KEY_RSA, 2048), GF_OK);
+  /* Zero, one and equal primes are refused, not fed to libgcrypt.  */
+  CHECK_EQ (read_primes (src, NULL, 0, NULL, 0), GF_ERR_ENCODING);
+  CHECK_EQ (read_primes (src, NULL, 0, seven, 1), GF_ERR_ENCODING);
+  CHECK_EQ (read_primes (src, seven, 1, NULL, 0), GF_ERR_ENCODING);
+  CHECK_EQ (read_primes (src, one, 1, seven, 1), GF_ERR_ENCODING);
+  CHECK_EQ (read_primes (src, seven, 1, one, 1), GF_ERR_ENCODING);
+  CHECK_EQ (read_primes (src, five, 1, five, 1), GF_ERR_ENCODING);
+  gf_key_free (src);
+}
+
 /* Writing an encrypted file and reading it back, for each kind of key.  */
 static void
 test_write (void)
@@ -466,6 +537,7 @@ main (void)
   test_read ();
   test_tamper_gcm ();
   test_refused_files ();
+  test_degenerate_primes ();
   test_write ();
   TST_DONE ();
 }

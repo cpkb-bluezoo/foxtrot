@@ -470,11 +470,12 @@ cli_response (void *user, const gf_sftp_response *rr)
   r->status = rr->status;
   snprintf (r->message, sizeof r->message, "%.*s", (int) rr->message.len,
             (const char *) rr->message.data);
-  if (rr->handle.len <= sizeof r->handle)
+  if (rr->handle.len && rr->handle.len <= sizeof r->handle)
     memcpy (r->handle, rr->handle.data, rr->handle.len);
   r->handle_len = rr->handle.len;
   r->data = malloc (rr->data.len + 1);
-  memcpy (r->data, rr->data.data, rr->data.len);
+  if (rr->data.len)
+    memcpy (r->data, rr->data.data, rr->data.len);
   r->data_len = rr->data.len;
   r->attrs = rr->attrs;
   while (r->nnames < 16 && gf_sftp_response_next_name (&copy, &nm))

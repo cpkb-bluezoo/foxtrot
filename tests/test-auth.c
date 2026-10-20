@@ -76,6 +76,18 @@ struct ap
   int cli_authenticated, cli_failed, banners, prompts;
   char banner[128];
   int tamper;			/* Flip a byte of what the client signs.  */
+  /* A signer standing in for an agent or a token.  */
+  int sign_mode, sign_calls;
+  enum gf_sigalg sign_alg;
+  const gf_key *signers[8];	/* Private keys, found by their public part.  */
+  size_t nsigners;
+  const gf_key *wrong_signer;	/* Signs under SIGN_OTHER.  */
+  const gf_key *token_plain;	/* The token's key, for SIGN_TOKEN.  */
+  uint8_t token_flags;
+  uint8_t stash[GF_SIG_MAX];
+  size_t stashlen;
+  int pending;
+  int sent_signed;		/* Signed public key requests the client sent.  */
   uint8_t sid_override[32];
   int use_sid_override;
 };
@@ -210,6 +222,20 @@ cli_send (void *user, const uint8_t *p, size_t n)
   struct ap *x = user;
   uint8_t copy[GF_MAX_PAYLOAD];
 
+  if (p[0] == 50)
+    {
+      gf_reader r;
+      gf_slice name, service, method;
+      int has_sig;
+
+      gf_reader_init (&r, p + 1, n - 1);
+      if (gf_rd_string (&r, &name) == GF_OK && gf_rd_string (&r, &service) == GF_OK
+          && gf_rd_string (&r, &method) == GF_OK
+          && (gf_slice_equals (method, "publickey")
+              || gf_slice_equals (method, GF_AUTH_HOSTBOUND_METHOD))
+          && gf_rd_bool (&r, &has_sig) == GF_OK && has_sig)
+        x->sent_signed++;
+    }
   if (x->tamper && p[0] == 50 && n > 100 && n < sizeof copy)
     {
       /* A signed request: damage the last byte of the signature.  */
@@ -253,6 +279,71 @@ cli_authenticated (void *user)
 {
   ((struct ap *) user)->cli_authenticated++;
   return 0;
+}
+
+enum
+{
+  SIGN_NONE, SIGN_SYNC, SIGN_ASYNC, SIGN_REFUSE, SIGN_FAIL, SIGN_FAIL_ASYNC,
+  SIGN_BADSIG, SIGN_WRONGDATA, SIGN_OTHER, SIGN_TOKEN, SIGN_TOKEN_ASYNC,
+  SIGN_SYNC_AND_REFUSE		/* Answers, then says it could not.  */
+};
+
+static size_t token_sign (const gf_key *plain, const char *app, const uint8_t *m,
+                          size_t ml, uint8_t flags, uint32_t counter,
+                          uint8_t *out, size_t cap);
+
+static int
+cli_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
+{
+  struct ap *x = user;
+  uint8_t sig[GF_SIG_MAX], tmp[2048];
+  const uint8_t *d = data.data;
+  size_t n = 0, i;
+  const gf_key *signer = NULL;
+  int async = x->sign_mode == SIGN_ASYNC || x->sign_mode == SIGN_TOKEN_ASYNC;
+
+  x->sign_calls++;
+  x->sign_alg = alg;
+  if (x->sign_mode == SIGN_REFUSE)
+    return 1;
+  if (x->sign_mode == SIGN_FAIL)
+    return gf_auth_client_sign_fail (x->cli, tst_now) != GF_OK;
+  if (x->sign_mode == SIGN_FAIL_ASYNC)
+    {
+      x->pending = 1;
+      return 0;
+    }
+  if (x->sign_mode == SIGN_TOKEN || x->sign_mode == SIGN_TOKEN_ASYNC)
+    n = token_sign (x->token_plain, "ssh:", data.data, data.len, x->token_flags,
+                    7, sig, sizeof sig);
+  else
+    {
+      for (i = 0; i < x->nsigners; i++)
+        if (gf_key_equal (x->signers[i], key))
+          signer = x->signers[i];
+      CHECK (signer != NULL);
+      if (x->sign_mode == SIGN_OTHER)
+        signer = x->wrong_signer;
+      if (x->sign_mode == SIGN_WRONGDATA)
+        {
+          CHECK (data.len <= sizeof tmp);
+          memcpy (tmp, data.data, data.len);
+          tmp[data.len - 1] ^= 1;
+          d = tmp;
+        }
+      CHECK_EQ (gf_key_sign (signer, alg, d, data.len, sig, sizeof sig, &n), GF_OK);
+      if (x->sign_mode == SIGN_BADSIG)
+        sig[n - 1] ^= 1;
+    }
+  if (async)
+    {
+      memcpy (x->stash, sig, n);
+      x->stashlen = n;
+      x->pending = 1;
+      return 0;
+    }
+  (void) gf_auth_client_sign_respond (x->cli, tst_now, sig, n);
+  return x->sign_mode == SIGN_SYNC_AND_REFUSE;
 }
 
 static int
@@ -389,6 +480,7 @@ ap_new (struct ap *x, const gf_auth_server_config *scfg,
       ce.send = cli_send;
       ce.banner = cli_banner;
       ce.kbdint = cli_kbdint;
+      ce.sign = cli_sign;
       ce.authenticated = cli_authenticated;
       ce.failed = cli_failed;
       CHECK_EQ (gf_auth_client_new (&x->cli, &cc, &ce), GF_OK);
@@ -1691,6 +1783,44 @@ test_certificates (void)
     ap_free (&x);
   }
 
+  /* What the certificate permits is asked of the machine afterwards, for the
+     request that was accepted and not for an earlier one.  */
+  {
+    gf_key *noperm = cert_key (vec_ed_private, vec_noperm_cert);
+    gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+    static struct cli_creds cr;
+
+    sc.trusted_user_cas = both;
+    sc.ntrusted_user_cas = 2;
+    sc.peer_address = "192.0.2.77";
+    /* In through the certificate: only what it has.  */
+    cert_login (&x, both, 2, noperm, "alice", "192.0.2.77", 0);
+    ap_run (&x);
+    CHECK_EQ (x.cli_authenticated, 1);
+    CHECK_EQ (gf_auth_server_permits (x.srv, GF_CERT_PERMIT_PTY), 0);
+    CHECK_EQ (gf_auth_server_permits (x.srv, GF_CERT_PERMIT_PORT_FORWARDING), 0);
+    CHECK_EQ (gf_auth_server_permits (x.srv, NULL), 0);
+    ap_free (&x);
+    cert_login (&x, both, 2, ck[0], "alice", "192.0.2.77", 0);
+    ap_run (&x);
+    CHECK_EQ (gf_auth_server_permits (x.srv, GF_CERT_PERMIT_PTY), 1);
+    CHECK_EQ (gf_auth_server_permits (x.srv, GF_CERT_PERMIT_USER_RC), 1);
+    CHECK_EQ (gf_auth_server_permits (x.srv, "permit-nothing"), 0);
+    ap_free (&x);
+    /* A restricted certificate that the application turned down, then a
+       plain key that it took: nothing restricts the user.  */
+    cr = (struct cli_creds) { "alice", { noperm, ukeys[0] }, 2, NULL, 0, 0 };
+    ap_new (&x, &sc, &cr);
+    x.authorized[0] = ukeys[0];
+    x.nauthorized = 1;
+    ap_run (&x);
+    CHECK_EQ (x.cli_authenticated, 1);
+    CHECK_EQ (x.srv_cert_seen, 1);		/* It was tried first.  */
+    CHECK_EQ (gf_auth_server_permits (x.srv, GF_CERT_PERMIT_PTY), 1);
+    ap_free (&x);
+    gf_key_free (noperm);
+  }
+
   /* The wire: a certificate under the algorithm of its plain key is not a
      certificate request at all.  */
   {
@@ -2023,6 +2153,250 @@ test_security_keys (void)
   gf_key_free (ca);
 }
 
+/* ---------------------------------------------------------------- */
+/* Keys that are somewhere else                                       */
+/* ---------------------------------------------------------------- */
+
+static gf_key *
+public_of (const gf_key *k)
+{
+  size_t n;
+  const uint8_t *b = gf_key_blob (k, &n);
+  gf_key *p = NULL;
+
+  CHECK_EQ (gf_key_from_blob (&p, b, n), GF_OK);
+  return p;
+}
+
+static void
+test_external_signer (void)
+{
+  gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+  static struct cli_creds cr;
+  gf_key *pub[4], *spare = NULL, *plain = NULL, *sk, *certpub, *certpriv;
+  gf_key *ca = blob_key (vec_ca_ed_blob);
+  const gf_key *cas[1];
+  struct ap x;
+  size_t k;
+
+  cas[0] = ca;
+  for (k = 0; k < 4; k++)
+    pub[k] = public_of (ukeys[k]);
+  CHECK_EQ (gf_key_generate (&spare, GF_KEY_ED25519, 0), GF_OK);
+  CHECK_EQ (gf_key_generate (&plain, GF_KEY_ED25519, 0), GF_OK);
+  sk = soft_sk_public (plain, "ssh:");
+
+  /* Each kind of key, signed for by whoever has the private part: inside
+     the call, and later.  */
+  for (k = 0; k < 4; k++)
+    {
+      static const int answers[] = { SIGN_SYNC, SIGN_ASYNC, SIGN_SYNC_AND_REFUSE };
+      size_t am;
+
+      for (am = 0; am < sizeof answers / sizeof answers[0]; am++)
+        {
+          int mode = answers[am];
+
+          cr = (struct cli_creds) { "alice", { pub[k] }, 1, NULL, 0, 0 };
+          ap_new (&x, &sc, &cr);
+          x.sign_mode = mode;
+          x.signers[0] = ukeys[k];
+          x.nsigners = 1;
+          x.authorized[0] = pub[k];
+          x.nauthorized = 1;
+          ap_run (&x);
+          CHECK_EQ (x.sign_calls, 1);
+          CHECK_EQ (x.srv_queries, 1);
+          if (mode == SIGN_ASYNC)
+            {
+              /* Nothing has gone to the server while the token thinks.  */
+              CHECK (x.pending);
+              CHECK_EQ (x.srv_signed, 0);
+              CHECK_EQ (x.cli_authenticated, 0);
+              CHECK_EQ (gf_auth_client_sign_respond (x.cli, tst_now, x.stash,
+                                                     x.stashlen), GF_OK);
+              pump (&x.p, 0);
+              /* It was answered once.  */
+              CHECK_EQ (gf_auth_client_sign_respond (x.cli, tst_now, x.stash,
+                                                     x.stashlen), GF_ERR_STATE);
+              CHECK_EQ (gf_auth_client_sign_fail (x.cli, tst_now), GF_ERR_STATE);
+            }
+          CHECK_EQ (x.cli_authenticated, 1);
+          CHECK_EQ (x.srv_signed, 1);
+          ap_free (&x);
+        }
+    }
+  /* With the host-bound method; and the key asked about is the one that
+     signs.  */
+  sc.hostbound = 1;
+  cr = (struct cli_creds) { "alice", { pub[1] }, 1, NULL, 0, 0 };
+  ap_new (&x, &sc, &cr);
+  x.sign_mode = SIGN_SYNC;
+  x.signers[0] = ukeys[1];
+  x.nsigners = 1;
+  x.authorized[0] = pub[1];
+  x.nauthorized = 1;
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.srv_hostbound_seen, 2);
+  CHECK_EQ (x.sign_alg, GF_SIG_ECDSA_NISTP256);
+  ap_free (&x);
+  sc.hostbound = 0;
+
+  /* Nothing to ask when there is no private part to be had: a key without
+     one and no function is a mistake.  */
+  {
+    gf_auth_client_config cc;
+    gf_auth_client_events ce;
+    gf_auth_client *c = NULL;
+    const gf_key *keys[1];
+
+    memset (&cc, 0, sizeof cc);
+    memset (&ce, 0, sizeof ce);
+    keys[0] = pub[0];
+    cc.user = "alice";
+    cc.keys = keys;
+    cc.nkeys = 1;
+    ce.send = cli_send;
+    ce.failed = cli_failed;
+    CHECK_EQ (gf_auth_client_new (&c, &cc, &ce), GF_ERR_INVAL);
+    ce.sign = cli_sign;
+    CHECK_EQ (gf_auth_client_new (&c, &cc, &ce), GF_OK);
+    CHECK_EQ (gf_auth_client_sign_respond (c, 0, (const uint8_t *) "x", 1), GF_ERR_STATE);
+    CHECK_EQ (gf_auth_client_sign_fail (c, 0), GF_ERR_STATE);
+    CHECK_EQ (gf_auth_client_sign_respond (NULL, 0, (const uint8_t *) "x", 1), GF_ERR_INVAL);
+    CHECK_EQ (gf_auth_client_sign_respond (c, 0, NULL, 1), GF_ERR_INVAL);
+    gf_auth_client_free (c);
+  }
+
+  /* A signer that cannot, that fails, or that answers wrongly costs its key
+     and no more: the next one is tried.  Wrong answers never reach the
+     server.  */
+  {
+    static const int modes[] = { SIGN_REFUSE, SIGN_FAIL, SIGN_FAIL_ASYNC,
+                                 SIGN_BADSIG, SIGN_WRONGDATA, SIGN_OTHER };
+    size_t m;
+
+    for (m = 0; m < sizeof modes / sizeof modes[0]; m++)
+      {
+        /* The only key.  */
+        cr = (struct cli_creds) { "alice", { pub[0] }, 1, NULL, 0, 0 };
+        ap_new (&x, &sc, &cr);
+        x.sign_mode = modes[m];
+        x.signers[0] = ukeys[0];
+        x.nsigners = 1;
+        x.wrong_signer = spare;
+        x.authorized[0] = pub[0];
+        x.nauthorized = 1;
+        ap_run (&x);
+        if (modes[m] == SIGN_FAIL_ASYNC)
+          {
+            CHECK (x.pending);
+            /* Nothing is left to try: the answer a failure always gets.  */
+            CHECK_EQ (gf_auth_client_sign_fail (x.cli, tst_now), GF_ERR_AUTH);
+            pump (&x.p, 0);
+          }
+        CHECK_EQ (x.sign_calls, 1);
+        CHECK_EQ (x.cli_authenticated, 0);
+        CHECK_EQ (x.cli_failed, 1);
+        CHECK_EQ (x.srv_signed, 0);
+        CHECK_EQ (x.sent_signed, 0);		/* Not even sent.  */
+        CHECK_EQ (x.srv_disconnect, 0);
+        ap_free (&x);
+        /* A second key, which is local and signs itself.  */
+        cr = (struct cli_creds) { "alice", { pub[0], ukeys[1] }, 2, NULL, 0, 0 };
+        ap_new (&x, &sc, &cr);
+        x.sign_mode = modes[m];
+        x.signers[0] = ukeys[0];
+        x.nsigners = 1;
+        x.wrong_signer = spare;
+        x.authorized[0] = pub[0];
+        x.authorized[1] = ukeys[1];
+        x.nauthorized = 2;
+        ap_run (&x);
+        if (modes[m] == SIGN_FAIL_ASYNC)
+          {
+            CHECK_EQ (gf_auth_client_sign_fail (x.cli, tst_now), GF_OK);
+            pump (&x.p, 0);
+          }
+        CHECK_EQ (x.sign_calls, 1);		/* Only for the key that needs it. */
+        CHECK_EQ (x.cli_authenticated, 1);
+        CHECK_EQ (x.srv_signed, 1);
+        CHECK_EQ (x.sent_signed, 1);		/* Just the good one.  */
+        ap_free (&x);
+      }
+  }
+
+  /* A certificate whose key is elsewhere.  */
+  certpub = blob_key (vec_ed_user_cert);
+  certpriv = cert_key (vec_ed_private, vec_ed_user_cert);
+  sc.trusted_user_cas = cas;
+  sc.ntrusted_user_cas = 1;
+  sc.peer_address = "192.0.2.77";
+  cr = (struct cli_creds) { "alice", { certpub }, 1, NULL, 0, 0 };
+  ap_new (&x, &sc, &cr);
+  x.sign_mode = SIGN_SYNC;
+  x.signers[0] = certpriv;
+  x.nsigners = 1;
+  x.accept_certs = 1;
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.sign_alg, GF_SIG_ED25519_CERT);
+  CHECK_EQ (x.srv_cert_seen, 2);
+  ap_free (&x);
+  sc.trusted_user_cas = NULL;
+  sc.ntrusted_user_cas = 0;
+  sc.peer_address = NULL;
+
+  /* A security key, which only a token can sign for, and only if it was
+     touched: an answer without the user presence flag is not sent.  */
+  cr = (struct cli_creds) { "alice", { sk }, 1, NULL, 0, 0 };
+  ap_new (&x, &sc, &cr);
+  x.sign_mode = SIGN_TOKEN;
+  x.token_plain = plain;
+  x.token_flags = GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED;
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  ap_run (&x);
+  CHECK_EQ (x.cli_authenticated, 1);
+  CHECK_EQ (x.sign_alg, GF_SIG_SK_ED25519);
+  CHECK_EQ (x.srv_sk_flags, GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED);
+  CHECK_EQ (x.srv_sk_counter, 7);
+  ap_free (&x);
+  ap_new (&x, &sc, &cr);
+  x.sign_mode = SIGN_TOKEN_ASYNC;		/* The user takes a while. */
+  x.token_plain = plain;
+  x.token_flags = GF_SK_USER_PRESENT;
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  ap_run (&x);
+  CHECK (x.pending && x.cli_authenticated == 0);
+  CHECK_EQ (gf_auth_client_sign_respond (x.cli, tst_now, x.stash, x.stashlen), GF_OK);
+  pump (&x.p, 0);
+  CHECK_EQ (x.cli_authenticated, 1);
+  ap_free (&x);
+  ap_new (&x, &sc, &cr);
+  x.sign_mode = SIGN_TOKEN;
+  x.token_plain = plain;
+  x.token_flags = 0;				/* Not touched.  */
+  x.authorized[0] = sk;
+  x.nauthorized = 1;
+  ap_run (&x);
+  CHECK_EQ (x.srv_signed, 0);			/* Refused here, not there.  */
+  CHECK_EQ (x.sent_signed, 0);
+  CHECK_EQ (x.cli_authenticated, 0);
+  ap_free (&x);
+
+  for (k = 0; k < 4; k++)
+    gf_key_free (pub[k]);
+  gf_key_free (spare);
+  gf_key_free (plain);
+  gf_key_free (sk);
+  gf_key_free (certpub);
+  gf_key_free (certpriv);
+  gf_key_free (ca);
+}
+
 #ifdef HAVE_GNUTLS
 /* ---------------------------------------------------------------- */
 /* X.509 chains                                                       */
@@ -2170,6 +2544,7 @@ main (void)
   test_limits_and_timeout ();
   test_certificates ();
   test_security_keys ();
+  test_external_signer ();
 #ifdef HAVE_GNUTLS
   test_x509 ();
 #endif

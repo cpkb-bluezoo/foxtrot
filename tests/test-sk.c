@@ -251,7 +251,7 @@ test_verify (void)
 static void
 test_refusals (void)
 {
-  static uint8_t pk[65], b[BLOBMAX];
+  static uint8_t pk[97], b[BLOBMAX];
   static const struct
   {
     const char *app;

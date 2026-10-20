@@ -246,6 +246,18 @@ int gf_cert_critical_next (const gf_key *cert, size_t *pos, gf_slice *name,
 int gf_cert_extension_next (const gf_key *cert, size_t *pos, gf_slice *name,
                             gf_slice *data);
 
+/* 1 if the certificate has the extension NAME.  A user certificate says what
+   it permits by having extensions, so a restriction is an extension that is
+   missing: ssh-keygen's default has all five of these, and
+   "ssh-keygen -O clear" has none.  The session enforces them for a server
+   (session.h); an application that does not use the session has to ask.  */
+#define GF_CERT_PERMIT_PTY "permit-pty"
+#define GF_CERT_PERMIT_PORT_FORWARDING "permit-port-forwarding"
+#define GF_CERT_PERMIT_AGENT_FORWARDING "permit-agent-forwarding"
+#define GF_CERT_PERMIT_X11_FORWARDING "permit-X11-forwarding"
+#define GF_CERT_PERMIT_USER_RC "permit-user-rc"
+int gf_cert_has_extension (const gf_key *cert, const char *name);
+
 /* 1 if NAME is one of the principals.  With WILDCARDS, a principal may
    contain '*' and '?', as host certificates do.  A certificate with no
    principals names nobody here.  */

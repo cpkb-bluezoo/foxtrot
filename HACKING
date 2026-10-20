@@ -125,6 +125,49 @@ an implementation of it (the security keys, the RFC 6187 signatures), the
 generator says so and checks it against one that can (ssh-keygen -Y, openssl
 verify).
 
+Fuzzing and sanitizers
+----------------------
+
+fuzz/ has a fuzz target for each parser that reads what a peer or a file
+sends: the identification line, the binary packet, KEXINIT, public keys and
+certificates (blob and text), private key files, known_hosts, X.509 chains,
+authentication, channels, SFTP and the whole connection.  Each is a libFuzzer
+entry point (LLVMFuzzerTestOneInput) that also checks what must hold on any
+input, not only that nothing crashes: for example that a known_hosts line we
+write is read back as the key we wrote it for.  make check runs every target
+once over its corpus (fuzz/corpus/TARGET/), so what fuzzing found stays
+fixed: when a run finds something, put the input in the corpus (name it
+crash-WHAT or found-WHAT; gen-seeds.py leaves such files alone) and write
+the unit test too.
+
+Build with the sanitizers, and give the library and the targets coverage
+so that mutation builds on the inputs that reach new code:
+
+  ./configure CFLAGS="-g -O1 -fsanitize=address,undefined \
+      -fno-sanitize-recover=undefined -fno-omit-frame-pointer" \
+      LDFLAGS="-fsanitize=address,undefined"
+  make -C src CFLAGS="... -fsanitize-coverage=trace-pc"
+  make -C fuzz check TESTS= CFLAGS="... -fsanitize-coverage=trace-pc"
+
+(CFLAGS the same in both, with the coverage option added.)  Then run a
+target with mutation, from fuzz/:
+
+  export ASAN_OPTIONS=abort_on_error=1
+  export LSAN_OPTIONS=suppressions=$PWD/lsan.supp
+  ./fuzz-key -runs=1000000 -max_total_time=600 -seed=1 -out=/tmp/found \
+      -save=/tmp/crash.bin corpus/key /tmp/found
+
+A failing input is saved to the -save file; run the target on that file
+alone to see the report.  The driver is ours (driver.c) because gcc has no
+libFuzzer; with clang a target links with -fsanitize=fuzzer instead and the
+options are libFuzzer's.  lsan.supp hides one leak that is libgcrypt's own
+(its jitter entropy collector).  The unit tests are also run under the
+sanitizers (make check with the CFLAGS above) and should stay clean.
+
+libgcrypt before 1.12.4 can abort the process in gcry_pk_verify on some
+Ed25519 public keys (fixed in 1.12.3), which is why that is the minimum: a
+fuzzer finds it in seconds.
+
 Copyright assignment
 --------------------
 

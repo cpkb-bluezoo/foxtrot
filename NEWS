@@ -14,3 +14,9 @@ foxtrot NEWS - history of user-visible changes.
 ** New status GF_ERR_PASSPHRASE.
 ** X.509 chains as keys (RFC 6187), with GnuTLS: gf_key_with_x509, gf_x509_trust, gf_x509_verify.
 ** Stapled OCSP responses are checked with an X.509 chain (gf_key_with_x509_ocsp, gf_x509_trust_require_ocsp).
+** A server session enforces what a user's certificate permits (pty, forwarding); gf_session_permits.
+** Client keys can be elsewhere (agent, token, HSM): the sign event, gf_auth_client_sign_respond.
+** libgcrypt 1.12.4 or later is required, at build and at run time: earlier versions abort on some Ed25519 keys.
+** Fuzz targets (fuzz/) with a coverage-guided driver; sanitizer builds are clean.
+** A private key file with a zero, one or repeated RSA prime is refused (libgcrypt crashed on it).
+** gf_knownhosts_add and gf_knownhosts_format refuse host names that a line would not carry: a leading #, @ or !, wildcards, brackets.

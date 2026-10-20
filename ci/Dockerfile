@@ -61,3 +61,19 @@ RUN ./autogen.sh \
 FROM build AS check
 RUN make check -j"$(nproc)" CFLAGS="-g -O2 -Werror" \
     || (cat tests/test-suite.log; exit 1)
+
+# ---- Sanitize: the unit tests and the fuzz corpora, with ASan and UBSan -----
+# Also runs each fuzz target with mutation for a short time.  The build is
+# separate from the one above because the sanitizers need their own flags.
+FROM build AS sanitize
+ENV SAN="-g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+ENV ASAN_OPTIONS=abort_on_error=1 LSAN_OPTIONS=suppressions=/src/fuzz/lsan.supp
+RUN make distclean >/dev/null 2>&1; \
+    ./configure --without-gnutls CFLAGS="$SAN" LDFLAGS="-fsanitize=address,undefined" \
+    && make -j"$(nproc)" -C src CFLAGS="$SAN -fsanitize-coverage=trace-pc" \
+    && make -j"$(nproc)" check CFLAGS="$SAN -fsanitize-coverage=trace-pc" \
+       || (cat tests/test-suite.log fuzz/test-suite.log; exit 1)
+RUN cd fuzz && for t in $(ls corpus); do \
+      ./fuzz-$t -runs=100000000 -max_total_time=30 -seed=1 -save=/tmp/crash-$t.bin \
+        corpus/$t || exit 1; \
+    done

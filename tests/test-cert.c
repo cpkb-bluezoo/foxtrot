@@ -777,6 +777,39 @@ test_options (void)
       CHECK_EQ (gf_cert_check (k, GF_CERT_USER, 1700000000, NULL), GF_OK);
       gf_key_free (k);
     }
+  /* What a certificate permits is what it has extensions for.  */
+  k = load_cert (vec_ed_user_cert);
+  if (k != NULL)
+    {
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_PTY));
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_PORT_FORWARDING));
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_AGENT_FORWARDING));
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_X11_FORWARDING));
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_USER_RC));
+      CHECK (!gf_cert_has_extension (k, "permit-pt"));
+      CHECK (!gf_cert_has_extension (k, "permit-pty "));
+      CHECK (!gf_cert_has_extension (k, "PERMIT-PTY"));
+      CHECK (!gf_cert_has_extension (k, ""));
+      CHECK (!gf_cert_has_extension (k, NULL));
+      gf_key_free (k);
+    }
+  k = load_cert (vec_noperm_cert);
+  if (k != NULL)
+    {
+      CHECK (!gf_cert_has_extension (k, GF_CERT_PERMIT_PTY));
+      CHECK (!gf_cert_has_extension (k, GF_CERT_PERMIT_PORT_FORWARDING));
+      CHECK (!gf_cert_has_extension (k, GF_CERT_PERMIT_USER_RC));
+      CHECK_EQ (gf_cert_check (k, GF_CERT_USER, 1700000000, NULL), GF_OK);
+      gf_key_free (k);
+    }
+  k = load_cert (vec_pty_only_cert);
+  if (k != NULL)
+    {
+      CHECK (gf_cert_has_extension (k, GF_CERT_PERMIT_PTY));
+      CHECK (!gf_cert_has_extension (k, GF_CERT_PERMIT_PORT_FORWARDING));
+      gf_key_free (k);
+    }
+  CHECK (!gf_cert_has_extension (NULL, GF_CERT_PERMIT_PTY));
   /* No restriction, no options.  */
   k = load_cert (vec_forever_cert);
   if (k != NULL)

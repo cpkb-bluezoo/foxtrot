@@ -37,6 +37,8 @@
        back by one;
      - keeps one deadline for the application to wait for, the earliest of
        the transport's and the authentication grace time;
+     - enforces what a user's certificate permits: no pty without
+       permit-pty, no forwarding without permit-port-forwarding;
      - enforces no-more-sessions@openssh.com and a limit on session
        channels, and refuses what the application has not been asked to
        decide: with no channel_open callback every channel is refused, and
@@ -120,6 +122,12 @@ typedef struct gf_session_events
   int (*auth_kbdint) (void *user, gf_slice name, gf_slice instruction,
                       size_t nprompts, const gf_slice *prompts,
                       const int *echo);
+  /* Sign for a key in client_auth.keys that has no private part, because it
+     is in an agent, on a token or elsewhere (auth.h has the details of the
+     contract); answer with gf_session_auth_sign_respond or _sign_fail.
+     Required for such a key.  */
+  int (*auth_sign) (void *user, const gf_key *key, enum gf_sigalg alg,
+                    gf_slice data);
   /* Nothing is left to try.  The session then disconnects.  */
   int (*auth_failed) (void *user);
 
@@ -203,6 +211,15 @@ const char *gf_session_user (const gf_session *s);
    asks for in an exec, shell or subsystem request.  Valid until the
    session is freed.  */
 const char *gf_session_force_command (const gf_session *s);
+/* A server: does the user's certificate permit PERMISSION (one of the
+   GF_CERT_PERMIT_* names of key.h)?  1 for a user who did not use a
+   certificate, who is not restricted by one.  The session itself refuses a
+   pty request without "permit-pty", and a direct-tcpip channel or a
+   tcpip-forward request without "permit-port-forwarding", before the
+   application is asked; agent and X11 forwarding are never offered.  The
+   rest, "permit-user-rc" (whether to run ~/.ssh/rc) among them, is the
+   application's to ask here.  */
+int gf_session_permits (const gf_session *s, const char *permission);
 
 /* The layers underneath, for what the session does not wrap: channel
    operations (open, send data, requests, close: see chan.h) and transport
@@ -224,6 +241,11 @@ int gf_session_auth_banner (gf_session *s, const char *text);
 
 int gf_session_auth_kbdint_respond (gf_session *s, size_t n,
                                     const char *const *responses);
+
+/* ---- Client: answers to auth_sign ---- */
+
+int gf_session_auth_sign_respond (gf_session *s, const uint8_t *sig, size_t len);
+int gf_session_auth_sign_fail (gf_session *s);
 
 /* ---- Answers to channel_open ---- */
 

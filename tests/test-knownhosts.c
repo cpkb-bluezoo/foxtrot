@@ -301,6 +301,25 @@ test_format (void)
   CHECK_EQ (gf_knownhosts_add (kh, "x.example.org", 22, c), GF_ERR_INVAL);
   CHECK_EQ (gf_knownhosts_add (kh, "", 22, e), GF_ERR_INVAL);
   CHECK_EQ (gf_knownhosts_add (kh, "a,b", 22, e), GF_ERR_INVAL);
+  /* Names that a line would not carry as a host: a comment, a marker, a
+     negation, a wildcard that would make the key good for other hosts.  */
+  {
+    static const char *const bad[] = {
+      "#x.example.org", "@x.example.org", "!x.example.org", "*", "*.example.org",
+      "a*b", "x?.example.org", "[x.example.org", "x.example.org]"
+    };
+    size_t b;
+    char l[1024];
+
+    for (b = 0; b < sizeof bad / sizeof bad[0]; b++)
+      {
+        CHECK_EQ (gf_knownhosts_add (kh, bad[b], 22, e), GF_ERR_INVAL);
+        CHECK_EQ (gf_knownhosts_format (l, sizeof l, NULL, bad[b], 22, e, 0),
+                  GF_ERR_INVAL);
+        CHECK_EQ (gf_knownhosts_format (l, sizeof l, NULL, bad[b], 22, e, 1),
+                  GF_ERR_INVAL);
+      }
+  }
   gf_knownhosts_free (kh);
 
   for (hash = 0; hash < 2; hash++)

@@ -30,7 +30,13 @@
 
 #include "gettext.h"
 
-#define GF_MIN_GCRYPT "1.12.0"
+/* The oldest libgcrypt we run on.  1.12.0 has the final ML-KEM; but before
+   1.12.3 a public key with an awkward Ed25519 point made gcry_pk_verify
+   abort the process ("mulm_25519: different sizes"), which a peer can
+   send, and before 1.12.4 ECDH did not check its peer's point.  Both
+   are fatal for a network daemon, and an application cannot catch an
+   abort.  */
+#define GF_MIN_GCRYPT "1.12.4"
 
 void
 gf_wipe (void *secret, size_t len)

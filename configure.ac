@@ -73,9 +73,12 @@ dnl Crypto floor.  All primitives come from libgcrypt; we never
 dnl implement a cipher, hash, KEM or signature scheme ourselves.  1.12.0 is
 dnl the first release whose ML-KEM is the final FIPS 203 (the hybrid key
 dnl exchange mlkem768x25519-sha256 does not interoperate with the draft
-dnl in 1.11).
-PKG_CHECK_MODULES([LIBGCRYPT], [libgcrypt >= 1.12.0],
-  [], [AC_MSG_ERROR([libgcrypt >= 1.12.0 is required])])
+dnl in 1.11); but 1.12.4 is the floor, because earlier versions abort the
+dnl process in gcry_pk_verify on some Ed25519 public keys a peer can send
+dnl (fixed in 1.12.3), and do not check the peer's point in ECDH (1.12.4).
+dnl src/crypto.c checks the same at run time.
+PKG_CHECK_MODULES([LIBGCRYPT], [libgcrypt >= 1.12.4],
+  [], [AC_MSG_ERROR([libgcrypt >= 1.12.4 is required])])
 
 dnl Certificates.  Plain SSH keys and OpenSSH certificates need nothing but
 dnl libgcrypt.  GnuTLS is for the X.509 host key and user key formats of
@@ -115,6 +118,7 @@ AC_CONFIG_FILES([Makefile
                  po/Makefile.in
                  doc/Makefile
                  tests/Makefile
+                 fuzz/Makefile
                  integration/Makefile
                  foxtrot.pc])
 AC_OUTPUT

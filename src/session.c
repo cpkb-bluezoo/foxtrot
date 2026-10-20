@@ -194,6 +194,14 @@ ac_kbdint (void *user, gf_slice name, gf_slice instr, size_t n,
 }
 
 static int
+ac_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
+{
+  gf_session *s = user;
+
+  return s->ev.auth_sign (s->ev.user, key, alg, data);
+}
+
+static int
 ac_authenticated (void *user)
 {
   gf_session *s = user;
@@ -233,11 +241,34 @@ ch_disconnect (void *user, uint32_t reason)
   return 0;
 }
 
+/* Does the user's certificate permit this?  Anyone who did not come in with
+   one, and a client, is not restricted.  */
+static int
+permitted (const gf_session *s, const char *permission)
+{
+  return !s->server || s->as == NULL
+    || gf_auth_server_permits (s->as, permission);
+}
+
+int
+gf_session_permits (const gf_session *s, const char *permission)
+{
+  return s != NULL && permission != NULL && permitted (s, permission);
+}
+
 static int
 ch_open_request (void *user, const gf_chan_open *o)
 {
   gf_session *s = user;
   struct binding *b;
+
+  /* Forwarding that the user's certificate does not allow is refused without
+     the application hearing of it.  */
+  if (o->type == GF_CHAN_DIRECT_TCPIP
+      && !permitted (s, GF_CERT_PERMIT_PORT_FORWARDING))
+    return gf_chans_open_reject (s->ch, o->id,
+                                 GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                                 "forwarding not permitted") != GF_OK;
 
   if (o->type == GF_CHAN_SESSION)
     {
@@ -399,6 +430,8 @@ ch_request (void *user, const gf_chan_request *q)
 {
   gf_session *s = user;
 
+  if (q->type == GF_REQ_PTY && !permitted (s, GF_CERT_PERMIT_PTY))
+    return q->want_reply ? gf_chans_reply (s->ch, q->id, 0) != GF_OK : 0;
   if (s->ev.channel_request)
     return s->ev.channel_request (s->ev.user, q);
   /* Nobody to decide: refuse what asks for an answer.  */
@@ -435,6 +468,10 @@ ch_global_request (void *user, const gf_global_request *r)
       s->no_more_sessions = 1;
       return r->want_reply ? gf_chans_global_reply (s->ch, 1, 0) != GF_OK : 0;
     }
+  if ((r->type == GF_GLOBAL_TCPIP_FORWARD
+       || r->type == GF_GLOBAL_CANCEL_TCPIP_FORWARD)
+      && !permitted (s, GF_CERT_PERMIT_PORT_FORWARDING))
+    return r->want_reply ? gf_chans_global_reply (s->ch, 0, 0) != GF_OK : 0;
   if (s->ev.global_request)
     return s->ev.global_request (s->ev.user, r);
   return r->want_reply ? gf_chans_global_reply (s->ch, 0, 0) != GF_OK : 0;
@@ -688,6 +725,7 @@ session_new (gf_session **out, int server, const gf_session_config *config,
       ae.send = as_send;
       ae.banner = ac_banner;
       ae.kbdint = events->auth_kbdint ? ac_kbdint : NULL;
+      ae.sign = events->auth_sign ? ac_sign : NULL;
       ae.authenticated = ac_authenticated;
       ae.failed = ac_failed;
       r = gf_auth_client_new (&s->ac, &config->client_auth, &ae);
@@ -895,6 +933,22 @@ gf_session_auth_kbdint_respond (gf_session *s, size_t n,
   if (s == NULL || s->server)
     return GF_ERR_STATE;
   return gf_auth_client_kbdint_respond (s->ac, s->now, n, responses);
+}
+
+int
+gf_session_auth_sign_respond (gf_session *s, const uint8_t *sig, size_t len)
+{
+  if (s == NULL || s->server)
+    return GF_ERR_STATE;
+  return gf_auth_client_sign_respond (s->ac, s->now, sig, len);
+}
+
+int
+gf_session_auth_sign_fail (gf_session *s)
+{
+  if (s == NULL || s->server)
+    return GF_ERR_STATE;
+  return gf_auth_client_sign_fail (s->ac, s->now);
 }
 
 /* ------------------------------------------------------------------ */

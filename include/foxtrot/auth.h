@@ -255,6 +255,12 @@ int gf_auth_server_banner (gf_auth_server *a, uint64_t now_us,
    command is valid until the machine is freed.  */
 int gf_auth_server_force_command (const gf_auth_server *a, gf_slice *cmd);
 
+/* After the authenticated event: does the user's certificate permit
+   PERMISSION, one of the extensions of key.h ("permit-pty" and the like)?
+   1 if the user did not authenticate with a certificate, since there is then
+   nothing that restricts them, and for any other key type.  */
+int gf_auth_server_permits (const gf_auth_server *a, const char *permission);
+
 uint64_t gf_auth_server_timeout (const gf_auth_server *a);
 int gf_auth_server_on_timeout (gf_auth_server *a, uint64_t now_us);
 int gf_auth_server_is_done (const gf_auth_server *a);
@@ -275,6 +281,20 @@ typedef struct gf_auth_client_events
      PROMPTS and the text are valid only during the call.  */
   int (*kbdint) (void *user, gf_slice name, gf_slice instruction,
                  size_t nprompts, const gf_slice *prompts, const int *echo);
+  /* Sign DATA with KEY, which has no private part here, under ALG: the key
+     lives in an agent, a security token, a smart card or a remote service.
+     Required for such a key.  Return 0 to take the job, and answer with
+     gf_auth_client_sign_respond or gf_auth_client_sign_fail, inside the call
+     or later; DATA is valid only until you answer.  Return nonzero to say
+     you cannot, and the key is skipped.  The signature is the whole blob
+     (string algorithm name, then the signature, and for a security key the
+     flags and counter after it), as gf_key_sign makes it; for a certificate
+     the name inside is its key's.  The machine checks the answer against KEY
+     before it sends it, so a wrong or untouched-token answer only costs the
+     key.  Signing may take as long as a person does; the server's grace
+     time is running meanwhile.  */
+  int (*sign) (void *user, const gf_key *key, enum gf_sigalg alg,
+               gf_slice data);
   /* Authentication succeeded.  */
   int (*authenticated) (void *user);
   /* Nothing is left to try, or max_attempts is used up.  Required.  The
@@ -285,7 +305,8 @@ typedef struct gf_auth_client_events
 typedef struct gf_auth_client_config
 {
   const char *user;		/* Required, UTF-8.  */
-  /* The keys to offer, in order.  Each must have a private part.  */
+  /* The keys to offer, in order.  Each must have a private part, or the
+     events must have a sign function to do without one.  */
   const gf_key *const *keys;
   size_t nkeys;
   /* The password, or NULL.  It must stay valid while authenticating; wipe
@@ -323,6 +344,14 @@ int gf_auth_client_input (gf_auth_client *a, uint64_t now_us,
 /* Answer keyboard-interactive prompts: one response per prompt.  */
 int gf_auth_client_kbdint_respond (gf_auth_client *a, uint64_t now_us,
                                    size_t n, const char *const *responses);
+
+/* Answer the sign event: the signature blob, or that there is none.
+   GF_ERR_STATE if nothing was asked.  A signature that does not verify as
+   KEY's for the data (or whose token was not touched) skips the key as a
+   failure would.  */
+int gf_auth_client_sign_respond (gf_auth_client *a, uint64_t now_us,
+                                 const uint8_t *sig, size_t len);
+int gf_auth_client_sign_fail (gf_auth_client *a, uint64_t now_us);
 
 int gf_auth_client_is_done (const gf_auth_client *a);
 

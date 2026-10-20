@@ -78,6 +78,12 @@ struct node
   uint32_t exit_status;
   int exited;
   int global_requests, global_replies, global_ok;
+  int request_replies, request_ok;
+  const gf_key *signer;		/* Signs for the client's key, which is only public.  */
+  int sign_calls, sign_mode;	/* 0 now, 1 later, 2 fail. */
+  uint8_t stash[GF_SIG_MAX];
+  size_t stashlen;
+  int pending;
   uint32_t global_port;
   int unimpl;
   uint32_t unimpl_seq;
@@ -326,6 +332,44 @@ w_request (void *u, const gf_chan_request *q)
 }
 
 static int
+w_sign (void *u, const gf_key *key, enum gf_sigalg alg, gf_slice data)
+{
+  struct node *x = u;
+  uint8_t sig[GF_SIG_MAX];
+  size_t n;
+
+  (void) key;
+  x->sign_calls++;
+  if (x->sign_mode == 2)
+    {
+      (void) gf_session_auth_sign_fail (x->s);	/* Nothing else to try.  */
+      return 0;
+    }
+  CHECK_EQ (gf_key_sign (x->signer, alg, data.data, data.len, sig, sizeof sig, &n),
+            GF_OK);
+  if (x->sign_mode == 1)
+    {
+      memcpy (x->stash, sig, n);
+      x->stashlen = n;
+      x->pending = 1;
+      return 0;
+    }
+  (void) gf_session_auth_sign_respond (x->s, sig, n);
+  return 0;
+}
+
+static int
+w_request_reply (void *u, uint32_t id, int ok)
+{
+  struct node *x = u;
+
+  (void) id;
+  x->request_replies++;
+  x->request_ok = ok;
+  return 0;
+}
+
+static int
 w_eof (void *u, uint32_t id)
 {
   (void) id;
@@ -400,6 +444,8 @@ struct opts
   const gf_key *const *cas;	/* The server's trusted user CAs.  */
   size_t ncas;
   const char *peer_address;
+  const gf_key *signer;		/* The client's key is only public.  */
+  int sign_mode;
 };
 
 static void
@@ -415,6 +461,8 @@ world_new (struct world *w, const struct opts *o)
   w->sv.peer = &w->c;
   w->sv.is_server = 1;
   w->c.trust = o->client_trusts;
+  w->c.signer = o->signer;
+  w->c.sign_mode = o->sign_mode;
 #ifdef HAVE_GNUTLS
   w->c.x509_trust = o->x509_trust;
 #endif
@@ -458,6 +506,8 @@ world_new (struct world *w, const struct opts *o)
   ce.channel_failed = w_failed;
   ce.channel_data = w_data;
   ce.channel_request = w_request;
+  ce.channel_request_reply = w_request_reply;
+  ce.auth_sign = o->signer ? w_sign : NULL;
   ce.channel_eof = w_eof;
   ce.channel_closed = w_chan_closed;
   ce.global_reply = w_global_reply;
@@ -1181,8 +1231,9 @@ test_sftp (uint64_t rekey)
   {
     gf_session_config cc, sc;
     gf_session_events ce, se;
-    const gf_key *keys[1] = { userkey };
+    static const gf_key *keys[1];	/* The sessions outlive this block.  */
 
+    keys[0] = userkey;
     memset (&cc, 0, sizeof cc);
     memset (&sc, 0, sizeof sc);
     memset (&ce, 0, sizeof ce);
@@ -1475,6 +1526,180 @@ test_certificates (void)
   gf_key_free (ca);
 }
 
+/* What a user's certificate permits is enforced before the application is
+   asked: no pty without permit-pty, no forwarding without
+   permit-port-forwarding.  */
+static void
+test_cert_permissions (void)
+{
+  static const struct
+  {
+    const char *cert;
+    int pty, fwd;
+  } v[] = {
+    { vec_ed_user_cert, 1, 1 },	/* ssh-keygen's default: all of them.  */
+    { vec_noperm_cert, 0, 0 },
+    { vec_pty_only_cert, 1, 0 },
+    { vec_fwd_only_cert, 0, 1 }
+  };
+  gf_key *ca = NULL;
+  const gf_key *cas[1];
+  static uint8_t cab[256];
+  size_t n = tst_unhex (vec_ca_ed_blob, cab, sizeof cab), i;
+
+  CHECK_EQ (gf_key_from_blob (&ca, cab, n), GF_OK);
+  cas[0] = ca;
+  for (i = 0; i < 4; i++)
+    {
+      struct world w;
+      struct opts o;
+      gf_key *ukey = cert_of (vec_ed_private, v[i].cert);
+      gf_chans *ch;
+      uint32_t a, b;
+      int opens, reqs, globals;
+
+      memset (&o, 0, sizeof o);
+      o.client_trusts = 1;
+      o.client_key = ukey;
+      o.cas = cas;
+      o.ncas = 1;
+      o.peer_address = "192.0.2.50";
+      world_new (&w, &o);
+      w.c.auto_exec = 0;
+      run (&w);
+      CHECK_EQ (w.c.authenticated, 1);
+      CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PTY), v[i].pty);
+      CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PORT_FORWARDING), v[i].fwd);
+      CHECK_EQ (gf_session_permits (w.sv.s, "no-such-permission"), 0);
+      ch = gf_session_channels (w.c.s);
+
+      /* A pty request.  */
+      CHECK_EQ (gf_chans_open_session (ch, &a, 0, 0), GF_OK);
+      pump (&w, 0);
+      reqs = w.sv.requests;
+      CHECK_EQ (gf_chans_request_pty (ch, a, "xterm", 80, 24, 0, 0, NULL, 0, 1), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.requests - reqs, v[i].pty);
+      CHECK_EQ (w.sv.closed, 0);	/* Refused, not an offence.  */
+      /* The client is told no either way (the application says no to the
+         ones it sees).  */
+      CHECK_EQ (w.c.request_replies, 1);
+      CHECK_EQ (w.c.request_ok, 0);
+
+      /* A forwarded connection out, and a port in.  */
+      opens = w.sv.opens;
+      w.c.failed = 0;
+      CHECK_EQ (gf_chans_open_direct_tcpip (ch, &b, "h", 1, "o", 2, 0, 0), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.opens - opens, v[i].fwd);
+      CHECK_EQ (w.c.failed, !v[i].fwd);
+      if (!v[i].fwd)
+        CHECK_EQ (w.c.fail_reason, GF_OPEN_ADMINISTRATIVELY_PROHIBITED);
+      globals = w.sv.global_requests;
+      CHECK_EQ (gf_chans_request_tcpip_forward (ch, "0.0.0.0", 8080), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.global_requests - globals, v[i].fwd);
+      CHECK_EQ (w.c.global_ok, v[i].fwd);
+      globals = w.sv.global_requests;
+      CHECK_EQ (gf_chans_request_cancel_tcpip_forward (ch, "0.0.0.0", 8080), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.global_requests - globals, v[i].fwd);
+      /* Sessions themselves are not forwarding.  */
+      CHECK_EQ (gf_chans_open_session (ch, &a, 0, 0), GF_OK);
+      pump (&w, 0);
+      CHECK_EQ (w.sv.closed, 0);
+      world_free (&w);
+      gf_key_free (ukey);
+    }
+  /* Nobody who did not come in with a certificate is restricted, and nothing
+     restricts a client.  */
+  {
+    struct world w;
+    struct opts o;
+
+    memset (&o, 0, sizeof o);
+    o.client_trusts = 1;
+    o.client_key = userkey;
+    world_new (&w, &o);
+    run (&w);
+    CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PTY), 1);
+    CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PORT_FORWARDING), 1);
+    CHECK_EQ (gf_session_permits (w.c.s, GF_CERT_PERMIT_PTY), 1);
+    CHECK_EQ (gf_session_permits (NULL, GF_CERT_PERMIT_PTY), 0);
+    CHECK_EQ (gf_session_permits (w.sv.s, NULL), 0);
+    world_free (&w);
+  }
+  gf_key_free (ca);
+}
+
+/* A client whose key is elsewhere: the session passes the signing out and the
+   answer back in.  */
+static void
+test_external_signer (void)
+{
+  struct world w;
+  struct opts o;
+  size_t bl;
+  const uint8_t *b = gf_key_blob (userkey, &bl);
+  gf_key *pub = NULL;
+  int mode;
+
+  CHECK_EQ (gf_key_from_blob (&pub, b, bl), GF_OK);
+  for (mode = 0; mode < 3; mode++)
+    {
+      memset (&o, 0, sizeof o);
+      o.client_trusts = 1;
+      o.client_key = pub;
+      o.signer = userkey;
+      o.sign_mode = mode;
+      world_new (&w, &o);
+      run (&w);
+      CHECK_EQ (w.c.sign_calls, 1);
+      if (mode == 1)
+        {
+          CHECK (w.c.pending);
+          CHECK_EQ (w.c.authenticated, 0);
+          CHECK_EQ (gf_session_auth_sign_respond (w.c.s, w.c.stash, w.c.stashlen), GF_OK);
+          pump (&w, 0);
+        }
+      if (mode == 2)
+        {
+          CHECK_EQ (w.c.authenticated, 0);
+          CHECK_EQ (w.c.auth_failed, 1);
+        }
+      else
+        {
+          CHECK_EQ (w.c.authenticated, 1);
+          CHECK_EQ (w.sv.authenticated, 1);
+        }
+      /* Servers have nothing to sign for.  */
+      CHECK_EQ (gf_session_auth_sign_respond (w.sv.s, (const uint8_t *) "x", 1),
+                GF_ERR_STATE);
+      CHECK_EQ (gf_session_auth_sign_fail (w.sv.s), GF_ERR_STATE);
+      world_free (&w);
+    }
+  /* A public key and no function to sign with is not a configuration.  */
+  {
+    gf_session_config cc;
+    gf_session_events ce;
+    gf_session *sx = NULL;
+    static const gf_key *keys[1];
+
+    memset (&cc, 0, sizeof cc);
+    memset (&ce, 0, sizeof ce);
+    keys[0] = pub;
+    cc.client_auth.user = "alice";
+    cc.client_auth.keys = keys;
+    cc.client_auth.nkeys = 1;
+    ce.write = w_write;
+    CHECK_EQ (gf_session_client_new (&sx, &cc, &ce), GF_ERR_INVAL);
+    ce.auth_sign = w_sign;
+    CHECK_EQ (gf_session_client_new (&sx, &cc, &ce), GF_OK);
+    gf_session_free (sx);
+  }
+  gf_key_free (pub);
+}
+
 #ifdef HAVE_GNUTLS
 /* An X.509 chain as the host key: the transport signs with the chain's key
    under the RFC 6187 algorithm and the client decides with the store.  */
@@ -1576,6 +1801,8 @@ main (void)
   test_sftp (0);
   test_sftp (400000);
   test_certificates ();
+  test_cert_permissions ();
+  test_external_signer ();
 #ifdef HAVE_GNUTLS
   test_x509_host_keys ();
 #endif

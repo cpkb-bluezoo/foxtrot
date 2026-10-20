@@ -65,7 +65,8 @@ Start with include/foxtrot/session.h and the manual.  See the manual
 Building
 --------
 
-Requires libgcrypt >= 1.12.
+Requires libgcrypt >= 1.12.4 (earlier versions abort on some Ed25519 keys a
+peer can send), and GnuTLS >= 3.8 for X.509 keys (optional).
 
   ./autogen.sh        # only when building from a repository checkout
   ./configure

@@ -355,6 +355,18 @@ gf_cert_extension_next (const gf_key *k, size_t *pos, gf_slice *name,
 }
 
 int
+gf_cert_has_extension (const gf_key *k, const char *name)
+{
+  size_t pos = 0;
+  gf_slice n, d;
+
+  while (k != NULL && name != NULL && gf_cert_extension_next (k, &pos, &n, &d))
+    if (gf_slice_equals (n, name))
+      return 1;
+  return 0;
+}
+
+int
 gf_cert_has_principal (const gf_key *k, const char *name, size_t n,
                        int wildcards)
 {

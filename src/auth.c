@@ -158,6 +158,7 @@ struct gf_auth_server
   enum pending pending;
   enum gf_auth_method pending_method;
   int pending_probe;		/* A public key query: not an attempt.  */
+  gf_key *cert_key;		/* The certificate of this request, if any.  */
   uint8_t *force;		/* The certificate's force-command, if any.  */
   size_t forcelen;
   uint8_t *pk_blob;		/* For PK_OK.  */
@@ -208,6 +209,7 @@ gf_auth_server_free (gf_auth_server *a)
   free (a->user);
   free (a->pk_blob);
   free (a->force);
+  gf_key_free (a->cert_key);
   gf_wipe (a, sizeof *a);
   free (a);
 }
@@ -439,8 +441,13 @@ srv_publickey (gf_auth_server *a, gf_reader *rd, gf_auth_request *req,
   req->sigalg = alg;
   req->has_signature = has_sig;
   req->hostbound = hostbound;
+  /* A certificate is kept for as long as the request may be answered, so
+     that what it permits can be asked of the machine afterwards.  */
+  if (req->certificate)
+    a->cert_key = key;
   r = srv_request_app (a, req);
-  gf_key_free (key);
+  if (!req->certificate)
+    gf_key_free (key);
   return r;
 }
 
@@ -478,6 +485,8 @@ srv_handle_request (gf_auth_server *a, const uint8_t *p, size_t n)
   free (a->force);		/* A command belongs to the last request.  */
   a->force = NULL;
   a->forcelen = 0;
+  gf_key_free (a->cert_key);	/* And so does a certificate.  */
+  a->cert_key = NULL;
   if (user.len == 0)
     return srv_attempt_failed (a, 1);
 
@@ -587,6 +596,14 @@ gf_auth_server_accept (gf_auth_server *a, uint64_t now_us)
   if (a->ev.authenticated && a->ev.authenticated (a->ev.user, user))
     return GF_ERR_HANDLER;
   return GF_OK;
+}
+
+int
+gf_auth_server_permits (const gf_auth_server *a, const char *permission)
+{
+  if (a == NULL || permission == NULL)
+    return 0;
+  return a->cert_key == NULL || gf_cert_has_extension (a->cert_key, permission);
 }
 
 int
@@ -740,6 +757,7 @@ enum attempt
 {
   A_NONE,
   A_PK_QUERY,
+  A_PK_SIGNING,			/* Waiting for the application to sign.  */
   A_PK_SIGNED,
   A_KBD,
   A_PASSWORD
@@ -767,6 +785,8 @@ struct gf_auth_client
   enum gf_sigalg cur_alg;
   enum attempt cur;
   size_t kbd_prompts;
+  uint8_t *sign_data;		/* What the application is signing.  */
+  size_t sign_len;
 };
 
 int
@@ -783,7 +803,8 @@ gf_auth_client_new (gf_auth_client **out, const gf_auth_client_config *config,
       || !gf_utf8_valid ((const uint8_t *) config->user, strlen (config->user)))
     return GF_ERR_INVAL;
   for (i = 0; i < config->nkeys; i++)
-    if (config->keys == NULL || !gf_key_has_private (config->keys[i]))
+    if (config->keys == NULL || config->keys[i] == NULL
+        || (!gf_key_has_private (config->keys[i]) && events->sign == NULL))
       return GF_ERR_INVAL;
   a = calloc (1, sizeof *a);
   if (a == NULL)
@@ -819,6 +840,7 @@ gf_auth_client_free (gf_auth_client *a)
   free (a->user);
   free (a->host);
   free (a->sigalgs);
+  free (a->sign_data);
   gf_wipe (a, sizeof *a);
   free (a);
 }
@@ -894,33 +916,20 @@ pick_alg (const gf_auth_client *a, const gf_key *key)
 
 /* Send the public key request for the current key: the query, or with
    SIGN the signed one.  */
+/* Send the public key request for the current key, with the signature SIG
+   if SIGN.  */
 static int
-cl_publickey (gf_auth_client *a, int sign)
+cl_pk_send (gf_auth_client *a, int sign, const uint8_t *sig, size_t siglen)
 {
   const gf_key *key = a->cfg.keys[a->cur_key];
   const char *method = a->hostbound ? GF_AUTH_HOSTBOUND_METHOD : "publickey";
   const char *alg = gf_sigalg_name (a->cur_alg);
   size_t bloblen, cap, ul = strlen (a->user);
   const uint8_t *blob = gf_key_blob (key, &bloblen);
-  uint8_t *buf, *data = NULL, sig[GF_SIG_MAX];
-  size_t siglen = 0, dl;
+  uint8_t *buf;
   gf_writer w;
   int r;
 
-  if (sign)
-    {
-      gf_slice user = { (const uint8_t *) a->user, ul };
-
-      r = signed_data (&data, &dl, a->sid, a->sidlen, user, method, alg, blob,
-                       bloblen, a->hostbound ? a->host : NULL, a->hostlen);
-      if (r == GF_OK)
-        {
-          r = gf_key_sign (key, a->cur_alg, data, dl, sig, sizeof sig, &siglen);
-          free (data);
-        }
-      if (r != GF_OK)
-        return r;
-    }
   cap = 128 + ul + strlen (method) + strlen (alg) + bloblen + a->hostlen
     + siglen;
   buf = malloc (cap);
@@ -939,6 +948,93 @@ cl_publickey (gf_auth_client *a, int sign)
   r = gf_wr_status (&w) == GF_OK ? cl_send (a, buf, w.len) : GF_ERR_BUFSIZE;
   free (buf);
   return r;
+}
+
+static int cl_next (gf_auth_client *a);
+
+/* The query (SIGN 0), or the signed request, for which the key signs here or
+   the application is asked to.  */
+static int
+cl_publickey (gf_auth_client *a, int sign)
+{
+  const gf_key *key = a->cfg.keys[a->cur_key];
+  const char *method = a->hostbound ? GF_AUTH_HOSTBOUND_METHOD : "publickey";
+  size_t bloblen, ul = strlen (a->user), dl;
+  const uint8_t *blob = gf_key_blob (key, &bloblen);
+  uint8_t *data = NULL, sig[GF_SIG_MAX];
+  size_t siglen = 0;
+  int r;
+
+  if (!sign)
+    return cl_pk_send (a, 0, NULL, 0);
+  {
+    gf_slice user = { (const uint8_t *) a->user, ul };
+
+    r = signed_data (&data, &dl, a->sid, a->sidlen, user, method,
+                     gf_sigalg_name (a->cur_alg), blob, bloblen,
+                     a->hostbound ? a->host : NULL, a->hostlen);
+  }
+  if (r != GF_OK)
+    return r;
+  if (gf_key_has_private (key))
+    {
+      r = gf_key_sign (key, a->cur_alg, data, dl, sig, sizeof sig, &siglen);
+      free (data);
+      return r != GF_OK ? r : cl_pk_send (a, 1, sig, siglen);
+    }
+  /* The key is elsewhere: hand the application the bytes.  */
+  free (a->sign_data);
+  a->sign_data = data;
+  a->sign_len = dl;
+  a->cur = A_PK_SIGNING;
+  if (a->ev.sign (a->ev.user, key, a->cur_alg, (gf_slice) { data, dl }) != 0
+      && a->cur == A_PK_SIGNING)
+    {
+      /* It cannot: another key.  */
+      free (a->sign_data);
+      a->sign_data = NULL;
+      return cl_next (a);
+    }
+  return GF_OK;
+}
+
+int
+gf_auth_client_sign_respond (gf_auth_client *a, uint64_t now_us,
+                             const uint8_t *sig, size_t len)
+{
+  const gf_key *key;
+  uint8_t *data;
+  size_t dl;
+  int r;
+
+  (void) now_us;
+  if (a == NULL || sig == NULL || len > GF_SIG_MAX)
+    return GF_ERR_INVAL;
+  if (a->cur != A_PK_SIGNING || a->sign_data == NULL)
+    return GF_ERR_STATE;
+  key = a->cfg.keys[a->cur_key];
+  data = a->sign_data;
+  dl = a->sign_len;
+  a->sign_data = NULL;
+  /* Believe nothing that has not been checked against the key.  */
+  r = gf_key_verify (key, a->cur_alg, data, dl, sig, len);
+  free (data);
+  if (r != GF_OK)
+    return cl_next (a);
+  return cl_pk_send (a, 1, sig, len);
+}
+
+int
+gf_auth_client_sign_fail (gf_auth_client *a, uint64_t now_us)
+{
+  (void) now_us;
+  if (a == NULL)
+    return GF_ERR_INVAL;
+  if (a->cur != A_PK_SIGNING)
+    return GF_ERR_STATE;
+  free (a->sign_data);
+  a->sign_data = NULL;
+  return cl_next (a);
 }
 
 /* Send the next request that the server's methods and ours allow, or

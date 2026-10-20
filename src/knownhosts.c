@@ -104,8 +104,15 @@ lookup_name (char *out, size_t cap, const char *host, unsigned port)
   n = strlen (host);
   if (n == 0 || n > MAX_HOST || cap < MAX_HOST + 16)
     return 0;
+  /* What a line would read as something else: a comment, a marker or a
+     negation at the start, a pattern or bracketed port anywhere.  A
+     wildcard would make the key good for other hosts.  */
+  if (host[0] == '#' || host[0] == '@' || host[0] == '!')
+    return 0;
   for (i = 0; i < n; i++)
-    if ((unsigned char) host[i] <= ' ' || host[i] == ',' || host[i] == '|')
+    if ((unsigned char) host[i] <= ' ' || host[i] == ',' || host[i] == '|'
+        || host[i] == '*' || host[i] == '?' || host[i] == '['
+        || host[i] == ']')
       return 0;
   if (port != 0 && port != 22)
     out[o++] = '[';

@@ -486,6 +486,47 @@ grep -q '^FORCE echo forced$' "$dir/server.out" && grep -q '^EXEC echo forced$' 
   && grep -q '^forced$' "$dir/ssh.out" && ! grep -q requested "$dir/ssh.out" \
   || { fail "ssh forced command"; cat "$dir/ssh.out" "$dir/server.out"; }
 
+# Permissions: what a certificate lacks, foxtrot refuses before its program is
+# asked.  "ssh-keygen -O clear" leaves out permit-pty and
+# permit-port-forwarding; the default has them.
+$SSH_KEYGEN -q -s "$dir/ca" -I noperm -n "$user" -V -1h:+1h -O clear "$dir/uk_ed25519.pub" || exit 99
+command cp -f "$dir/uk_ed25519-cert.pub" "$dir/noperm.cert.pub"
+for c in user-ed25519 noperm; do
+  SSH_CMD="echo hello" run_ssh hk_ed25519 --ca-key "$dir/ca.pub" -- -tt -o BatchMode=yes \
+    -i "$dir/uk_ed25519" -o CertificateFile="$dir/$c.cert.pub"
+  grep -q "^AUTH OK $user publickey\$" "$dir/server.out" || fail "ssh -tt with the $c certificate"
+  if [ $c = noperm ]; then
+    grep -q 'PTY allocation request failed' "$dir/ssh.out" || fail "a certificate without permit-pty got a pty"
+  else
+    grep -q 'PTY allocation request failed' "$dir/ssh.out" && fail "a certificate with permit-pty was refused a pty"
+  fi
+  # Remote forwarding: ssh stays up if the server grants the forward and gives
+  # up at once if it does not.
+  sport=$(pick_port)
+  "$SERVER" "$dir/hk_ed25519" "$sport" --ca-key "$dir/ca.pub" > "$dir/server.out" 2>&1 &
+  server_pid=$!
+  i=0
+  while [ $i -lt 30 ] && ! grep -q READY "$dir/server.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  # shellcheck disable=SC2086
+  $SSH $sshopts -o BatchMode=yes -o ExitOnForwardFailure=yes -i "$dir/uk_ed25519" \
+    -o CertificateFile="$dir/$c.cert.pub" -N -R "$((sport + 2000)):localhost:9" \
+    -p "$sport" "$user@127.0.0.1" > "$dir/fwd.out" 2>&1 &
+  fwd_pid=$!
+  sleep 1.5
+  if kill -0 "$fwd_pid" 2>/dev/null; then alive=1; else alive=0; fi
+  kill "$fwd_pid" 2>/dev/null
+  wait "$fwd_pid" 2>/dev/null
+  kill "$server_pid" 2>/dev/null
+  wait "$server_pid" 2>/dev/null
+  server_pid=
+  if [ $c = noperm ]; then
+    [ $alive = 0 ] || fail "a certificate without permit-port-forwarding got a remote forward"
+    grep -q '^TCPIP-FORWARD' "$dir/server.out" && fail "the program was asked about a forward the certificate does not permit"
+  else
+    [ $alive = 1 ] || { fail "a certificate with permit-port-forwarding was refused a remote forward"; cat "$dir/fwd.out"; }
+  fi
+done
+
 # Host certificates: ssh trusts the server's certificate because its CA is in
 # known_hosts as @cert-authority, with strict host key checking.
 echo "@cert-authority 127.0.0.1 $(cut -d' ' -f1,2 "$dir/ca.pub")" > "$dir/kh_ssh_ca"

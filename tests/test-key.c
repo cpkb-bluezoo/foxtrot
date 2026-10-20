@@ -550,7 +550,12 @@ test_text (void)
       CHECK_EQ (gf_key_to_text (k, out, n, NULL), GF_ERR_BUFSIZE);
       CHECK_EQ (gf_key_to_text (k, out, n + 1, NULL), GF_OK);
       /* Without asking for the comment, and in other layouts.  */
-      CHECK_EQ (gf_key_from_text (&k, out, n, NULL) == GF_OK, 1);
+      {
+        gf_key *k0 = NULL;
+
+        CHECK_EQ (gf_key_from_text (&k0, out, n, NULL), GF_OK);
+        gf_key_free (k0);
+      }
       snprintf (buf, sizeof buf, "  \t%.*s\t \t  c o m m e n t  \r\n", (int) sp,
                 v[i].pub);
       {
@@ -675,6 +680,106 @@ test_text (void)
   CHECK_EQ (gf_key_from_text (NULL, "x", 1, NULL), GF_ERR_INVAL);
 }
 
+/* Ed25519 public keys of odd shapes, from the strange (tiny, huge, not
+   canonical, of small order) to the one a fuzzer found, are no reason for
+   the process to die.  libgcrypt before 1.12.3 aborted in the signature check
+   for some of them ("mulm_25519: different sizes"), which a peer could have
+   used to kill a server; this library needs 1.12.4 and the test is that
+   nothing is fatal and nothing verifies.  */
+static void
+test_ed25519_odd_points (void)
+{
+  /* The key and signature a fuzzer found.  */
+  static const char *const found_q =
+    "9d0c876e6574000000005e0be10000000000f485058000000000000000000000";
+  static const char *const found_sig =
+    "2e5eb069cde3cfcf9d6be8fcbd3b7a842b08fe8cadcad286069af81cab502dfe"
+    "8f6c66bde9b78068ced38ef42a02864e130442a8f4c4bbecff7166e3c5cd1907";
+  uint8_t q[32], rs[64], blob[128], sig[128], m16[16];
+  gf_writer w;
+  size_t i, j;
+  static const struct
+  {
+    unsigned low;		/* The low 32 bits of y (little endian)... */
+    unsigned fill;		/* ...and what the other bytes are.  */
+    unsigned sign;		/* The sign bit of x.  */
+  } shapes[] = {
+    { 0, 0, 0 }, { 1, 0, 0 }, { 2, 0, 0 }, { 3, 0, 0 }, { 0, 0, 1 },
+    { 1, 0, 1 }, { 0xffffffffu, 0, 0 }, { 0xffffffedu, 0xff, 0 },
+    { 0xffffffecu, 0xff, 0 }, { 0xffffffeeu, 0xff, 0 }, { 5, 0xff, 1 },
+    { 0xffffffffu, 0xff, 0 }, { 0x12345678u, 0, 0 }, { 0x12345678u, 0xff, 1 }
+  };
+
+  memset (m16, 7, sizeof m16);
+  for (i = 0; i < sizeof shapes / sizeof shapes[0] + 1; i++)
+    {
+      gf_key *k = NULL;
+      size_t sl;
+      gf_writer sw;
+      int rc;
+
+      if (i < sizeof shapes / sizeof shapes[0])
+        {
+          memset (q, (int) shapes[i].fill, sizeof q);
+          for (j = 0; j < 4; j++)
+            q[j] = (uint8_t) (shapes[i].low >> (8 * j));
+          if (shapes[i].fill == 0xff)
+            q[31] = 0x7f;
+          else
+            q[31] = 0;
+          if (shapes[i].sign)
+            q[31] |= 0x80;
+          memset (rs, 0x11, sizeof rs);
+          rs[63] = 0;			/* A canonical S.  */
+        }
+      else
+        {
+          tst_unhex (found_q, q, sizeof q);
+          tst_unhex (found_sig, rs, sizeof rs);
+        }
+      gf_writer_init (&w, blob, sizeof blob);
+      gf_wr_cstring (&w, "ssh-ed25519");
+      gf_wr_string (&w, q, sizeof q);
+      rc = gf_key_from_blob (&k, blob, w.len);
+      if (rc != GF_OK)
+        continue;			/* Refused outright is fine.  */
+      gf_writer_init (&sw, sig, sizeof sig);
+      gf_wr_cstring (&sw, "ssh-ed25519");
+      gf_wr_string (&sw, rs, sizeof rs);
+      sl = sw.len;
+      /* Not fatal, and not a good signature.  */
+      CHECK (gf_key_verify (k, GF_SIG_ED25519, m16, sizeof m16, sig, sl) != GF_OK);
+      /* The same points as the R of a signature by a good key.  */
+      gf_key_free (k);
+    }
+  {
+    /* As R: a good key, a signature whose R is each shape.  */
+    gf_key *good = NULL;
+
+    CHECK_EQ (gf_key_generate (&good, GF_KEY_ED25519, 0), GF_OK);
+    for (i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
+      {
+        gf_writer sw;
+        size_t sl;
+
+        memset (rs, (int) shapes[i].fill, 32);
+        for (j = 0; j < 4; j++)
+          rs[j] = (uint8_t) (shapes[i].low >> (8 * j));
+        rs[31] = shapes[i].fill == 0xff ? 0x7f : 0;
+        if (shapes[i].sign)
+          rs[31] |= 0x80;
+        memset (rs + 32, 0x22, 32);
+        rs[63] = 0;
+        gf_writer_init (&sw, sig, sizeof sig);
+        gf_wr_cstring (&sw, "ssh-ed25519");
+        gf_wr_string (&sw, rs, sizeof rs);
+        sl = sw.len;
+        CHECK (gf_key_verify (good, GF_SIG_ED25519, m16, sizeof m16, sig, sl) != GF_OK);
+      }
+    gf_key_free (good);
+  }
+}
+
 int
 main (void)
 {
@@ -686,5 +791,6 @@ main (void)
   test_signature_refusals ();
   test_openssh_file_refusals ();
   test_text ();
+  test_ed25519_odd_points ();
   TST_DONE ();
 }

@@ -133,13 +133,21 @@ ECDH on P-256 and P-384, ML-KEM, sntrup761, Ed25519, ECDSA and RSA.
 foxtrot adds the glue SSH defines: the OpenSSH ChaCha20-Poly1305
 construction and the RFC 5647 AES-GCM one in @file{src/packet.c}, the
 hybrid key exchange composition in @file{src/kex.c}, and the SSH
-signature formats in @file{src/key.c}.  libgcrypt 1.12 or later is
-required, the first whose ML-KEM is the final FIPS 203.
+signature formats in @file{src/key.c}.  libgcrypt 1.12.4 or later is
+required: 1.12.0 is the first whose ML-KEM is the final FIPS 203, but before
+1.12.3 libgcrypt aborts the process when asked to verify with some Ed25519
+public keys, which a peer can choose, and before 1.12.4 its ECDH does not
+check the peer's point.  A library that makes a server's process die on a
+stranger's key is not one to run, so @code{gf_crypto_init} refuses an older
+libgcrypt at run time as @command{configure} does at build time.
 
-There is no MD5 and no SHA-1 anywhere, not even for fingerprints
-(@samp{SHA256:}), and no HMAC, since every cipher is AEAD.  GnuTLS is
-configured with @option{--with-gnutls} but nothing uses it yet; it is
-reserved for the X.509 key formats of RFC 6187.
+There is no MD5 and no SHA-1 for anything that authenticates or derives
+anything, not even for fingerprints (@samp{SHA256:}), and no HMAC in the
+protocol, since every cipher is AEAD.  SHA-1 appears in two places only, to
+recognise names and not to protect them: the HMAC-SHA-1 of hashed
+@file{known_hosts} names and the SHA-1 hash that identifies an OCSP
+responder.  GnuTLS, if configured (@option{--with-gnutls}, the default if it
+is found), is used for the X.509 key formats of RFC 6187.
 
 libgcrypt's ECDH takes any point it is given.  An invalid-curve attack is
 what that invites, so foxtrot checks the peer's point itself before the
@@ -252,6 +260,17 @@ request, by packet count, by byte count and by time; a scripted client that
 completes a real key exchange and then sends the server what it must refuse;
 and the Terrapin attack's injection and deletion.  Each protection was
 checked by removing it and seeing a test fail.
+
+@code{make check} also runs the fuzz targets of @file{fuzz/} once over
+their corpora.  There is one for each parser of what a peer or a file
+sends (the identification line, packets, key exchange messages, keys and
+certificates, private key files, @file{known_hosts}, X.509 chains,
+authentication, channels, SFTP and a whole connection), and each checks
+what must hold on any input as well as that nothing crashes.  Built with
+AddressSanitizer and UndefinedBehaviorSanitizer and coverage, they are
+run with mutation (the file @file{HACKING} says how); inputs that found
+something stay in the corpus, and the unit tests are kept clean under the
+same sanitizers.
 
 @code{make check-integration} runs foxtrot's client against OpenSSH's
 @command{sshd} and OpenSSH's @command{ssh} and @command{sftp} against
@@ -373,6 +392,26 @@ the client requested), and whether @samp{verify-required} is set, and may
 still say no (a revocation list, by serial or key id).  With no CAs
 configured no certificate is accepted.  The wall clock is
 @code{unix_time} in the events, or @code{time(2)}.
+
+@cindex permit-pty
+@cindex permit-port-forwarding
+A user certificate says what it permits by having extensions, so a
+restriction is an extension that is missing: @command{ssh-keygen}'s default
+has @samp{permit-pty}, @samp{permit-port-forwarding},
+@samp{permit-agent-forwarding}, @samp{permit-X11-forwarding} and
+@samp{permit-user-rc}, and @samp{-O clear} has none.  Code that checks only
+what is present would let a user who was given nothing do everything, so the
+session does the checking for a server (@code{gf_session_permits}): a pty
+request without @samp{permit-pty}, and a direct-tcpip channel or a
+tcpip-forward request without @samp{permit-port-forwarding}, are refused
+before the application is asked, with the answers of a refusal and not as
+an offence.  Agent and X11 forwarding are never offered.
+@samp{permit-user-rc} is for the application, with @code{force-command}, to
+ask about.  A user who did not authenticate with a certificate is not
+restricted by one.  An application that does not use the session asks
+@code{gf_auth_server_permits} or @code{gf_cert_has_extension}.  The
+@samp{no-touch-required} extension of a security key's certificate is not
+honoured: the touch is always required.
 
 A client presents a certificate by putting the key with the certificate
 attached (@code{gf_key_with_certificate}) in its list.  A server presents a
@@ -724,6 +763,44 @@ database or another process: it answers a request now or later with
 whether each would be accepted, then keyboard-interactive if it can answer,
 then the password, within the methods the server says continue, and uses
 the RSA hash the server lists in @code{server-sig-algs}.
+
+@node Keys elsewhere
+@subsection Keys in an agent, on a token or in a module
+@cindex agent
+@cindex hardware token
+@cindex signer
+
+A client key needs no private part here if the application can have the
+signing done: @code{gf_auth_client_config.keys} may hold public keys (a
+public key from @code{gf_key_from_blob} or @code{gf_key_from_text}, a
+certificate, a FIDO security key) when the events have a @code{sign}
+function.  The library does not talk to an SSH agent, a token or an HSM, since
+that is I/O, but it asks whoever does, in the way the keyboard-interactive
+method asks a person: when the server has said it would take the key, the
+application is handed the exact bytes to sign and the algorithm, answers with
+@code{gf_auth_client_sign_respond} or @code{_sign_fail} inside the call or
+later, and the authentication goes on.  Through the session these are the
+@code{auth_sign} event and @code{gf_session_auth_sign_respond}.
+
+@itemize @bullet
+@item
+The answer is checked against the public key before anything is sent.  A
+signature that does not verify, made for other data, or by another key, or a
+security key's with the touch missing, is a failed key, not a malformed
+request on the wire, so a bad agent or an untouched token costs one attempt.
+@item
+For a certificate the name in the signature is its key's, as when the
+library signs; for a security key the whole blob with the flags and counter
+is the answer, which is what a FIDO library returns once its output is
+packed.
+@item
+Signing can take as long as a person does, and the server's grace time (two
+minutes) runs meanwhile.  A key with a private part is signed for at once, as
+before; the function is called only for the others.
+@item
+The agent protocol itself (the requests and replies on the agent's socket) is
+not part of the library.
+@end itemize
 
 @node The connection protocol
 @section The connection protocol

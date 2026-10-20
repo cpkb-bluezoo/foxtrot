@@ -19,7 +19,7 @@
 ## <https://www.gnu.org/licenses/>.
 
 ACLOCAL_AMFLAGS = -I m4
-SUBDIRS = po src doc tests
+SUBDIRS = po src doc tests fuzz
 ## The integration suite is built and run only on request (check-integration
 ## below), so "make", "make check" and "make install" never enter it; it is
 ## still configured, distributed and cleaned.

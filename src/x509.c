@@ -712,10 +712,12 @@ responder_in_dates (gnutls_ocsp_resp_t resp, gnutls_x509_crt_t issuer,
     }
   else
     {
-      gnutls_datum_t idn;
+      gnutls_datum_t idn = { NULL, 0 };
+      int same = gnutls_x509_crt_get_raw_dn (issuer, &idn) == 0
+        && idn.size == dn.size && memcmp (idn.data, dn.data, dn.size) == 0;
 
-      if (gnutls_x509_crt_get_raw_dn (issuer, &idn) == 0 && idn.size == dn.size
-          && memcmp (idn.data, dn.data, dn.size) == 0)
+      gnutls_free (idn.data);
+      if (same)
         {
           gnutls_free (dn.data);
           return 1;
@@ -738,10 +740,11 @@ responder_in_dates (gnutls_ocsp_resp_t resp, gnutls_x509_crt_t issuer,
         }
       else
         {
-          gnutls_datum_t cdn;
+          gnutls_datum_t cdn = { NULL, 0 };
 
           same = gnutls_x509_crt_get_raw_dn (certs[i], &cdn) == 0
             && cdn.size == dn.size && memcmp (cdn.data, dn.data, dn.size) == 0;
+          gnutls_free (cdn.data);
         }
       if (same)
         {

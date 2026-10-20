@@ -219,7 +219,8 @@ io_input (struct io *io, const uint8_t *d, size_t n, packet_fn fn, void *ctx)
             io->in = p;
             io->incap = cap;
           }
-        memcpy (io->in + io->inn, d, take);
+        if (take > 0)		/* io->in is NULL until something arrives.  */
+          memcpy (io->in + io->inn, d, take);
         io->inn += take;
         d += take;
         n -= take;

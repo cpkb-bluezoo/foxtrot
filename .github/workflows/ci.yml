@@ -3,6 +3,8 @@ name: CI
 # Builds foxtrot with gcc, warnings as errors, and runs "make check", the
 # unit tests, in the "check" stage of ci/Dockerfile.  The Dockerfile also
 # builds the libgcrypt that foxtrot needs and Ubuntu 24.04 does not have.
+# A second job runs the unit tests and the fuzz corpora under AddressSanitizer
+# and UndefinedBehaviorSanitizer, and fuzzes each target for a short time.
 
 on:
   push:
@@ -29,6 +31,25 @@ jobs:
           context: .
           file: ci/Dockerfile
           target: check
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  sanitize:
+    name: Sanitizers and fuzz corpora (gcc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Run the tests and a short fuzz under ASan and UBSan
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ci/Dockerfile
+          target: sanitize
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

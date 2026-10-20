@@ -1142,8 +1142,14 @@ import_private (gf_key *k, const uint8_t *q, size_t qlen, gcry_mpi_t d,
                            "(q %b)(d %b)))", (int) qlen, q, ED_LEN, seed);
   else if (k->type == GF_KEY_RSA)
     {
-      gcry_mpi_t u = gcry_mpi_new (0), lo = p, hi = qq;
+      gcry_mpi_t u, lo = p, hi = qq;
 
+      /* The primes come from a file.  libgcrypt's modular inverse does not
+         survive a zero modulus, and 1 or equal primes are no RSA key.  */
+      if (gcry_mpi_cmp_ui (p, 1) <= 0 || gcry_mpi_cmp_ui (qq, 1) <= 0
+          || gcry_mpi_cmp (p, qq) == 0)
+        return GF_ERR_ENCODING;
+      u = gcry_mpi_new (0);
       /* libgcrypt wants p < q and u = p^-1 mod q.  */
       if (gcry_mpi_cmp (p, qq) > 0)
         {

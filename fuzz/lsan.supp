@@ -1,0 +1,3 @@
+# libgcrypt allocates its jitterentropy collector once and never frees it.
+# Not ours; without this every sanitized run ends in a report.
+leak:jent_entropy_collector_alloc
