@@ -6,3 +6,4 @@ foxtrot NEWS - history of user-visible changes.
 ** User authentication: gf_auth_server and gf_auth_client.
 ** The connection protocol: gf_chans.
 ** SFTP version 3: gf_sftp_server and gf_sftp_client.
+** The session object: gf_session.

@@ -90,6 +90,7 @@ why for each.
 * Layers::
 * Crypto::
 * The push-parser contract::
+* The session::
 * Source layout::
 * Testing::
 @end menu
@@ -112,6 +113,7 @@ why for each.
 @item @file{auth.h} @tab User authentication, client and server.
 @item @file{chan.h} @tab The connection protocol: channels, flow control, requests, forwarding.
 @item @file{sftp.h} @tab SFTP version 3, client and server, over a channel.
+@item @file{session.h} @tab All of the above behind one object and one set of events.
 @end multitable
 
 Each header below @file{conn.h} can be used on its own and is tested on
@@ -156,6 +158,73 @@ all-or-nothing: no byte of it is delivered before its tag has verified.
 @code{gf_conn_receive} holds the partial tail internally and wipes each
 packet from its buffer after use.
 
+@node The session
+@section The session
+@cindex session
+
+Most applications want @file{session.h}: a @code{gf_session} owns a
+connection, an authentication machine and a channel manager, and does the
+plumbing that every application would otherwise write the same way.  The
+lower layers stay public for those that need different routing, and
+@code{gf_session_conn} and @code{gf_session_channels} give access to them.
+
+What the session does:
+
+@itemize @bullet
+@item
+Routes messages 50 to 79 to the authentication machine and 80 to 100 to the
+channels.  A channel message before authentication ends the connection, and
+a message number nobody knows is answered with @samp{UNIMPLEMENTED}.
+@item
+Requests the @samp{ssh-userauth} service, gives the authentication machine
+the session identifier and the host key, and passes it the server's
+extensions, so that the RSA hash and the host-bound method are chosen
+correctly.
+@item
+Turns every layer's request to end the connection into a DISCONNECT.
+@item
+Resumes channels whose sends were held back by a key exchange, when it is
+over.
+@item
+Keeps one deadline: the earliest of the transport's and the authentication
+grace time.
+@item
+Enforces @samp{no-more-sessions@@openssh.com} and a limit on session
+channels, and refuses by default what the application has not been asked
+to decide: with no @code{channel_open} callback every channel is refused,
+with no @code{global_request} callback every global request is, and a client
+with no @code{host_key} callback trusts no host.
+@item
+Binds SFTP to a channel with @code{gf_session_sftp_server} or
+@code{gf_session_sftp_client}: the data goes in, output is flushed when the
+channel can take more, the channel is closed if the SFTP session fails, and
+the SFTP object is freed with the channel.
+@end itemize
+
+A server, in outline:
+
+@example
+gf_session_config cfg = @{ 0 @};
+gf_session_events ev = @{ 0 @};
+
+cfg.conn.host_keys = keys;  cfg.conn.nhost_keys = n;
+cfg.server_auth.methods = GF_AUTH_PUBLICKEY;
+ev.user = app;
+ev.write = write_to_socket;
+ev.auth_request = decide;        /* gf_session_auth_accept/_reject */
+ev.channel_open = open_channel;  /* gf_session_channel_accept/_reject */
+ev.channel_request = on_request; /* exec, subsystem, ... */
+ev.channel_data = on_data;       /* gf_chans_consumed when done */
+gf_session_server_new (&s, &cfg, &ev);
+gf_session_start (s, now);
+/* then: gf_session_receive (s, now, bytes, n) for what is read, and
+   gf_session_on_timeout (s, now) when gf_session_timeout says */
+@end example
+
+A client is the same with @code{cfg.client_auth} (user, keys, password), a
+@code{host_key} callback and @code{channel_*} events for the channels it
+opens with @code{gf_chans_open_session}.
+
 @node Source layout
 @section Source layout
 
@@ -168,7 +237,10 @@ use libraries independent of libgcrypt.
 @node Testing
 @section Testing
 
-@code{make check} runs the unit tests (the channel and SFTP layers are
+@code{make check} runs the unit tests (the session is tested with two
+instances joined back to back, through authentication of every kind, channels,
+SFTP over a session, rekeying under load, and every routing violation; the
+channel and SFTP layers are
 tested with two instances wired back to back, a file system in memory and
 every chunking of the stream, and against scripted peers that break every
 rule): known answers from independent
@@ -506,9 +578,9 @@ directions against OpenSSH's @command{sftp} client and @samp{internal-sftp}:
 statuses of what fails.
 
 @item
-@strong{Next.}  A session object tying the transport, authentication and
-channels together with one event interface, so that an application sets
-callbacks and does not route messages.
+@strong{Done.}  A session object tying the transport, authentication and
+channels together with one event interface; the interoperability programs
+use it, and are some 200 lines shorter for it.
 
 @item
 OpenSSH certificates, FIDO security keys, passphrase-protected private key

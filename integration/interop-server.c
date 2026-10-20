@@ -57,9 +57,7 @@
 #include <sys/types.h>
 #include <limits.h>
 
-#include <foxtrot/auth.h>
-#include <foxtrot/chan.h>
-#include <foxtrot/sftp.h>
+#include <foxtrot/session.h>
 #include <foxtrot/key.h>
 #include <foxtrot/policy.h>
 #include <foxtrot/wire.h>
@@ -67,8 +65,7 @@
 struct ctx
 {
   int fd;
-  gf_conn *c;
-  gf_auth_server *auth;
+  gf_session *s;
   gf_chans *chans;
   gf_key *authorized;
   const char *password, *code;
@@ -92,8 +89,6 @@ static int
 on_established (void *user, const gf_conn_info *info)
 {
   struct ctx *x = user;
-  size_t bl;
-  const uint8_t *blob = gf_key_blob (info->host_key, &bl);
 
   printf ("KEX %s %s %s\n", gf_kex_name (info->kex),
           gf_cipher_name (info->cipher_c2s), gf_sigalg_name (info->hostkey_alg));
@@ -101,32 +96,6 @@ on_established (void *user, const gf_conn_info *info)
           (const char *) info->peer_software.data);
   fflush (stdout);
   x->established = 1;
-  return gf_auth_server_start (x->auth, now_us (), info->session_id,
-                               info->session_id_len, blob, bl) != GF_OK;
-}
-
-static int
-on_rekeyed (void *user, const gf_conn_info *info)
-{
-  struct ctx *x = user;
-
-  (void) info;
-  return x->authed && gf_chans_resume (x->chans) != GF_OK;
-}
-
-static int
-on_message (void *user, const uint8_t *p, size_t n)
-{
-  struct ctx *x = user;
-
-  if (p[0] >= 50 && p[0] <= 79)
-    {
-      int r = gf_auth_server_input (x->auth, now_us (), p, n);
-
-      return r != GF_OK && r != GF_ERR_AUTH;
-    }
-  if (p[0] >= 80 && p[0] <= 100 && x->authed)
-    return gf_chans_input (x->chans, p, n) != GF_OK;
   return 0;
 }
 
@@ -146,14 +115,6 @@ on_closed (void *user, int error, uint32_t reason, gf_slice text)
 }
 
 static int
-auth_send (void *user, const uint8_t *p, size_t n)
-{
-  struct ctx *x = user;
-
-  return gf_conn_send (x->c, now_us (), p, n) != GF_OK;
-}
-
-static int
 auth_request (void *user, const gf_auth_request *req)
 {
   struct ctx *x = user;
@@ -165,8 +126,8 @@ auth_request (void *user, const gf_auth_request *req)
       x->method = req->hostbound ? "publickey-hostbound" : "publickey";
       ok = x->authorized && gf_key_equal (x->authorized, req->key);
       if (!req->has_signature)
-        return (ok ? gf_auth_server_pk_ok (x->auth, now_us ())
-                   : gf_auth_server_reject (x->auth, now_us (), 0)) != GF_OK;
+        return (ok ? gf_session_auth_pk_ok (x->s)
+                   : gf_session_auth_reject (x->s, 0)) != GF_OK;
       break;
     case GF_AUTH_PASSWORD:
       x->method = "password";
@@ -179,15 +140,15 @@ auth_request (void *user, const gf_auth_request *req)
         static const int echo[] = { 0 };
 
         x->method = "keyboard-interactive";
-        return gf_auth_server_kbdint_prompt (x->auth, now_us (), "", "", 1,
-                                             prompts, echo) != GF_OK;
+        return gf_session_auth_kbdint_prompt (x->s, "", "", 1, prompts, echo)
+          != GF_OK;
       }
     default:
       break;
     }
   printf ("REQUEST %s %s\n", x->method ? x->method : "?", ok ? "yes" : "no");
-  return (ok ? gf_auth_server_accept (x->auth, now_us ())
-             : gf_auth_server_reject (x->auth, now_us (), 0)) != GF_OK;
+  return (ok ? gf_session_auth_accept (x->s)
+             : gf_session_auth_reject (x->s, 0)) != GF_OK;
 }
 
 static int
@@ -197,8 +158,8 @@ auth_kbd_response (void *user, const gf_slice *r, size_t n)
   int ok = n == 1 && x->code && r[0].len == strlen (x->code)
     && memcmp (r[0].data, x->code, r[0].len) == 0;
 
-  return (ok ? gf_auth_server_accept (x->auth, now_us ())
-             : gf_auth_server_reject (x->auth, now_us (), 0)) != GF_OK;
+  return (ok ? gf_session_auth_accept (x->s)
+             : gf_session_auth_reject (x->s, 0)) != GF_OK;
 }
 
 static int
@@ -213,34 +174,7 @@ auth_done (void *user, gf_slice username)
   return 0;
 }
 
-static int
-auth_disconnect (void *user, uint32_t reason)
-{
-  struct ctx *x = user;
-
-  printf ("AUTH FAILED %u\n", (unsigned) reason);
-  fflush (stdout);
-  gf_conn_disconnect (x->c, now_us (), reason, NULL);
-  return 0;
-}
-
-
 /* ---- channels ---- */
-
-static int
-chans_send (void *user, const uint8_t *p, size_t n)
-{
-  return gf_conn_send (((struct ctx *) user)->c, now_us (), p, n);
-}
-
-static int
-chans_disconnect (void *user, uint32_t reason)
-{
-  struct ctx *x = user;
-
-  gf_conn_disconnect (x->c, now_us (), reason, NULL);
-  return 0;
-}
 
 /* Queue data for the peer and send what the window takes.  */
 static int
@@ -669,25 +603,14 @@ sftp_request (void *user, const gf_sftp_request *q)
     }
 }
 
-static long
-sftp_write (void *user, const uint8_t *d, size_t n)
-{
-  struct ctx *x = user;
-  /* Offer it all: the library takes what the window allows, and a short
-     result is what makes it tell us when to try again.  */
-  long r = gf_chans_send_data (x->chans, x->chan, d, n);
-
-  return r == GF_ERR_AGAIN ? 0 : r;
-}
-
 static void
 sftp_disconnect (void *user, int status)
 {
   struct ctx *x = user;
 
+  (void) x;
   printf ("SFTP ENDED %d\n", status);
   fflush (stdout);
-  gf_chans_close (x->chans, x->chan);
 }
 
 static int
@@ -696,8 +619,8 @@ chan_open_request (void *user, const gf_chan_open *o)
   struct ctx *x = user;
 
   if (x->active)
-    return gf_chans_open_reject (x->chans, o->id,
-                                 GF_OPEN_RESOURCE_SHORTAGE, "busy") != GF_OK;
+    return gf_session_channel_reject (x->s, o->id, GF_OPEN_RESOURCE_SHORTAGE,
+                                      "busy") != GF_OK;
   if (o->type == GF_CHAN_DIRECT_TCPIP)
     {
       printf ("FORWARD %.*s %u\n", (int) o->host.len,
@@ -707,9 +630,9 @@ chan_open_request (void *user, const gf_chan_open *o)
       x->tcpip = 1;
     }
   else if (o->type != GF_CHAN_SESSION)
-    return gf_chans_open_reject (x->chans, o->id,
-                                 GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                                 "not here") != GF_OK;
+    return gf_session_channel_reject (x->s, o->id,
+                                      GF_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                                      "not here") != GF_OK;
   else
     {
       x->mode = M_NONE;
@@ -720,7 +643,7 @@ chan_open_request (void *user, const gf_chan_open *o)
   x->finishing = 0;
   x->outn = 0;
   x->exit_status = 0;
-  return gf_chans_open_accept (x->chans, o->id, 0, 0) != GF_OK;
+  return gf_session_channel_accept (x->s, o->id, 0, 0) != GF_OK;
 }
 
 static int
@@ -785,17 +708,17 @@ chan_request (void *user, const gf_chan_request *q)
           memset (&sc, 0, sizeof sc);
           memset (&se, 0, sizeof se);
           se.user = x;
-          se.write = sftp_write;
           se.request = sftp_request;
           se.disconnect = sftp_disconnect;
-          if (gf_sftp_server_new (&x->sftp, &sc, &se) != GF_OK)
-            ok = 0;
-          else
-            {
-              x->mode = M_SFTP;
-              printf ("SFTP START\n");
-              fflush (stdout);
-            }
+          /* The reply must go before the first SFTP byte can arrive.  */
+          if (gf_chans_reply (x->chans, q->id, 1) != GF_OK
+              || gf_session_sftp_server (x->s, q->id, &sc, &se, &x->sftp)
+                 != GF_OK)
+            return 1;
+          x->mode = M_SFTP;
+          printf ("SFTP START\n");
+          fflush (stdout);
+          return 0;
         }
       else
         ok = 0;
@@ -823,11 +746,6 @@ chan_data (void *user, uint32_t id, const uint8_t *d, size_t n)
 
   if ((x->mode == M_CAT || x->mode == M_ECHO) && out_add (x, d, n))
     return 1;
-  if (x->mode == M_SFTP && x->sftp)
-    {
-      if (gf_sftp_server_input (x->sftp, d, n) != GF_OK)
-        return 0;			/* It asked for the channel to close.  */
-    }
   return gf_chans_consumed (x->chans, id, n) != GF_OK;
 }
 
@@ -837,8 +755,6 @@ chan_eof (void *user, uint32_t id)
   struct ctx *x = user;
 
   (void) id;
-  if (x->mode == M_SFTP)
-    return gf_chans_close (x->chans, x->chan) != GF_OK;
   if (x->mode == M_ECHO)
     return out_flush (x) || gf_chans_close (x->chans, x->chan) != GF_OK;
   if (x->mode == M_CAT)
@@ -855,8 +771,6 @@ chan_writable (void *user, uint32_t id)
   struct ctx *x = user;
 
   (void) id;
-  if (x->mode == M_SFTP && x->sftp)
-    return gf_sftp_server_writable (x->sftp) != GF_OK;
   return out_flush (x) || produce (x) || maybe_finish (x);
 }
 
@@ -867,12 +781,8 @@ chan_closed (void *user, uint32_t id)
 
   (void) id;
   x->active = 0;
-  if (x->sftp)
-    {
-      gf_sftp_server_free (x->sftp);
-      x->sftp = NULL;
-      memset (x->handles, 0, sizeof x->handles);
-    }
+  x->sftp = NULL;			/* The session freed it.  */
+  memset (x->handles, 0, sizeof x->handles);
   printf ("CHANNEL CLOSED\n");
   fflush (stdout);
   return 0;
@@ -920,10 +830,8 @@ main (int argc, char **argv)
   char fp[64];
   struct ctx x;
   gf_key *key;
-  gf_conn_config cfg;
-  gf_conn_events ev;
-  gf_auth_server_config ac;
-  gf_auth_server_events ae;
+  gf_session_config cfg;
+  gf_session_events ev;
 
   if (argc < 3)
     {
@@ -986,60 +894,38 @@ main (int argc, char **argv)
     }
 
   memset (&cfg, 0, sizeof cfg);
-  cfg.host_keys = &key;
-  cfg.nhost_keys = 1;
-  cfg.announce_hostbound = hostbound;
-  cfg.rekey_bytes = rekey_bytes;
+  cfg.conn.host_keys = &key;
+  cfg.conn.nhost_keys = 1;
+  cfg.conn.rekey_bytes = rekey_bytes;
+  cfg.server_auth.methods = (x.authorized ? GF_AUTH_PUBLICKEY : 0)
+    | (x.password ? GF_AUTH_PASSWORD : 0) | (x.code ? GF_AUTH_KBDINT : 0);
+  cfg.server_auth.hostbound = hostbound;
   memset (&ev, 0, sizeof ev);
   ev.user = &x;
   ev.write = on_write;
   ev.established = on_established;
-  ev.rekeyed = on_rekeyed;
-  ev.message = on_message;
+  ev.auth_request = auth_request;
+  ev.auth_kbdint_response = auth_kbd_response;
+  ev.authenticated = auth_done;
+  ev.channel_open = chan_open_request;
+  ev.channel_request = chan_request;
+  ev.channel_data = chan_data;
+  ev.channel_eof = chan_eof;
+  ev.channel_writable = chan_writable;
+  ev.channel_closed = chan_closed;
+  ev.global_request = chan_global;
   ev.closed = on_closed;
-  memset (&ac, 0, sizeof ac);
-  ac.methods = (x.authorized ? GF_AUTH_PUBLICKEY : 0)
-    | (x.password ? GF_AUTH_PASSWORD : 0) | (x.code ? GF_AUTH_KBDINT : 0);
-  ac.hostbound = hostbound;
-  memset (&ae, 0, sizeof ae);
-  ae.user = &x;
-  ae.send = auth_send;
-  ae.request = auth_request;
-  ae.kbdint_response = auth_kbd_response;
-  ae.authenticated = auth_done;
-  ae.disconnect = auth_disconnect;
-  {
-    gf_chans_config cc;
-    gf_chans_events ce;
-
-    memset (&cc, 0, sizeof cc);
-    memset (&ce, 0, sizeof ce);
-    ce.user = &x;
-    ce.send = chans_send;
-    ce.disconnect = chans_disconnect;
-    ce.open_request = chan_open_request;
-    ce.request = chan_request;
-    ce.data = chan_data;
-    ce.eof = chan_eof;
-    ce.writable = chan_writable;
-    ce.closed = chan_closed;
-    ce.global_request = chan_global;
-    if (gf_chans_new (&x.chans, &cc, &ce) != GF_OK)
-      return 2;
-  }
-  if (gf_conn_server_new (&x.c, &cfg, &ev) != GF_OK
-      || gf_auth_server_new (&x.auth, &ac, &ae) != GF_OK
-      || gf_conn_start (x.c, now_us ()) != GF_OK)
+  if (gf_session_server_new (&x.s, &cfg, &ev) != GF_OK
+      || gf_session_start (x.s, now_us ()) != GF_OK)
     {
       fprintf (stderr, "cannot start\n");
       return 2;
     }
-  r = drive (x.c, x.fd, NULL, NULL, 20000);
+  x.chans = gf_session_channels (x.s);
+  r = drive (x.s, x.fd, NULL, NULL, 20000);
   printf ("DONE %d\n", r);
-  gf_chans_free (x.chans);
   free (x.out);
-  gf_auth_server_free (x.auth);
-  gf_conn_free (x.c);
+  gf_session_free (x.s);
   gf_key_free (key);
   gf_key_free (x.authorized);
   close (x.fd);

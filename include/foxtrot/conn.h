@@ -236,6 +236,11 @@ int gf_conn_request_service (gf_conn *c, uint64_t now_us, const char *name);
 int gf_conn_send (gf_conn *c, uint64_t now_us, const uint8_t *payload,
                   size_t len);
 
+/* From inside the message callback: answer the message being delivered
+   with SSH_MSG_UNIMPLEMENTED, because the layer above does not know its
+   number (RFC 4253 section 11.4).  */
+int gf_conn_reject_message (gf_conn *c);
+
 /* Send SSH_MSG_IGNORE with DATA (traffic padding, keepalive).  */
 int gf_conn_send_ignore (gf_conn *c, uint64_t now_us, const uint8_t *data,
                          size_t len);

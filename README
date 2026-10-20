@@ -49,7 +49,10 @@ Pre-alpha.  What exists today:
   sftp      SFTP version 3, client and server, over a channel; interoperating
             with OpenSSH's sftp and internal-sftp
 
-Not yet written: a session object that ties the layers together.  See the manual
+  session   one object and one set of events over all of the above: routing,
+            startup wiring, deadlines, policy defaults, SFTP binding
+
+Start with include/foxtrot/session.h and the manual.  See the manual
 (doc/foxtrot.texi) for the design, security policy and roadmap.
 
 Building

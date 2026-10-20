@@ -1318,6 +1318,16 @@ gf_conn_send (gf_conn *c, uint64_t now_us, const uint8_t *payload, size_t len)
 }
 
 int
+gf_conn_reject_message (gf_conn *c)
+{
+  if (c == NULL)
+    return GF_ERR_INVAL;
+  if (c->st != ST_PACKETS || !c->in_event)
+    return GF_ERR_STATE;
+  return send_unimplemented (c, gf_packet_seq (&c->pkt, GF_DIR_READ) - 1);
+}
+
+int
 gf_conn_send_ignore (gf_conn *c, uint64_t now_us, const uint8_t *data,
                      size_t len)
 {

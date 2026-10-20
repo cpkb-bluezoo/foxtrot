@@ -32,6 +32,7 @@ libfoxtrot_la_SOURCES = \
   key.c \
   packet.c \
   policy.c \
+  session.c \
   sftp.c \
   status.c \
   wire.c
@@ -55,6 +56,7 @@ foxtrotinclude_HEADERS = \
   $(top_srcdir)/include/foxtrot/key.h \
   $(top_srcdir)/include/foxtrot/packet.h \
   $(top_srcdir)/include/foxtrot/policy.h \
+  $(top_srcdir)/include/foxtrot/session.h \
   $(top_srcdir)/include/foxtrot/sftp.h \
   $(top_srcdir)/include/foxtrot/status.h \
   $(top_srcdir)/include/foxtrot/wire.h
