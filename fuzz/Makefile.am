@@ -28,13 +28,13 @@
 ## The corpus (corpus/) is made from the vectors of ../tests by gen-seeds.py,
 ## and grows with the inputs that found something.
 
-AM_CPPFLAGS = -I$(top_srcdir)/include -I$(srcdir)
+AM_CPPFLAGS = -I$(top_srcdir)/include -I$(srcdir) -I$(top_srcdir)/tests
 AM_CFLAGS = $(STD_CFLAGS) $(WARN_CFLAGS)
 LDADD = $(top_builddir)/src/libfoxtrot.la
 
 FUZZ_TARGETS = fuzz-wire fuzz-ident fuzz-packet fuzz-kexinit fuzz-key \
   fuzz-keytext fuzz-keyfile fuzz-knownhosts fuzz-x509 fuzz-auth \
-  fuzz-chans fuzz-sftp fuzz-conn
+  fuzz-chans fuzz-sftp fuzz-conn fuzz-authkeys
 
 check_PROGRAMS = $(FUZZ_TARGETS)
 TESTS = $(FUZZ_TARGETS)
@@ -55,5 +55,6 @@ fuzz_auth_SOURCES = fuzz-auth.c driver.c fuzz-common.h
 fuzz_chans_SOURCES = fuzz-chans.c driver.c fuzz-common.h
 fuzz_sftp_SOURCES = fuzz-sftp.c driver.c fuzz-common.h
 fuzz_conn_SOURCES = fuzz-conn.c driver.c fuzz-common.h
+fuzz_authkeys_SOURCES = fuzz-authkeys.c driver.c fuzz-common.h
 
 EXTRA_DIST = run-corpus.sh gen-seeds.py lsan.supp corpus

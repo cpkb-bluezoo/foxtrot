@@ -1,0 +1,3 @@
+
+192.0.2.50host.example.orgaliceno-pty,command="/bin/ls -l",from="192.0.2.0/24,*.example.org,!bad.example.org" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINJoto4fjj7N5LkmfPGLFlqu2sol3+9FIQOeobO2alB1
+restrict,pty,permitopen="db:5432",permitopen="[2001:db8::1]:22",permitlisten="8080",environment="A=1",expiry-time="20991231" ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHC4LZEx0kYe2k/e8xWuH5nIFsb71G9l2K6snxrFAlQZ+kn9pIHWtVGo8T8J9we0UVzeCl6WGoW10a15MqafdTs=

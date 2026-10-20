@@ -413,8 +413,9 @@ gf_cert_critical_option (const gf_key *k, const char *name, gf_slice *value)
 
 /* One entry of a source-address list: an address, or an address and a
    prefix length (CIDR).  */
-static int
-parse_cidr (const char *e, size_t n, int *family, uint8_t *addr, unsigned *bits)
+int
+gfi_parse_cidr (const char *e, size_t n, int *family, uint8_t *addr,
+                unsigned *bits)
 {
   char buf[64];
   const char *slash = memchr (e, '/', n);
@@ -456,8 +457,8 @@ parse_cidr (const char *e, size_t n, int *family, uint8_t *addr, unsigned *bits)
   return 1;
 }
 
-static int
-prefix_equal (const uint8_t *a, const uint8_t *b, unsigned bits)
+int
+gfi_prefix_equal (const uint8_t *a, const uint8_t *b, unsigned bits)
 {
   unsigned whole = bits / 8, rest = bits % 8;
 
@@ -484,10 +485,10 @@ walk_list (gf_slice list, int pfam, const uint8_t *peer)
       int fam;
       unsigned bits;
 
-      if (!parse_cidr ((const char *) list.data + start, end - start, &fam, a,
-                       &bits))
+      if (!gfi_parse_cidr ((const char *) list.data + start, end - start, &fam,
+                           a, &bits))
         return -1;
-      if (peer != NULL && fam == pfam && prefix_equal (a, peer, bits))
+      if (peer != NULL && fam == pfam && gfi_prefix_equal (a, peer, bits))
         matched = 1;
       if (comma == NULL)
         return matched;
@@ -495,10 +496,35 @@ walk_list (gf_slice list, int pfam, const uint8_t *peer)
     }
 }
 
+/* The client's address as bytes, an IPv4-mapped one as the IPv4 address.  */
+int
+gfi_parse_peer (const char *address, int *family, uint8_t *peer)
+{
+  static const uint8_t mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+
+  if (address == NULL)
+    return 0;
+  if (inet_pton (AF_INET, address, peer) == 1)
+    *family = AF_INET;
+  else if (inet_pton (AF_INET6, address, peer) == 1)
+    {
+      /* An IPv4 client on a dual-stack socket is still that IPv4 address.  */
+      if (memcmp (peer, mapped, sizeof mapped) == 0)
+        {
+          memmove (peer, peer + 12, 4);
+          *family = AF_INET;
+        }
+      else
+        *family = AF_INET6;
+    }
+  else
+    return 0;
+  return 1;
+}
+
 int
 gf_cert_source_address_ok (const gf_key *k, const char *address)
 {
-  static const uint8_t mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
   gf_slice list;
   uint8_t peer[16];
   int pfam, found;
@@ -507,22 +533,7 @@ gf_cert_source_address_ok (const gf_key *k, const char *address)
   if (found == 0)
     return 1;
   /* Present but unreadable, or nothing to compare with: nobody.  */
-  if (found < 0 || list.len == 0 || address == NULL)
-    return 0;
-  if (inet_pton (AF_INET, address, peer) == 1)
-    pfam = AF_INET;
-  else if (inet_pton (AF_INET6, address, peer) == 1)
-    {
-      /* An IPv4 client on a dual-stack socket is still that IPv4 address.  */
-      if (memcmp (peer, mapped, sizeof mapped) == 0)
-        {
-          memmove (peer, peer + 12, 4);
-          pfam = AF_INET;
-        }
-      else
-        pfam = AF_INET6;
-    }
-  else
+  if (found < 0 || list.len == 0 || !gfi_parse_peer (address, &pfam, peer))
     return 0;
   return walk_list (list, pfam, peer) == 1;
 }

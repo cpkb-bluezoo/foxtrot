@@ -20,3 +20,5 @@ foxtrot NEWS - history of user-visible changes.
 ** Fuzz targets (fuzz/) with a coverage-guided driver; sanitizer builds are clean.
 ** A private key file with a zero, one or repeated RSA prime is refused (libgcrypt crashed on it).
 ** gf_knownhosts_add and gf_knownhosts_format refuse host names that a line would not carry: a leading #, @ or !, wildcards, brackets.
+** authorized_keys files (authkeys.h): gf_authkeys_check enforces from, expiry-time, cert-authority, principals and verify-required, and reports command, the no- options, restrict, permitopen, permitlisten and environment.
+** gf_session_deny and gf_session_force pass an authorized_keys line's restrictions to the session; gf_auth_server_config.principals_by_application lets the application decide who a certificate is for.

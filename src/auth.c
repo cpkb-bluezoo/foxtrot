@@ -326,8 +326,9 @@ srv_certificate (gf_auth_server *a, const gf_key *key, gf_auth_request *req)
     if (gf_key_equal (ci.ca, a->cfg.trusted_user_cas[i]))
       trusted = 1;
   if (!trusted || gf_cert_check (key, GF_CERT_USER, now, NULL) != GF_OK
-      || !gf_cert_has_principal (key, (const char *) req->user.data,
-                                 req->user.len, 0)
+      || (!a->cfg.principals_by_application
+          && !gf_cert_has_principal (key, (const char *) req->user.data,
+                                     req->user.len, 0))
       || !gf_cert_source_address_ok (key, a->cfg.peer_address))
     return 0;
   req->certificate = 1;

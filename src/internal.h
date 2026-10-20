@@ -35,6 +35,17 @@ int gfi_ec_point_ok (const char *curve, const uint8_t *q, size_t qlen);
    for any run of characters and '?' for any one.  Case sensitive.  */
 int gfi_wildmatch (const char *pat, size_t pn, const char *s, size_t sn);
 
+/* One entry E (N bytes) of an address list: an IPv4 or IPv6 address, with
+   "/bits" if it is a range.  Sets the family (AF_INET or AF_INET6), the
+   address bytes (4 or 16) and the prefix length.  0 if it is neither.  */
+int gfi_parse_cidr (const char *e, size_t n, int *family, uint8_t *addr,
+                    unsigned *bits);
+/* Do the first BITS bits of A and B agree?  */
+int gfi_prefix_equal (const uint8_t *a, const uint8_t *b, unsigned bits);
+/* The address in ADDRESS (text) as family and bytes; an IPv4-mapped IPv6
+   address is the IPv4 one.  0 if it is not an address.  */
+int gfi_parse_peer (const char *address, int *family, uint8_t *peer);
+
 /* Base64 (RFC 4648).  Encode IN (N bytes) into OUT, which must hold 4*ceil(N/3)
    characters; PAD nonzero for '=' padding.  No terminating NUL.  Returns the
    length written.  */

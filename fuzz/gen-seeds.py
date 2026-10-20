@@ -214,6 +214,23 @@ add('chans', 'all', b'\x55\x01' + b''.join(struct.pack('>H', len(m)) + m + bytes
 add('chans', 'auto', b'\x00\x01' + b''.join(struct.pack('>H', len(m)) + m + bytes([(i * 7) % 256]) for i, m in enumerate(ch)))
 add('chans', 'flaky', b'\xaa\x80' + b''.join(struct.pack('>H', len(m)) + m + bytes([(i * 3) % 256]) for i, m in enumerate(ch)))
 
+# ---- authkeys: [alen][addr][hlen][host][ulen][user][text] ----
+import base64
+def lp(x): x = x.encode() if isinstance(x, str) else x; return bytes([len(x)]) + x
+def aseed(name, addr, host, user, text): add('authkeys', name, lp(addr) + lp(host) + lp(user) + text.encode())
+edpub = 'ssh-ed25519 ' + kh['vec_kh_e'].split()[1]
+p256pub = kh['vec_kh_p']
+capub = 'ssh-ed25519 ' + base64.b64encode(cert['vec_ca_ed_blob']).decode()
+aseed('plain', '192.0.2.50', '', 'alice', '# keys\n' + edpub + ' me\n' + p256pub + '\n')
+aseed('options', '192.0.2.50', 'host.example.org', 'alice',
+      'no-pty,command="/bin/ls -l",from="192.0.2.0/24,*.example.org,!bad.example.org" ' + edpub + '\n'
+      'restrict,pty,permitopen="db:5432",permitopen="[2001:db8::1]:22",permitlisten="8080",environment="A=1",'
+      'expiry-time="20991231" ' + p256pub + '\n')
+aseed('ca', '192.0.2.50', '', 'alice', 'cert-authority,principals="al*,bob" ' + capub + '\n')
+aseed('ca-plain', '192.0.2.50', '', 'bob', 'cert-authority ' + capub + '\n' + edpub + '\n')
+aseed('bad', '', '', '', 'command="x ' + edpub + '\nfrom="" ' + edpub + '\nunknown="x" ' + edpub + '\n')
+aseed('expiry', '10.0.0.1', '', 'alice', 'expiry-time="20231114221320Z" ' + edpub + '\nexpiry-time="2024" ' + edpub + '\n')
+
 # ---- sftp: [mode][schedule][chunk] raw ----
 def sftp(t, body): return u32(len(body) + 1) + bytes([t]) + body
 srv_stream = (sftp(1, u32(3)) + sftp(16, u32(1) + s('.')) + sftp(3, u32(2) + s('/a') + u32(1) + u32(0))

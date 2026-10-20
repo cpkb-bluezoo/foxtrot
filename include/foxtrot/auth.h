@@ -213,6 +213,13 @@ typedef struct gf_auth_server_config
   /* The trust for X.509 chains as users' keys; not copied, and it must
      outlive the machine.  */
   const gf_x509_trust *x509_trust;
+  /* Do not require the user name to be one of a certificate's principals:
+     the application decides who the certificate is for (authkeys.h does,
+     with "principals=", and with none, the user name).  The machine still
+     checks the CA, the dates and the source address.  Set it only if
+     the application does check: a certificate for someone else is
+     otherwise accepted as the user's.  */
+  int principals_by_application;
 } gf_auth_server_config;
 
 typedef struct gf_auth_server gf_auth_server;

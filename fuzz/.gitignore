@@ -1,0 +1,11 @@
+/fuzz-*
+!/fuzz-*.c
+!/fuzz-common.h
+/fuzz-crash.bin
+*.o
+*.log
+*.trs
+.deps/
+.libs/
+Makefile
+Makefile.in

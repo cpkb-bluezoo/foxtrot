@@ -1632,6 +1632,91 @@ test_cert_permissions (void)
   gf_key_free (ca);
 }
 
+/* What an application learns from an authorized_keys line it passes to the
+   session: permissions it takes away and the command it forces.  */
+static void
+test_restrict (void)
+{
+  struct world w;
+  struct opts o;
+  gf_chans *ch;
+  uint32_t a, b;
+  int reqs, opens, globals;
+
+  memset (&o, 0, sizeof o);
+  o.client_trusts = 1;
+  o.client_key = userkey;
+  world_new (&w, &o);
+  w.c.auto_exec = 0;
+  run (&w);
+  CHECK_EQ (w.c.authenticated, 1);
+  CHECK_EQ (gf_session_deny (w.sv.s, GF_CERT_PERMIT_PTY), GF_OK);
+  CHECK_EQ (gf_session_deny (w.sv.s, GF_CERT_PERMIT_PORT_FORWARDING), GF_OK);
+  CHECK_EQ (gf_session_deny (w.sv.s, "no-such-permission"), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_deny (NULL, GF_CERT_PERMIT_PTY), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_deny (w.c.s, GF_CERT_PERMIT_PTY), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PTY), 0);
+  CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_PORT_FORWARDING), 0);
+  CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_USER_RC), 1);
+  CHECK_EQ (gf_session_deny (w.sv.s, GF_CERT_PERMIT_USER_RC), GF_OK);
+  CHECK_EQ (gf_session_permits (w.sv.s, GF_CERT_PERMIT_USER_RC), 0);
+
+  ch = gf_session_channels (w.c.s);
+  CHECK_EQ (gf_chans_open_session (ch, &a, 0, 0), GF_OK);
+  pump (&w, 0);
+  reqs = w.sv.requests;
+  CHECK_EQ (gf_chans_request_pty (ch, a, "xterm", 80, 24, 0, 0, NULL, 0, 1), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.sv.requests, reqs);
+  CHECK_EQ (w.sv.closed, 0);
+  opens = w.sv.opens;
+  CHECK_EQ (gf_chans_open_direct_tcpip (ch, &b, "h", 1, "o", 2, 0, 0), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.sv.opens, opens);
+  globals = w.sv.global_requests;
+  CHECK_EQ (gf_chans_request_tcpip_forward (ch, "0.0.0.0", 8080), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.sv.global_requests, globals);
+
+  /* A command is forced once; the same again is fine, another is not.  */
+  CHECK (gf_session_force_command (w.sv.s) == NULL);
+  CHECK_EQ (gf_session_force (w.sv.s, ""), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_force (w.sv.s, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_force (w.c.s, "/bin/date"), GF_ERR_INVAL);
+  CHECK_EQ (gf_session_force (w.sv.s, "/bin/date"), GF_OK);
+  CHECK (strcmp (gf_session_force_command (w.sv.s), "/bin/date") == 0);
+  CHECK_EQ (gf_session_force (w.sv.s, "/bin/date"), GF_OK);
+  CHECK_EQ (gf_session_force (w.sv.s, "/bin/cat"), GF_ERR_INVAL);
+  CHECK (strcmp (gf_session_force_command (w.sv.s), "/bin/date") == 0);
+  world_free (&w);
+
+  /* A certificate's own command cannot be changed.  */
+  {
+    gf_key *ca = NULL, *ukey = cert_of (vec_ed_private, vec_ed_user_cert);
+    const gf_key *cas[1];
+    static uint8_t cab[256];
+    size_t n = tst_unhex (vec_ca_ed_blob, cab, sizeof cab);
+
+    CHECK_EQ (gf_key_from_blob (&ca, cab, n), GF_OK);
+    cas[0] = ca;
+    memset (&o, 0, sizeof o);
+    o.client_trusts = 1;
+    o.client_key = ukey;
+    o.cas = cas;
+    o.ncas = 1;
+    o.peer_address = "192.0.2.50";
+    world_new (&w, &o);
+    run (&w);
+    CHECK_EQ (w.c.authenticated, 1);
+    CHECK_EQ (gf_session_force (w.sv.s, "/bin/date"), GF_ERR_INVAL);
+    CHECK_EQ (gf_session_force (w.sv.s, "/bin/true"), GF_OK);
+    CHECK (strcmp (gf_session_force_command (w.sv.s), "/bin/true") == 0);
+    world_free (&w);
+    gf_key_free (ukey);
+    gf_key_free (ca);
+  }
+}
+
 /* A client whose key is elsewhere: the session passes the signing out and the
    answer back in.  */
 static void
@@ -1802,6 +1887,7 @@ main (void)
   test_sftp (400000);
   test_certificates ();
   test_cert_permissions ();
+  test_restrict ();
   test_external_signer ();
 #ifdef HAVE_GNUTLS
   test_x509_host_keys ();

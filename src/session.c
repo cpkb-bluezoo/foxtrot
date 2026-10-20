@@ -66,6 +66,8 @@ struct gf_session
   int no_more_sessions;
   unsigned nsessions;
   char *user;
+  unsigned denied;		/* Bits of the application's denials.  */
+  char *force;			/* A command the application forces.  */
   struct binding *bind;
   size_t nbind;
 };
@@ -241,13 +243,53 @@ ch_disconnect (void *user, uint32_t reason)
   return 0;
 }
 
-/* Does the user's certificate permit this?  Anyone who did not come in with
-   one, and a client, is not restricted.  */
+/* The permissions an application can take away; the bit of each is its
+   place here.  */
+static const char *const permission_names[] = {
+  GF_CERT_PERMIT_PTY, GF_CERT_PERMIT_PORT_FORWARDING,
+  GF_CERT_PERMIT_AGENT_FORWARDING, GF_CERT_PERMIT_X11_FORWARDING,
+  GF_CERT_PERMIT_USER_RC
+};
+
+static int
+permission_bit (const char *permission)
+{
+  size_t i;
+
+  for (i = 0; i < sizeof permission_names / sizeof permission_names[0]; i++)
+    if (strcmp (permission, permission_names[i]) == 0)
+      return (int) i;
+  return -1;
+}
+
+/* Does the user's certificate permit this, and has the application not taken
+   it away?  Anyone who did not come in with a certificate, and a client, is
+   not restricted by one.  */
 static int
 permitted (const gf_session *s, const char *permission)
 {
-  return !s->server || s->as == NULL
-    || gf_auth_server_permits (s->as, permission);
+  int bit;
+
+  if (!s->server || s->as == NULL)
+    return 1;
+  bit = permission_bit (permission);
+  if (bit >= 0 && (s->denied & (1u << bit)))
+    return 0;
+  return gf_auth_server_permits (s->as, permission);
+}
+
+int
+gf_session_deny (gf_session *s, const char *permission)
+{
+  int bit;
+
+  if (s == NULL || !s->server || permission == NULL)
+    return GF_ERR_INVAL;
+  bit = permission_bit (permission);
+  if (bit < 0)
+    return GF_ERR_INVAL;
+  s->denied |= 1u << bit;
+  return GF_OK;
 }
 
 int
@@ -769,6 +811,7 @@ gf_session_free (gf_session *s)
   gf_conn_free (s->c);
   free (s->bind);
   free (s->user);
+  free (s->force);
   free (s);
 }
 
@@ -863,10 +906,29 @@ gf_session_force_command (const gf_session *s)
 {
   gf_slice cmd;
 
-  if (s == NULL || s->as == NULL
-      || gf_auth_server_force_command (s->as, &cmd) != GF_OK || cmd.len == 0)
+  if (s == NULL || s->as == NULL)
     return NULL;
-  return (const char *) cmd.data;
+  if (gf_auth_server_force_command (s->as, &cmd) == GF_OK && cmd.len != 0)
+    return (const char *) cmd.data;
+  return s->force;
+}
+
+int
+gf_session_force (gf_session *s, const char *command)
+{
+  const char *have;
+  char *copy;
+
+  if (s == NULL || !s->server || command == NULL || command[0] == '\0')
+    return GF_ERR_INVAL;
+  have = gf_session_force_command (s);
+  if (have != NULL)
+    return strcmp (have, command) == 0 ? GF_OK : GF_ERR_INVAL;
+  copy = strdup (command);
+  if (copy == NULL)
+    return GF_ERR_NOMEM;
+  s->force = copy;
+  return GF_OK;
 }
 
 gf_chans *

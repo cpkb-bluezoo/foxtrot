@@ -37,7 +37,8 @@
        back by one;
      - keeps one deadline for the application to wait for, the earliest of
        the transport's and the authentication grace time;
-     - enforces what a user's certificate permits: no pty without
+     - enforces what a user's certificate permits, or the application
+       takes away (an authorized_keys line, authkeys.h): no pty without
        permit-pty, no forwarding without permit-port-forwarding;
      - enforces no-more-sessions@openssh.com and a limit on session
        channels, and refuses what the application has not been asked to
@@ -206,7 +207,8 @@ const gf_conn_info *gf_session_info (const gf_session *s);
    authentication; else NULL.  */
 const char *gf_session_user (const gf_session *s);
 /* A server, after authentication: the command the user's certificate
-   forces ("force-command"), or NULL if there is none.  If there is one the
+   forces ("force-command") or the application forced (gf_session_force),
+   or NULL if there is none.  If there is one the
    application must run it, and only it, in place of whatever the client
    asks for in an exec, shell or subsystem request.  Valid until the
    session is freed.  */
@@ -220,6 +222,20 @@ const char *gf_session_force_command (const gf_session *s);
    rest, "permit-user-rc" (whether to run ~/.ssh/rc) among them, is the
    application's to ask here.  */
 int gf_session_permits (const gf_session *s, const char *permission);
+
+/* A server: take PERMISSION (one of the GF_CERT_PERMIT_* names of key.h)
+   away from the user, whatever their certificate says, for the pty request,
+   direct-tcpip channels and tcpip-forward requests the session refuses
+   itself and for gf_session_permits.  For what an authorized_keys line says
+   (authkeys.h): call it for each permission gf_authkey_permits denies.
+   GF_ERR_INVAL for a name that is not one of the five, or for a client.  */
+int gf_session_deny (gf_session *s, const char *permission);
+/* A server: the user must be given COMMAND and nothing else
+   (gf_session_force_command), as an authorized_keys line "command=" says.
+   GF_ERR_INVAL if the user's certificate or an earlier call forces another
+   command: a user two things say different things about is to be refused,
+   which is for the application to do.  */
+int gf_session_force (gf_session *s, const char *command);
 
 /* The layers underneath, for what the session does not wrap: channel
    operations (open, send data, requests, close: see chan.h) and transport

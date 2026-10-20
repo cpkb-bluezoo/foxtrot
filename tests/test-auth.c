@@ -1645,6 +1645,31 @@ test_certificates (void)
   ap_run (&x);
   CHECK_EQ (x.srv_requests, 0);
   ap_free (&x);
+  /* Unless the application says it decides who a certificate is for.  */
+  {
+    gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+    static struct cli_creds cr;
+
+    cr = (struct cli_creds) { "ali", { ck[0] }, 1, NULL, 0, 0 };
+    sc.trusted_user_cas = both;
+    sc.ntrusted_user_cas = 2;
+    sc.peer_address = "192.0.2.77";
+    sc.principals_by_application = 1;
+    ap_new (&x, &sc, &cr);
+    x.accept_certs = 1;
+    ap_run (&x);
+    CHECK_EQ (x.srv_cert_seen, 2);
+    CHECK_EQ (x.srv_authenticated, 1);
+    ap_free (&x);
+    /* Which CA, the dates and the address are still the machine's.  */
+    sc.trusted_user_cas = NULL;
+    sc.ntrusted_user_cas = 0;
+    ap_new (&x, &sc, &cr);
+    x.accept_certs = 1;
+    ap_run (&x);
+    CHECK_EQ (x.srv_requests, 0);
+    ap_free (&x);
+  }
 
   /* A CA that is not trusted; no CAs at all.  */
   cert_login (&x, only_p256, 1, ck[0], "alice", "192.0.2.77", 0);

@@ -264,7 +264,8 @@ checked by removing it and seeing a test fail.
 @code{make check} also runs the fuzz targets of @file{fuzz/} once over
 their corpora.  There is one for each parser of what a peer or a file
 sends (the identification line, packets, key exchange messages, keys and
-certificates, private key files, @file{known_hosts}, X.509 chains,
+certificates, private key files, @file{known_hosts}, @file{authorized_keys},
+X.509 chains,
 authentication, channels, SFTP and a whole connection), and each checks
 what must hold on any input as well as that nothing crashes.  Built with
 AddressSanitizer and UndefinedBehaviorSanitizer and coverage, they are
@@ -668,6 +669,55 @@ A client has no default trust in a host key.  The signature on the exchange
 hash is verified first, then the application is asked through the
 @code{host_key} callback; a client without one refuses every key.  At a
 rekey the server must present the same key.
+
+@node Authorized keys
+@subsection Authorized keys
+@cindex authorized_keys
+
+@file{authkeys.h} is the server's side of the same idea: it reads the
+text of a user's OpenSSH @file{authorized_keys} file and, from the
+request callback of the authentication machine,
+@code{gf_authkeys_check} says whether the key in the request is one the
+user has authorized.  The library does no I/O, so the application reads the
+file (as the user, and having checked the permissions of the file, which
+are its business) and passes the text.
+
+What a line can say, and who enforces it:
+
+@itemize @bullet
+@item
+@code{from=} (addresses, CIDR ranges, wildcards, @samp{!} exclusions, and
+names if the application says what the client's name is),
+@code{expiry-time=}, @code{cert-authority}, @code{principals=} and
+@code{verify-required} are enforced by @code{gf_authkeys_check}.  A line
+that does not match does not stop a later line from doing so.
+@item
+@code{command=}, @code{no-pty}, @code{no-port-forwarding} and the other
+@code{no-} options, @code{restrict} and the positive options that undo it,
+@code{permitopen=}, @code{permitlisten=} and @code{environment=} are
+reported in the match.  The session enforces the permissions and the
+command if the application passes them on with
+@code{gf_session_deny} and @code{gf_session_force}; the lists of what may
+be forwarded are for the application to check with
+@code{gf_authkey_permits_open} and @code{_listen} when it is asked.
+@end itemize
+
+As in OpenSSH, a line with an option the library does not know is not
+read, and neither is one that gives @code{from}, @code{command},
+@code{principals} or @code{expiry-time} twice: a restriction that is not
+understood is never ignored.  Such lines are counted.  Expiry times are UTC
+here, where OpenSSH reads those without a @samp{Z} in the server's time
+zone.  @code{no-touch-required} is read and ignored: the machine always
+requires the presence of the user for a security key.
+
+A certificate comes in only through a @code{cert-authority} line, and must
+be a user certificate in its dates whose source address allows the
+client.  The authentication machine takes certificates from the CAs of its
+configuration, so an application that keeps them in the users' files hands
+the machine the union (@code{gf_authkeys_cas} of the global file, say), and
+sets @code{principals_by_application} if it wants @code{principals=} to say
+who a certificate is for rather than the user name; the machine then no
+longer checks the name, and @code{gf_authkeys_check} does.
 
 @node Ciphers
 @section Ciphers
