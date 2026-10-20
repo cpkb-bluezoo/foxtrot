@@ -201,6 +201,34 @@ grep -q '^STAT size=12000000 perms=644$' "$dir/client.out" \
   || { fail "sftp operations"; cat "$dir/client.out"; }
 [ "$(grep -c '^RESULT .* 2$' "$dir/client.out")" = 3 ] || fail "sftp: missing-file statuses"
 grep -q '^RESULT rmdir 4$' "$dir/client.out" || fail "sftp: rmdir of a non-empty directory"
+# The extensions of sshd's own sftp-server: all ten are advertised, and each
+# does what it says on the real files.
+mkdir "$dir/cr/x"
+echo "extension data" > "$dir/cr/x/a"
+echo "other data" > "$dir/cr/x/b"
+x=$dir/cr/x
+cli_exec --sftp "has posix-rename@openssh.com; has statvfs@openssh.com; has fstatvfs@openssh.com; has hardlink@openssh.com; has fsync@openssh.com; has lsetstat@openssh.com; has limits@openssh.com; has expand-path@openssh.com; has copy-data; has users-groups-by-id@openssh.com; has nothing@example.org; prename $x/a $x/b; hardlink $x/b $x/h; lsetstat 600 $x/b; statvfs $x; limits; expand ~; fsync $x/b; copydata $x/b $x/copy; idnames 0 0"
+for e in posix-rename@openssh.com statvfs@openssh.com fstatvfs@openssh.com \
+         hardlink@openssh.com fsync@openssh.com lsetstat@openssh.com limits@openssh.com \
+         expand-path@openssh.com copy-data users-groups-by-id@openssh.com; do
+  grep -q "^HAS $e 1\$" "$dir/client.out" || fail "sftp: sshd did not advertise $e"
+done
+grep -q '^HAS nothing@example.org 0$' "$dir/client.out" || fail "sftp: an extension nobody has was found"
+[ "$(grep -c '^RESULT [a-z]* 0$' "$dir/client.out")" = 20 ] || { fail "sftp extensions: results"; cat "$dir/client.out"; }
+[ ! -e "$x/a" ] && [ "$(cat "$x/b")" = "extension data" ] || fail "sftp: posix-rename did not replace"
+[ "$(stat -c %h "$x/b")" = 2 ] && [ "$(cat "$x/h")" = "extension data" ] || fail "sftp: hardlink"
+[ "$(stat -c %a "$x/b")" = 600 ] || fail "sftp: lsetstat"
+cmp -s "$x/b" "$x/copy" || fail "sftp: copy-data"
+grep -q "^STATVFS bsize=.* frsize=$(stat -f -c %S "$x") .* namemax=$(stat -f -c %l "$x")\$" "$dir/client.out" \
+  || { fail "sftp: statvfs"; cat "$dir/client.out"; }
+grep -q '^LIMITS packet=[1-9][0-9]* read=[1-9][0-9]* write=[1-9][0-9]* handles=[1-9]' "$dir/client.out" \
+  || fail "sftp: limits"
+home=$(getent passwd "$user" | cut -d: -f6)
+[ -z "$home" ] || grep -q "^NAME $home\$" "$dir/client.out" || fail "sftp: expand-path of ~"
+grep -q '^IDNAMES root root$' "$dir/client.out" || fail "sftp: users-groups-by-id"
+# Failures are statuses.
+cli_exec --sftp "prename $x/nosuch $x/y; hardlink $x/nosuch $x/y; copydata $x/nosuch $x/y; statvfs $x/nosuch"
+[ "$(grep -c '^RESULT [a-z]* 2$' "$dir/client.out")" -ge 3 ] || { fail "sftp extension failures"; cat "$dir/client.out"; }
 # Keys alone offer nothing sshd (password and k-i off) would take.
 client --user "$user" --password hunter2 && fail "client authenticated with a password sshd does not take"
 
@@ -574,6 +602,7 @@ SSH_CMD="bytes 5000000" SSH_OUT="$dir/bytes.out" run_ssh hk_ed25519 \
 mkdir "$dir/sroot" "$dir/local"
 echo "hello sftp" > "$dir/sroot/small.txt"
 head -c 20000000 /dev/urandom > "$dir/local/big.bin"
+echo "synced data" > "$dir/local/small.sync"
 cat > "$dir/batch" <<EOT
 pwd
 ls
@@ -583,6 +612,16 @@ mkdir sub
 rename up.bin sub/up2.bin
 ls -l sub
 chmod 600 sub/up2.bin
+df sub
+ln small.txt sub/hard
+cp small.txt sub/copy.txt
+put -f $dir/local/small.sync sub/synced.txt
+get sub/copy.txt $dir/local/copy.back
+get sub/hard $dir/local/hard.back
+get sub/synced.txt $dir/local/sync.back
+rm sub/hard
+rm sub/copy.txt
+rm sub/synced.txt
 ln -s small.txt sub/lnk
 get sub/up2.bin $dir/local/big.back
 rm sub/lnk
@@ -609,6 +648,32 @@ cmp -s "$dir/local/big.bin" "$dir/local/big.back" || { fail "sftp 20 MB roundtri
 [ -e "$dir/local/escape" ] && fail "sftp: a path with .. left the root"
 grep -q 'Remote working directory: /' "$dir/sftp.out" || { fail "sftp pwd"; cat "$dir/sftp.out"; }
 grep -q '^SFTP START' "$dir/server.out" || fail "sftp: server did not start it"
+# The extensions OpenSSH's client used on the server we wrote.
+[ "$(cat "$dir/local/copy.back" 2>/dev/null)" = "hello sftp" ] || { fail "sftp cp (copy-data)"; cat "$dir/sftp.out"; }
+[ "$(cat "$dir/local/hard.back" 2>/dev/null)" = "hello sftp" ] || fail "sftp ln (hardlink)"
+[ "$(cat "$dir/local/sync.back" 2>/dev/null)" = "synced data" ] || fail "sftp put -f (fsync)"
+grep -q 'Size.*Used.*Avail' "$dir/sftp.out" || { fail "sftp df (statvfs)"; cat "$dir/sftp.out"; }
+grep -qi 'unsupported\|not supported\|Couldn' "$dir/sftp.out" && { fail "sftp extension error"; cat "$dir/sftp.out"; }
+
+# scp (in its SFTP mode) asks the server to expand "~", with expand-path.
+if command -v scp >/dev/null 2>&1; then
+  sport=$(pick_port)
+  "$SERVER" "$dir/hk_ed25519" "$sport" --auth-key "$dir/uk_ed25519" --sftp-root "$dir/sroot" \
+    > "$dir/server.out" 2>&1 &
+  server_pid=$!
+  i=0
+  while [ $i -lt 30 ] && ! grep -q READY "$dir/server.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  rm -f "$dir/local/scp.copy"
+  # shellcheck disable=SC2086
+  timeout 60 scp -s $sshopts -o BatchMode=yes -i "$dir/uk_ed25519" -P "$sport" \
+    "$user@127.0.0.1:~/small.txt" "$dir/local/scp.copy" > "$dir/scp.out" 2>&1
+  sleep 0.3
+  kill "$server_pid" 2>/dev/null
+  wait "$server_pid" 2>/dev/null
+  server_pid=
+  [ "$(cat "$dir/local/scp.copy" 2>/dev/null)" = "hello sftp" ] \
+    || { fail "scp of ~/small.txt (expand-path)"; cat "$dir/scp.out"; }
+fi
 
 # Port forwarding: ssh -L through a direct-tcpip channel that foxtrot echoes,
 # and -R, which foxtrot grants.

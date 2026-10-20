@@ -207,6 +207,139 @@ fill_attrs (const struct file *f, gf_sftp_attrs *a)
   a->permissions = f->perms | (f->is_dir ? 040000 : 0100000);
 }
 
+/* The extensions, on the file system in memory.  */
+static int
+srv_extension (struct world *w, const gf_sftp_request *q)
+{
+  gf_sftp_ext_request e;
+  struct handle *h, *h2;
+  int f, f2, k;
+
+  if (gf_sftp_request_extension (q, &e) != GF_OK)
+    return status (w, q->id, GF_FX_BAD_MESSAGE);
+  switch (e.which)
+    {
+    case GF_SFTPX_POSIX_RENAME:
+      f = find_file (w, e.path);
+      if (f < 0)
+        return status (w, q->id, GF_FX_NO_SUCH_FILE);
+      /* Unlike RENAME, it replaces what is there.  */
+      f2 = find_file (w, e.path2);
+      if (f2 >= 0 && f2 != f)
+        {
+          w->files[f2].used = 0;
+          free (w->files[f2].data);
+          w->files[f2].data = NULL;
+        }
+      snprintf (w->files[f].name, sizeof w->files[f].name, "%.*s",
+                (int) e.path2.len, (const char *) e.path2.data);
+      return status (w, q->id, GF_FX_OK);
+    case GF_SFTPX_HARDLINK:
+      f = find_file (w, e.path);
+      if (f < 0)
+        return status (w, q->id, GF_FX_NO_SUCH_FILE);
+      if (find_file (w, e.path2) >= 0)
+        return status (w, q->id, GF_FX_FAILURE);
+      for (k = 0; k < MAXFILES && w->files[k].used; k++)
+        ;
+      if (k == MAXFILES)
+        return status (w, q->id, GF_FX_FAILURE);
+      w->files[k] = w->files[f];
+      w->files[k].data = malloc (w->files[f].len + 1);
+      memcpy (w->files[k].data, w->files[f].data, w->files[f].len);
+      snprintf (w->files[k].name, sizeof w->files[k].name, "%.*s",
+                (int) e.path2.len, (const char *) e.path2.data);
+      return status (w, q->id, GF_FX_OK);
+    case GF_SFTPX_FSYNC:
+      return status (w, q->id, get_handle (w, e.handle) ? GF_FX_OK : GF_FX_FAILURE);
+    case GF_SFTPX_LSETSTAT:
+      f = find_file (w, e.path);
+      if (f < 0)
+        return status (w, q->id, GF_FX_NO_SUCH_FILE);
+      if (e.attrs.flags & GF_FILEXFER_ATTR_PERMISSIONS)
+        w->files[f].perms = e.attrs.permissions & 0777;
+      return status (w, q->id, GF_FX_OK);
+    case GF_SFTPX_STATVFS:
+    case GF_SFTPX_FSTATVFS:
+      {
+        gf_sftp_statvfs sv = { 4096, 4096, 1000, 500, 400, 100, 50, 40, 7,
+                               GF_SFTP_ST_NOSUID, 255 };
+
+        if (e.which == GF_SFTPX_FSTATVFS && get_handle (w, e.handle) == NULL)
+          return status (w, q->id, GF_FX_FAILURE);
+        return gf_sftp_server_statvfs (w->srv, q->id, &sv) != GF_OK;
+      }
+    case GF_SFTPX_LIMITS:
+      {
+        gf_sftp_limits l = { 262144, 65536, 65536, 256 };
+
+        return gf_sftp_server_limits (w->srv, q->id, &l) != GF_OK;
+      }
+    case GF_SFTPX_EXPAND_PATH:
+      {
+        gf_sftp_name nm;
+        char buf[80];
+
+        if (e.path.len >= 1 && e.path.data[0] == '~')
+          snprintf (buf, sizeof buf, "/home/test%.*s", (int) e.path.len - 1,
+                    (const char *) e.path.data + 1);
+        else
+          snprintf (buf, sizeof buf, "%.*s", (int) e.path.len,
+                    (const char *) e.path.data);
+        nm.filename.data = (const uint8_t *) buf;
+        nm.filename.len = strlen (buf);
+        nm.longname = nm.filename;
+        memset (&nm.attrs, 0, sizeof nm.attrs);
+        return gf_sftp_server_names (w->srv, q->id, 1, &nm) != GF_OK;
+      }
+    case GF_SFTPX_COPY_DATA:
+      h = get_handle (w, e.handle);
+      h2 = get_handle (w, e.handle2);
+      if (h == NULL || h2 == NULL || h->is_dir || h2->is_dir)
+        return status (w, q->id, GF_FX_FAILURE);
+      {
+        struct file *src = &w->files[h->file], *dst = &w->files[h2->file];
+        uint64_t n;
+
+        if (e.offset > src->len)
+          return status (w, q->id, GF_FX_FAILURE);
+        n = e.length ? e.length : src->len - e.offset;
+        if (e.offset + n > src->len)
+          return status (w, q->id, GF_FX_FAILURE);
+        if (e.offset2 + n > dst->len)
+          {
+            dst->data = realloc (dst->data, (size_t) (e.offset2 + n));
+            memset (dst->data + dst->len, 0,
+                    (size_t) (e.offset2 + n) - dst->len);
+            dst->len = (size_t) (e.offset2 + n);
+          }
+        memmove (dst->data + e.offset2, src->data + e.offset, (size_t) n);
+        return status (w, q->id, GF_FX_OK);
+      }
+    case GF_SFTPX_USERS_GROUPS:
+      {
+        static char names[8][16];
+        const char *users[8], *groups[8];
+        size_t nu = 0, ng = 0;
+        uint32_t v;
+        gf_slice l;
+
+        for (l = e.uids; gf_sftp_u32_next (&l, &v) && nu < 8; nu++)
+          {
+            snprintf (names[nu], sizeof names[nu], "user%u", v);
+            users[nu] = names[nu];
+          }
+        for (l = e.gids; gf_sftp_u32_next (&l, &v) && ng < 8; ng++)
+          groups[ng] = v == 5 ? "staff" : "";
+        return gf_sftp_server_users_groups (w->srv, q->id, nu, users, ng, groups)
+          != GF_OK;
+      }
+    case GF_SFTPX_UNKNOWN:
+      break;
+    }
+  return status (w, q->id, GF_FX_OP_UNSUPPORTED);
+}
+
 static int
 srv_request (void *user, const gf_sftp_request *q)
 {
@@ -424,7 +557,7 @@ srv_request (void *user, const gf_sftp_request *q)
       if (q->ext_name.len == 7 && memcmp (q->ext_name.data, "echo@te", 7) == 0)
         return gf_sftp_server_extended_reply (w->srv, q->id, q->ext_data.data,
                                               q->ext_data.len) != GF_OK;
-      return status (w, q->id, GF_FX_OP_UNSUPPORTED);
+      return srv_extension (w, q);
     default:
       return status (w, q->id, GF_FX_OP_UNSUPPORTED);
     }
@@ -615,7 +748,7 @@ test_lifecycle (size_t chunk)
   size_t i;
   gf_sftp_attrs a;
 
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   /* Requests wait for the version.  */
   CHECK_EQ (gf_sftp_client_stat (w.cli, "x", NULL, NULL), GF_ERR_STATE);
@@ -764,7 +897,7 @@ test_pipelining (void)
   uintptr_t i;
   size_t k;
 
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 8, 0 });
   start (&w, 0);
   CHECK (call_open (&w, "f", GF_FXF_WRITE | GF_FXF_CREAT, 0));
@@ -831,7 +964,7 @@ test_server_protocol (void)
   gf_writer bw;
 
   /* Not INIT first; INIT twice; an old version; broken lengths.  */
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   {
     uint8_t one[] = { 0, 0, 0, 5 };
@@ -843,7 +976,7 @@ test_server_protocol (void)
   }
   world_free (&w);
 
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   {
     uint8_t v[4] = { 0, 0, 0, 3 };
 
@@ -853,7 +986,7 @@ test_server_protocol (void)
   }
   world_free (&w);
 
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   {
     uint8_t v[4] = { 0, 0, 0, 2 };
@@ -866,7 +999,7 @@ test_server_protocol (void)
   world_free (&w);
 
   /* A client may offer a newer version: it gets 3.  */
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   {
     uint8_t v[4] = { 0, 0, 0, 6 };
@@ -885,7 +1018,7 @@ test_server_protocol (void)
 
     for (i = 0; i < 3; i++)
       {
-        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
         srv_feed (&w, lens[i], 4);	/* Refused before any body.  */
         CHECK_EQ (w.srv_disconnect, 1);
         CHECK_EQ (w.srv_status, GF_ERR_PROTOCOL);
@@ -893,7 +1026,7 @@ test_server_protocol (void)
       }
   }
   /* The limit is configurable, and exact.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 100, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 100, 0, 0, NULL, 0 });
   {
     uint8_t big[4] = { 0, 0, 0, 101 };
 
@@ -913,7 +1046,7 @@ test_server_protocol (void)
       {
         uint8_t body0[8] = { 0, 0, 0, 1, 0, 0, 0, 0 };
 
-        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
         n = pkt (b, sizeof b, types[i], body0, 8);
         srv_feed (&w, b, n);
         CHECK_EQ (w.srv_disconnect, 1);
@@ -921,7 +1054,7 @@ test_server_protocol (void)
       }
   }
   /* A packet with no id.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   n = pkt (b, sizeof b, GF_FXP_STAT, (const uint8_t *) "ab", 2);
   srv_feed (&w, b, n);
   CHECK_EQ (w.srv_disconnect, 1);
@@ -947,7 +1080,7 @@ test_server_protocol (void)
         uint8_t type = GF_FXP_STAT;
         uint32_t want = GF_FX_BAD_MESSAGE;
 
-        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+        srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
         gf_writer_init (&bw, body, sizeof body);
         gf_wr_u32 (&bw, 77);
         switch (cases[i].kind)
@@ -1036,7 +1169,7 @@ test_server_protocol (void)
   }
 
   /* Extended requests carry their data through.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   gf_writer_init (&bw, body, sizeof body);
   gf_wr_u32 (&bw, 5);
   gf_wr_cstring (&bw, "posix-rename@openssh.com");
@@ -1051,7 +1184,7 @@ test_server_protocol (void)
   world_free (&w);
 
   /* A request id in use.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   w.hold = 1;
   gf_writer_init (&bw, body, sizeof body);
   gf_wr_u32 (&bw, 9);
@@ -1066,7 +1199,7 @@ test_server_protocol (void)
   world_free (&w);
 
   /* Too many unanswered.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 3, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 3, 0, NULL, 0 });
   w.hold = 1;
   for (i = 1; i <= 3; i++)
     {
@@ -1081,7 +1214,7 @@ test_server_protocol (void)
   srv_feed (&w, b, n);			/* The id 3 again.  */
   CHECK_EQ (w.srv_disconnect, 1);
   world_free (&w);
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 3, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 3, 0, NULL, 0 });
   w.hold = 1;
   for (i = 1; i <= 4 && !w.srv_disconnect; i++)
     {
@@ -1110,7 +1243,7 @@ test_server_responses (void)
   memset (h, 1, sizeof h);
   memset (&a, 0, sizeof a);
   memset (&nm, 0, sizeof nm);
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   w.hold = 1;
   /* Requests of several kinds, unanswered: OPEN 1, READ 2, STAT 3,
      READDIR 4, REALPATH 5, CLOSE 6, EXTENDED 7.  */
@@ -1209,7 +1342,7 @@ test_output_limits (void)
   size_t n, i, want = 0;
   static uint8_t data[40000];
 
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 100000 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 100000, NULL, 0 });
   w.to_cli.blocked = 1;
   w.hold = 1;
   for (i = 1; i <= 4; i++)
@@ -1244,7 +1377,7 @@ test_output_limits (void)
   world_free (&w);
 
   /* A write that fails ends the session.  */
-  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0 });
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
   w.hold = 1;
   gf_writer_init (&bw, body, sizeof body);
   gf_wr_u32 (&bw, 1);
@@ -1259,12 +1392,12 @@ test_output_limits (void)
     memset (&se, 0, sizeof se);
     se.user = &w;
     se.write = NULL;
-    CHECK_EQ (gf_sftp_server_new (&w.srv, &(gf_sftp_server_config) { 0, 0, 0 },
+    CHECK_EQ (gf_sftp_server_new (&w.srv, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
                                   &se), GF_ERR_INVAL);
     se.write = srv_write;
     se.request = srv_request;
     se.disconnect = srv_disconnect;
-    CHECK_EQ (gf_sftp_server_new (&w.srv, &(gf_sftp_server_config) { 0, 0, 0 },
+    CHECK_EQ (gf_sftp_server_new (&w.srv, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
                                   &se), GF_OK);
   }
   world_free (&w);
@@ -1286,7 +1419,7 @@ cli_ready_world (struct world *w, uint32_t *first_id)
   uint8_t b[64], v[4] = { 0, 0, 0, 3 };
   size_t n = pkt (b, sizeof b, GF_FXP_VERSION, v, 4);
 
-  world_new (w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   CHECK_EQ (gf_sftp_client_start (w->cli), GF_OK);
   CHECK_EQ (w->to_srv.len, 9);
@@ -1320,7 +1453,7 @@ test_client_protocol (void)
   uint8_t h[4] = { 'H', 0, 0, 0 };
 
   /* VERSION: right, old, too new, not VERSION at all.  */
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   gf_sftp_client_start (w.cli);
   {
@@ -1332,7 +1465,7 @@ test_client_protocol (void)
     CHECK_EQ (w.cli_status, GF_ERR_UNSUPPORTED);
   }
   world_free (&w);
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   gf_sftp_client_start (w.cli);
   {
@@ -1343,7 +1476,7 @@ test_client_protocol (void)
     CHECK_EQ (w.cli_disconnect, 1);
   }
   world_free (&w);
-  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0 },
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
              &(gf_sftp_client_config) { 0, 0, 0 });
   gf_sftp_client_start (w.cli);
   n = response (b, sizeof b, GF_FXP_STATUS, 1, (const uint8_t *) "\0\0\0\0", 4);
@@ -1608,6 +1741,671 @@ test_client_protocol (void)
   world_free (&w);
 }
 
+/* ---------------------------------------------------------------- */
+/* Extensions                                                       */
+/* ---------------------------------------------------------------- */
+
+static void
+ext_world (struct world *w, int advertise)
+{
+  gf_sftp_server_config sc;
+  size_t n;
+
+  memset (&sc, 0, sizeof sc);
+  if (advertise)
+    {
+      sc.extensions = gf_sftp_standard_extensions (&n);
+      sc.nextensions = n;
+    }
+  world_new (w, &sc, &(gf_sftp_client_config) { 0, 0, 0 });
+}
+
+static void
+make_file (struct world *w, const char *name, const char *text)
+{
+  int k;
+
+  for (k = 0; k < MAXFILES && w->files[k].used; k++)
+    ;
+  CHECK (k < MAXFILES);
+  memset (&w->files[k], 0, sizeof w->files[k]);
+  w->files[k].used = 1;
+  w->files[k].perms = 0644;
+  snprintf (w->files[k].name, sizeof w->files[k].name, "%s", name);
+  w->files[k].len = strlen (text);
+  w->files[k].data = malloc (w->files[k].len + 1);
+  memcpy (w->files[k].data, text, w->files[k].len);
+}
+
+static void
+test_extensions (size_t chunk)
+{
+  struct world w;
+  gf_slice d;
+  gf_sftp_statvfs sv;
+  gf_sftp_limits lim;
+  gf_sftp_attrs a;
+  uint8_t h1[GF_SFTP_MAX_HANDLE], h2[GF_SFTP_MAX_HANDLE];
+  size_t hl1, hl2, i, n;
+  const gf_sftp_extension *all = gf_sftp_standard_extensions (&n);
+  const uint32_t uids[2] = { 0, 1000 }, gids[1] = { 5 };
+  gf_slice users, groups, one;
+
+  ext_world (&w, 1);
+  start (&w, chunk);
+  /* What the server said, with its versions; what it did not say.  */
+  CHECK_EQ (n, 10);
+  for (i = 0; i < n; i++)
+    {
+      CHECK_EQ (gf_sftp_client_extension (w.cli, all[i].name, &d), 1);
+      CHECK (gf_slice_equals (d, all[i].data));
+    }
+  CHECK (gf_slice_equals ((gf_slice) { (const uint8_t *) "2", 1 }, "2"));
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "statvfs@openssh.com", &d), 1);
+  CHECK (gf_slice_equals (d, "2"));
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "posix-rename@openssh.com", &d), 1);
+  CHECK (gf_slice_equals (d, "1"));
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "nothing@example.org", &d), 0);
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "statvfs", &d), 0);
+  CHECK_EQ (gf_sftp_client_extension (NULL, "statvfs@openssh.com", &d), 0);
+  CHECK_EQ (gf_sftp_client_extension (w.cli, NULL, &d), 0);
+
+  make_file (&w, "a", "hello world");
+  CHECK (call_open (&w, "a", GF_FXF_READ | GF_FXF_WRITE, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_HANDLE);
+  hl1 = LAST (&w).handle_len;
+  memcpy (h1, LAST (&w).handle, hl1);
+
+  /* posix-rename replaces what is there; hardlink does not.  */
+  make_file (&w, "victim", "old");
+  CHECK_EQ (gf_sftp_client_posix_rename (w.cli, "a", "victim", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_STATUS);
+  CHECK_EQ (LAST (&w).status, GF_FX_OK);
+  CHECK (find_file (&w, (gf_slice) { (const uint8_t *) "a", 1 }) < 0);
+  CHECK (find_file (&w, (gf_slice) { (const uint8_t *) "victim", 6 }) >= 0);
+  CHECK_EQ (gf_sftp_client_posix_rename (w.cli, "nosuch", "x", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_NO_SUCH_FILE);
+  CHECK_EQ (gf_sftp_client_hardlink (w.cli, "victim", "link", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_OK);
+  CHECK_EQ (gf_sftp_client_hardlink (w.cli, "victim", "link", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_FAILURE);
+
+  /* statvfs and fstatvfs.  */
+  CHECK_EQ (gf_sftp_client_statvfs (w.cli, "/", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_EXTENDED_REPLY);
+  CHECK_EQ (LAST (&w).data_len, 88);
+  {
+    gf_sftp_response r;
+
+    memset (&r, 0, sizeof r);
+    r.type = GF_FXP_EXTENDED_REPLY;
+    r.data.data = LAST (&w).data;
+    r.data.len = LAST (&w).data_len;
+    CHECK (gf_sftp_response_statvfs (&r, &sv));
+    CHECK_EQ (sv.bsize, 4096);
+    CHECK_EQ (sv.blocks, 1000);
+    CHECK_EQ (sv.bavail, 400);
+    CHECK_EQ (sv.fsid, 7);
+    CHECK_EQ (sv.flag, GF_SFTP_ST_NOSUID);
+    CHECK_EQ (sv.namemax, 255);
+    CHECK (!gf_sftp_response_limits (&r, &lim));
+    r.data.len = 87;
+    CHECK (!gf_sftp_response_statvfs (&r, &sv));
+    r.data.len = 88;
+    r.type = GF_FXP_DATA;
+    CHECK (!gf_sftp_response_statvfs (&r, &sv));
+  }
+  memset (&a, 0, sizeof a);
+  make_file (&w, "b", "0123456789");
+  CHECK (call_open (&w, "b", GF_FXF_READ, chunk));
+  hl2 = LAST (&w).handle_len;
+  memcpy (h2, LAST (&w).handle, hl2);
+  CHECK_EQ (gf_sftp_client_fstatvfs (w.cli, h2, hl2, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_EXTENDED_REPLY);
+  CHECK_EQ (gf_sftp_client_fstatvfs (w.cli, (const uint8_t *) "Hzzz", 4, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_STATUS);
+  CHECK_EQ (LAST (&w).status, GF_FX_FAILURE);
+
+  /* fsync, lsetstat, limits.  */
+  CHECK_EQ (gf_sftp_client_fsync (w.cli, h2, hl2, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_OK);
+  a.flags = GF_FILEXFER_ATTR_PERMISSIONS;
+  a.permissions = 0600;
+  CHECK_EQ (gf_sftp_client_lsetstat (w.cli, "b", &a, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_OK);
+  CHECK_EQ (w.files[find_file (&w, (gf_slice) { (const uint8_t *) "b", 1 })].perms, 0600);
+  CHECK_EQ (gf_sftp_client_limits (w.cli, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  {
+    gf_sftp_response r;
+
+    memset (&r, 0, sizeof r);
+    r.type = GF_FXP_EXTENDED_REPLY;
+    r.data.data = LAST (&w).data;
+    r.data.len = LAST (&w).data_len;
+    CHECK (gf_sftp_response_limits (&r, &lim));
+    CHECK_EQ (lim.max_packet, 262144);
+    CHECK_EQ (lim.max_read, 65536);
+    CHECK_EQ (lim.max_write, 65536);
+    CHECK_EQ (lim.max_open_handles, 256);
+  }
+
+  /* expand-path is answered with one name.  */
+  CHECK_EQ (gf_sftp_client_expand_path (w.cli, "~/docs", NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_NAME);
+  CHECK_EQ (LAST (&w).nnames, 1);
+  CHECK (strcmp (LAST (&w).names[0], "/home/test/docs") == 0);
+
+  /* copy-data: a length of 0 is to the end; the target grows.  */
+  make_file (&w, "dst", "");
+  CHECK (call_open (&w, "dst", GF_FXF_WRITE, chunk));
+  CHECK_EQ (gf_sftp_client_copy_data (w.cli, h2, hl2, 2, 5, LAST (&w).handle,
+                                      LAST (&w).handle_len, 1, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).status, GF_FX_OK);
+  {
+    struct file *f = &w.files[find_file (&w, (gf_slice) { (const uint8_t *) "dst", 3 })];
+
+    CHECK_EQ (f->len, 6);
+    CHECK (memcmp (f->data + 1, "23456", 5) == 0);
+  }
+  {
+    uint8_t wh[GF_SFTP_MAX_HANDLE];
+    size_t whl;
+
+    CHECK (call_open (&w, "dst", GF_FXF_WRITE | GF_FXF_TRUNC, chunk));
+    whl = LAST (&w).handle_len;
+    memcpy (wh, LAST (&w).handle, whl);
+    CHECK_EQ (gf_sftp_client_copy_data (w.cli, h2, hl2, 0, 0, wh, whl, 0, NULL, NULL), GF_OK);
+    CHECK (await (&w, chunk));
+    CHECK_EQ (LAST (&w).status, GF_FX_OK);
+    CHECK_EQ (w.files[find_file (&w, (gf_slice) { (const uint8_t *) "dst", 3 })].len, 10);
+    CHECK_EQ (gf_sftp_client_copy_data (w.cli, h2, hl2, 20, 1, wh, whl, 0, NULL, NULL), GF_OK);
+    CHECK (await (&w, chunk));
+    CHECK_EQ (LAST (&w).status, GF_FX_FAILURE);
+  }
+
+  /* users-groups-by-id: one name for each id, in order.  */
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, uids, 2, gids, 1, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_EXTENDED_REPLY);
+  {
+    gf_sftp_response r;
+
+    memset (&r, 0, sizeof r);
+    r.type = GF_FXP_EXTENDED_REPLY;
+    r.data.data = LAST (&w).data;
+    r.data.len = LAST (&w).data_len;
+    CHECK (gf_sftp_response_users_groups (&r, &users, &groups));
+    CHECK (gf_sftp_string_next (&users, &one));
+    CHECK (gf_slice_equals (one, "user0"));
+    CHECK (gf_sftp_string_next (&users, &one));
+    CHECK (gf_slice_equals (one, "user1000"));
+    CHECK (!gf_sftp_string_next (&users, &one));
+    CHECK (gf_sftp_string_next (&groups, &one));
+    CHECK (gf_slice_equals (one, "staff"));
+    CHECK (!gf_sftp_string_next (&groups, &one));
+  }
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, NULL, 0, gids, 1, NULL, NULL), GF_OK);
+  CHECK (await (&w, chunk));
+  CHECK_EQ (LAST (&w).type, GF_FXP_EXTENDED_REPLY);
+
+  /* Arguments.  */
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, NULL, 0, NULL, 0, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, uids, GF_SFTP_MAX_IDS + 1, NULL, 0, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_posix_rename (w.cli, NULL, "x", NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_fsync (w.cli, h1, 0, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_fsync (w.cli, h1, GF_SFTP_MAX_HANDLE + 1, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_lsetstat (w.cli, "x", NULL, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_copy_data (w.cli, h1, hl1, 0, 0, NULL, 0, 0, NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (w.srv_disconnect, 0);
+  CHECK_EQ (w.cli_disconnect, 0);
+  world_free (&w);
+}
+
+/* A client does not send an extension the server did not say it has.  */
+static void
+test_extensions_unadvertised (void)
+{
+  struct world w;
+  const uint8_t h[4] = { 'H', 0, 0, 0 };
+  gf_sftp_attrs a;
+  const uint32_t ids[1] = { 0 };
+  size_t sent;
+
+  ext_world (&w, 0);
+  /* Not started yet.  */
+  CHECK_EQ (gf_sftp_client_limits (w.cli, NULL, NULL), GF_ERR_STATE);
+  start (&w, 0);
+  memset (&a, 0, sizeof a);
+  sent = w.to_srv.len;
+  CHECK_EQ (gf_sftp_client_posix_rename (w.cli, "a", "b", NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_statvfs (w.cli, "/", NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_fstatvfs (w.cli, h, 4, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_hardlink (w.cli, "a", "b", NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_fsync (w.cli, h, 4, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_lsetstat (w.cli, "a", &a, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_limits (w.cli, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_expand_path (w.cli, "~", NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_copy_data (w.cli, h, 4, 0, 0, h, 4, 0, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, ids, 1, NULL, 0, NULL, NULL), GF_ERR_UNSUPPORTED);
+  CHECK_EQ (w.to_srv.len, sent);		/* Nothing went out.  */
+  /* Nor does it count against the outstanding requests.  */
+  CHECK_EQ (gf_sftp_client_stat (w.cli, "x", NULL, NULL), GF_OK);
+  /* The generic request still goes.  */
+  CHECK_EQ (gf_sftp_client_extended (w.cli, "echo@te", (const uint8_t *) "hi", 2, NULL, NULL), GF_OK);
+  world_free (&w);
+}
+
+/* Requests of known extensions that are malformed never reach the
+   application; they are answered BAD_MESSAGE.  */
+static void
+test_extensions_malformed (void)
+{
+  struct world w;
+  size_t i, before;
+  static const struct
+  {
+    const char *name;
+    const char *data;
+    size_t len;
+  } bad[] = {
+    { GF_SFTP_EXT_POSIX_RENAME, "\0\0\0\1a", 5 },
+    { GF_SFTP_EXT_POSIX_RENAME, "\0\0\0\1a\0\0\0\1bX", 11 },
+    { GF_SFTP_EXT_POSIX_RENAME, "\0\0\0\1a\0\0\0\2b\0", 10 },
+    { GF_SFTP_EXT_HARDLINK, "", 0 },
+    { GF_SFTP_EXT_STATVFS, "\0\0\0\5ab", 6 },
+    { GF_SFTP_EXT_FSTATVFS, "\0\0\1\1", 4 },
+    { GF_SFTP_EXT_FSYNC, "\0\0\0\0\0", 5 },
+    { GF_SFTP_EXT_LSETSTAT, "\0\0\0\1a", 5 },
+    { GF_SFTP_EXT_LSETSTAT, "\0\0\0\1a\xff\xff\xff\xff", 9 },
+    { GF_SFTP_EXT_LIMITS, "x", 1 },
+    { GF_SFTP_EXT_EXPAND_PATH, "", 0 },
+    { GF_SFTP_EXT_COPY_DATA, "\0\0\0\1h", 5 },
+    { GF_SFTP_EXT_USERS_GROUPS, "\0\0\0\3abc\0\0\0\0", 11 },
+    { GF_SFTP_EXT_USERS_GROUPS, "\0\0\0\4abcd", 8 }
+  };
+
+  ext_world (&w, 1);
+  start (&w, 0);
+  before = (size_t) w.requests;
+  for (i = 0; i < sizeof bad / sizeof bad[0]; i++)
+    {
+      CHECK_EQ (gf_sftp_client_extended (w.cli, bad[i].name,
+                                         (const uint8_t *) bad[i].data,
+                                         bad[i].len, NULL, NULL), GF_OK);
+      CHECK (await (&w, 0));
+      CHECK_EQ (LAST (&w).type, GF_FXP_STATUS);
+      if (LAST (&w).status != GF_FX_BAD_MESSAGE)
+        fprintf (stderr, "extension %zu (%s): status %u\n", i, bad[i].name,
+                 (unsigned) LAST (&w).status);
+      CHECK_EQ (LAST (&w).status, GF_FX_BAD_MESSAGE);
+    }
+  CHECK_EQ ((size_t) w.requests, before);
+  CHECK_EQ (w.srv_disconnect, 0);
+  /* Too many ids.  */
+  {
+    uint8_t big[8 + 4 * (GF_SFTP_MAX_IDS + 1)];
+    gf_writer bw;
+    size_t k;
+
+    gf_writer_init (&bw, big, sizeof big);
+    gf_wr_u32 (&bw, 4 * (GF_SFTP_MAX_IDS + 1));
+    for (k = 0; k < GF_SFTP_MAX_IDS + 1; k++)
+      gf_wr_u32 (&bw, 1);
+    gf_wr_u32 (&bw, 0);
+    CHECK_EQ (gf_sftp_client_extended (w.cli, GF_SFTP_EXT_USERS_GROUPS, big,
+                                       bw.len, NULL, NULL), GF_OK);
+    CHECK (await (&w, 0));
+    CHECK_EQ (LAST (&w).status, GF_FX_BAD_MESSAGE);
+    CHECK_EQ ((size_t) w.requests, before);
+  }
+  /* Other names are the application's.  */
+  CHECK_EQ (gf_sftp_client_extended (w.cli, "other@example.org", (const uint8_t *) "x", 1, NULL, NULL), GF_OK);
+  CHECK (await (&w, 0));
+  CHECK_EQ (LAST (&w).status, GF_FX_OP_UNSUPPORTED);
+  CHECK_EQ ((size_t) w.requests, before + 1);
+  world_free (&w);
+}
+
+/* The server answers each extension with its own reply and no other.  */
+static void
+test_extensions_replies (void)
+{
+  struct world w;
+  gf_sftp_statvfs sv;
+  gf_sftp_limits l;
+  gf_sftp_name nm;
+  const uint32_t uids[2] = { 1, 2 };
+  const char *users[2] = { "a", "b" }, *groups[1] = { "g" };
+  uint32_t id;
+
+  memset (&sv, 0, sizeof sv);
+  memset (&l, 0, sizeof l);
+  memset (&nm, 0, sizeof nm);
+  ext_world (&w, 1);
+  start (&w, 0);
+  w.hold = 1;
+
+  /* limits: only its own reply.  */
+  CHECK_EQ (gf_sftp_client_limits (w.cli, NULL, &id), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.nheld, 1);
+  CHECK_EQ (gf_sftp_server_statvfs (w.srv, id, &sv), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_extended_reply (w.srv, id, (const uint8_t *) "x", 1), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_names (w.srv, id, 1, &nm), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_users_groups (w.srv, id, 0, NULL, 0, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_data (w.srv, id, (const uint8_t *) "x", 1), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_limits (w.srv, id, &l), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.cli_disconnect, 0);
+  CHECK_EQ (LAST (&w).type, GF_FXP_EXTENDED_REPLY);
+  CHECK_EQ (LAST (&w).data_len, 32);
+
+  /* statvfs and fstatvfs: theirs.  */
+  w.nheld = 0;
+  CHECK_EQ (gf_sftp_client_statvfs (w.cli, "/", NULL, &id), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (gf_sftp_server_limits (w.srv, id, &l), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_statvfs (w.srv, id, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_statvfs (w.srv, id, &sv), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (LAST (&w).data_len, 88);
+
+  /* expand-path: a name, one only; a generic reply is not for it.  */
+  CHECK_EQ (gf_sftp_client_expand_path (w.cli, "~", NULL, &id), GF_OK);
+  pump (&w, 0);
+  nm.filename.data = (const uint8_t *) "/h";
+  nm.filename.len = 2;
+  nm.longname = nm.filename;
+  {
+    gf_sftp_name two[2];
+
+    two[0] = two[1] = nm;
+    CHECK_EQ (gf_sftp_server_names (w.srv, id, 2, two), GF_ERR_INVAL);
+  }
+  CHECK_EQ (gf_sftp_server_extended_reply (w.srv, id, (const uint8_t *) "x", 1), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_names (w.srv, id, 1, &nm), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (LAST (&w).type, GF_FXP_NAME);
+
+  /* users-groups: as many names as ids.  */
+  CHECK_EQ (gf_sftp_client_users_groups_by_id (w.cli, uids, 2, uids, 1, NULL, &id), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (gf_sftp_server_users_groups (w.srv, id, 1, users, 1, groups), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_users_groups (w.srv, id, 2, users, 0, groups), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_users_groups (w.srv, id, 2, NULL, 1, groups), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_statvfs (w.srv, id, &sv), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_users_groups (w.srv, id, 2, users, 1, groups), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.cli_disconnect, 0);
+
+  /* A status answers any of them; a typed reply does not answer a rename.  */
+  CHECK_EQ (gf_sftp_client_posix_rename (w.cli, "a", "b", NULL, &id), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (gf_sftp_server_limits (w.srv, id, &l), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_statvfs (w.srv, id, &sv), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_names (w.srv, id, 1, &nm), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_extended_reply (w.srv, id, (const uint8_t *) "x", 1), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_server_status (w.srv, id, GF_FX_OK, "ok"), GF_OK);
+  pump (&w, 0);
+  CHECK_EQ (w.cli_disconnect, 0);
+  world_free (&w);
+}
+
+/* The configuration of a server's extensions.  */
+static void
+test_extensions_config (void)
+{
+  gf_sftp_server *s = NULL;
+  gf_sftp_server_events se;
+  gf_sftp_server_config sc;
+  struct world w;
+  static const gf_sftp_extension ok[] = { { "a@b", "1" }, { "c@d", "" } };
+  static const gf_sftp_extension dup[] = { { "a@b", "1" }, { "a@b", "2" } };
+  static const gf_sftp_extension nul[] = { { NULL, "1" } };
+  static const gf_sftp_extension noname[] = { { "", "1" } };
+  gf_sftp_extension many[65];
+  char longname[200];
+  gf_sftp_extension lng[1];
+  uint8_t b[512];
+  size_t i, n;
+  gf_slice d;
+
+  memset (&w, 0, sizeof w);
+  memset (&se, 0, sizeof se);
+  se.user = &w;
+  se.write = srv_write;
+  se.request = srv_request;
+  se.disconnect = srv_disconnect;
+  memset (&sc, 0, sizeof sc);
+  sc.extensions = dup;
+  sc.nextensions = 2;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  sc.extensions = nul;
+  sc.nextensions = 1;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  sc.extensions = noname;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  sc.extensions = NULL;
+  sc.nextensions = 1;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  memset (longname, 'x', sizeof longname);
+  longname[129] = '\0';
+  lng[0].name = longname;
+  lng[0].data = "1";
+  sc.extensions = lng;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  longname[128] = '\0';
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_OK);
+  gf_sftp_server_free (s);
+  for (i = 0; i < 65; i++)
+    {
+      static char names[65][8];
+
+      snprintf (names[i], sizeof names[i], "e%zu", i);
+      many[i].name = names[i];
+      many[i].data = "1";
+    }
+  sc.extensions = many;
+  sc.nextensions = 65;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_ERR_INVAL);
+  sc.nextensions = 64;
+  CHECK_EQ (gf_sftp_server_new (&s, &sc, &se), GF_OK);
+  gf_sftp_server_free (s);
+
+  /* The VERSION carries exactly the pairs, in order.  */
+  sc.extensions = ok;
+  sc.nextensions = 2;
+  world_new (&w, &sc, &(gf_sftp_client_config) { 0, 0, 0 });
+  start (&w, 0);
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "a@b", &d), 1);
+  CHECK (gf_slice_equals (d, "1"));
+  CHECK_EQ (gf_sftp_client_extension (w.cli, "c@d", &d), 1);
+  CHECK_EQ (d.len, 0);
+  CHECK_EQ (d.data[0], 0);
+  world_free (&w);
+  (void) b;
+  (void) n;
+}
+
+/* A VERSION with extension pairs, from a scripted server.  */
+static void
+cli_version_world (struct world *w, const uint8_t *pairs, size_t pn)
+{
+  uint8_t b[4096], body[4096];
+  gf_writer bw;
+  size_t n;
+
+  world_new (w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
+             &(gf_sftp_client_config) { 0, 0, 0 });
+  CHECK_EQ (gf_sftp_client_start (w->cli), GF_OK);
+  w->to_srv.len = 0;
+  gf_writer_init (&bw, body, sizeof body);
+  gf_wr_u32 (&bw, 3);
+  gf_wr_bytes (&bw, pairs, pn);
+  n = pkt (b, sizeof b, GF_FXP_VERSION, body, bw.len);
+  cli_feed (w, b, n);
+}
+
+static size_t
+pairs_of (uint8_t *out, size_t cap, const char *const *names, size_t n)
+{
+  gf_writer w;
+  size_t i;
+
+  gf_writer_init (&w, out, cap);
+  for (i = 0; i < n; i++)
+    {
+      gf_wr_cstring (&w, names[i]);
+      gf_wr_cstring (&w, "1");
+    }
+  return w.len;
+}
+
+static void
+test_extensions_client (void)
+{
+  struct world w;
+  uint8_t pairs[4096], b[1200], body[1000];
+  const char *std[] = { GF_SFTP_EXT_POSIX_RENAME, GF_SFTP_EXT_STATVFS,
+                        GF_SFTP_EXT_LIMITS, GF_SFTP_EXT_EXPAND_PATH,
+                        GF_SFTP_EXT_USERS_GROUPS };
+  size_t pn = pairs_of (pairs, sizeof pairs, std, 5), n, i;
+  uint32_t id;
+  gf_writer bw;
+  const uint32_t uids[2] = { 1, 2 };
+
+  /* Malformed pairs: a name alone, a NUL in a name.  */
+  cli_version_world (&w, (const uint8_t *) "\0\0\0\1a", 5);
+  CHECK_EQ (w.cli_disconnect, 1);
+  CHECK_EQ (w.cli_status, GF_ERR_ENCODING);
+  world_free (&w);
+  cli_version_world (&w, (const uint8_t *) "\0\0\0\3a\0b\0\0\0\0", 11);
+  CHECK_EQ (w.cli_disconnect, 1);
+  world_free (&w);
+
+  /* More than 64 pairs: the first 64 are kept, the session goes on.  */
+  {
+    static char names[70][8];
+    const char *list[70];
+
+    for (i = 0; i < 70; i++)
+      {
+        snprintf (names[i], sizeof names[i], "e%zu", i);
+        list[i] = names[i];
+      }
+    pn = pairs_of (pairs, sizeof pairs, list, 70);
+    cli_version_world (&w, pairs, pn);
+    CHECK_EQ (w.cli_disconnect, 0);
+    CHECK (w.ready);
+    CHECK_EQ (gf_sftp_client_extension (w.cli, "e0", NULL), 1);
+    CHECK_EQ (gf_sftp_client_extension (w.cli, "e63", NULL), 1);
+    CHECK_EQ (gf_sftp_client_extension (w.cli, "e64", NULL), 0);
+    world_free (&w);
+  }
+
+  /* Replies of the wrong shape or kind end the session.  */
+  pn = pairs_of (pairs, sizeof pairs, std, 5);
+  for (i = 0; i < 9; i++)
+    {
+      uint8_t type = GF_FXP_EXTENDED_REPLY;
+
+      cli_version_world (&w, pairs, pn);
+      CHECK (w.ready);
+      memset (body, 0, sizeof body);
+      n = 0;
+      switch (i)
+        {
+        case 0:		/* statvfs, 87 bytes.  */
+          gf_sftp_client_statvfs (w.cli, "/", NULL, &id);
+          n = 87;
+          break;
+        case 1:		/* statvfs, 89 bytes.  */
+          gf_sftp_client_statvfs (w.cli, "/", NULL, &id);
+          n = 89;
+          break;
+        case 2:		/* limits, 31 bytes.  */
+          gf_sftp_client_limits (w.cli, NULL, &id);
+          n = 31;
+          break;
+        case 3:		/* statvfs, answered with a name.  */
+          gf_sftp_client_statvfs (w.cli, "/", NULL, &id);
+          type = GF_FXP_NAME;
+          n = 4;
+          break;
+        case 4:		/* expand-path, answered with an extended reply.  */
+          gf_sftp_client_expand_path (w.cli, "~", NULL, &id);
+          n = 8;
+          break;
+        case 5:		/* a rename, answered with an extended reply.  */
+          gf_sftp_client_posix_rename (w.cli, "a", "b", NULL, &id);
+          n = 8;
+          break;
+        case 6:		/* users-groups, one name too few.  */
+          gf_sftp_client_users_groups_by_id (w.cli, uids, 2, NULL, 0, NULL, &id);
+          gf_writer_init (&bw, body, sizeof body);
+          gf_wr_u32 (&bw, 5);
+          gf_wr_cstring (&bw, "a");
+          gf_wr_u32 (&bw, 0);
+          n = bw.len;
+          break;
+        case 7:		/* users-groups, not whole strings.  */
+          gf_sftp_client_users_groups_by_id (w.cli, uids, 2, NULL, 0, NULL, &id);
+          gf_writer_init (&bw, body, sizeof body);
+          gf_wr_u32 (&bw, 3);
+          gf_wr_bytes (&bw, "abc", 3);
+          gf_wr_u32 (&bw, 0);
+          n = bw.len;
+          break;
+        default:	/* expand-path, answered with two names.  */
+          gf_sftp_client_expand_path (w.cli, "~", NULL, &id);
+          type = GF_FXP_NAME;
+          gf_writer_init (&bw, body, sizeof body);
+          gf_wr_u32 (&bw, 2);
+          n = bw.len;
+          break;
+        }
+      n = response (b, sizeof b, type, id, body, n);
+      cli_feed (&w, b, n);
+      if (w.cli_disconnect != 1)
+        fprintf (stderr, "wrong reply %zu was believed\n", i);
+      CHECK_EQ (w.cli_disconnect, 1);
+      CHECK_EQ (w.nresponses, 0);
+      world_free (&w);
+    }
+
+  /* And the right ones are delivered; a status answers all of them.  */
+  cli_version_world (&w, pairs, pn);
+  gf_sftp_client_statvfs (w.cli, "/", NULL, &id);
+  memset (body, 0, sizeof body);
+  n = response (b, sizeof b, GF_FXP_EXTENDED_REPLY, id, body, 88);
+  cli_feed (&w, b, n);
+  CHECK_EQ (w.cli_disconnect, 0);
+  CHECK_EQ (w.nresponses, 1);
+  gf_sftp_client_posix_rename (w.cli, "a", "b", NULL, &id);
+  gf_writer_init (&bw, body, sizeof body);
+  gf_wr_u32 (&bw, GF_FX_OP_UNSUPPORTED);
+  gf_wr_cstring (&bw, "no");
+  gf_wr_cstring (&bw, "");
+  n = response (b, sizeof b, GF_FXP_STATUS, id, body, bw.len);
+  cli_feed (&w, b, n);
+  CHECK_EQ (w.cli_disconnect, 0);
+  CHECK_EQ (w.nresponses, 2);
+  CHECK_EQ (LAST (&w).status, GF_FX_OP_UNSUPPORTED);
+  world_free (&w);
+}
+
 int
 main (void)
 {
@@ -1617,5 +2415,13 @@ main (void)
   test_server_responses ();
   test_output_limits ();
   test_client_protocol ();
+  test_extensions (0);
+  test_extensions (1);
+  test_extensions (7);
+  test_extensions_unadvertised ();
+  test_extensions_malformed ();
+  test_extensions_replies ();
+  test_extensions_config ();
+  test_extensions_client ();
   TST_DONE ();
 }

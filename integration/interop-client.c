@@ -48,6 +48,15 @@
      mkdir DIR   rmdir DIR   rm FILE   mv OLD NEW   ln TARGET LINK
      stat PATH   lstat PATH   realpath PATH   readlink PATH   chmod OCTAL PATH
 
+   and the OpenSSH extensions:
+
+     prename OLD NEW   hardlink OLD NEW   lsetstat OCTAL PATH   statvfs PATH
+     limits   expand PATH   fsync FILE   copydata SRC DST   idnames UID GID
+     has NAME
+
+   (each prints "RESULT command 253" if the server did not advertise it, and
+   "STATVFS ...", "LIMITS ...", "IDNAMES user group", "HAS name 0|1").
+
    with up to 16 reads or writes of 32 KiB in flight, and prints
    "RESULT command status" (0 is success), and for a listing "LS name size
    perms", "STAT size=n perms=o", "NAME name".  Prints "KEX ...", "HOSTKEY ...", "SERVICE ...", "AUTH OK" or
@@ -97,6 +106,8 @@ struct ctx
   int lfd;
   uint8_t handle[GF_SFTP_MAX_HANDLE];
   size_t hlen;
+  uint8_t handle2[GF_SFTP_MAX_HANDLE];
+  size_t hlen2;
   uint64_t xoff, xtotal;
   unsigned outstanding;
   int eof, failed_cmd, closing;
@@ -391,7 +402,8 @@ chan_closed (void *user, uint32_t id)
 
 /* ---- SFTP ---- */
 
-enum { T_OPEN = 1, T_CLOSE, T_XFER, T_READDIR, T_PLAIN };
+enum { T_OPEN = 1, T_CLOSE, T_XFER, T_READDIR, T_PLAIN, T_OPEN2, T_COPY,
+       T_CLOSE2, T_FSYNC };
 
 struct tag
 {
@@ -569,6 +581,51 @@ next_command (struct ctx *x)
       a.permissions = (uint32_t) strtoul (w[1], NULL, 8);
       r = gf_sftp_client_setstat (x->sftp, w[2], &a, t, NULL);
     }
+  else if (strcmp (w[0], "prename") == 0 && n == 3)
+    r = gf_sftp_client_posix_rename (x->sftp, w[1], w[2], t, NULL);
+  else if (strcmp (w[0], "hardlink") == 0 && n == 3)
+    r = gf_sftp_client_hardlink (x->sftp, w[1], w[2], t, NULL);
+  else if (strcmp (w[0], "lsetstat") == 0 && n == 3)
+    {
+      a.flags = GF_FILEXFER_ATTR_PERMISSIONS;
+      a.permissions = (uint32_t) strtoul (w[1], NULL, 8);
+      r = gf_sftp_client_lsetstat (x->sftp, w[2], &a, t, NULL);
+    }
+  else if (strcmp (w[0], "statvfs") == 0 && n == 2)
+    r = gf_sftp_client_statvfs (x->sftp, w[1], t, NULL);
+  else if (strcmp (w[0], "limits") == 0 && n == 1)
+    r = gf_sftp_client_limits (x->sftp, t, NULL);
+  else if (strcmp (w[0], "expand") == 0 && n == 2)
+    r = gf_sftp_client_expand_path (x->sftp, w[1], t, NULL);
+  else if (strcmp (w[0], "idnames") == 0 && n == 3)
+    {
+      uint32_t uid = (uint32_t) strtoul (w[1], NULL, 10);
+      uint32_t gid = (uint32_t) strtoul (w[2], NULL, 10);
+
+      r = gf_sftp_client_users_groups_by_id (x->sftp, &uid, 1, &gid, 1, t, NULL);
+    }
+  else if (strcmp (w[0], "has") == 0 && n == 2)
+    {
+      free (t);
+      printf ("HAS %s %d\n", w[1], gf_sftp_client_extension (x->sftp, w[1], NULL));
+      return finish_command (x, "has", 0);
+    }
+  else if ((strcmp (w[0], "fsync") == 0 && n == 2)
+           || (strcmp (w[0], "copydata") == 0 && n == 3))
+    {
+      /* Several requests: the file is opened first.  */
+      free (t);
+      x->failed_cmd = 0;
+      if (!gf_sftp_client_extension (x->sftp, w[0][0] == 'f'
+                                     ? GF_SFTP_EXT_FSYNC : GF_SFTP_EXT_COPY_DATA,
+                                     NULL))
+        return finish_command (x, w[0], 253);
+      a.flags = GF_FILEXFER_ATTR_PERMISSIONS;
+      a.permissions = 0644;
+      r = gf_sftp_client_open (x->sftp, w[1], w[0][0] == 'f'
+                               ? GF_FXF_READ | GF_FXF_WRITE : GF_FXF_READ,
+                               &a, mktag (T_OPEN, 0, 0), NULL);
+    }
   else
     {
       free (t);
@@ -578,6 +635,8 @@ next_command (struct ctx *x)
   x->argv_[0] = w[0];
   x->argv_[1] = w[1];
   x->argv_[2] = n > 2 ? w[2] : NULL;
+  if (r == GF_ERR_UNSUPPORTED)
+    return finish_command (x, w[0], 253);
   return r != GF_OK;
 }
 
@@ -607,6 +666,20 @@ sftp_response (void *user, const gf_sftp_response *rr)
         return finish_command (x, cmd, rr->status);
       memcpy (x->handle, rr->handle.data, rr->handle.len);
       x->hlen = rr->handle.len;
+      if (strcmp (cmd, "fsync") == 0)
+        return gf_sftp_client_fsync (x->sftp, x->handle, x->hlen,
+                                     mktag (T_FSYNC, 0, 0), NULL) != GF_OK;
+      if (strcmp (cmd, "copydata") == 0)
+        {
+          gf_sftp_attrs a2;
+
+          memset (&a2, 0, sizeof a2);
+          a2.flags = GF_FILEXFER_ATTR_PERMISSIONS;
+          a2.permissions = 0644;
+          return gf_sftp_client_open (x->sftp, x->argv_[2], GF_FXF_WRITE
+                                      | GF_FXF_CREAT | GF_FXF_TRUNC, &a2,
+                                      mktag (T_OPEN2, 0, 0), NULL) != GF_OK;
+        }
       if (strcmp (cmd, "ls") == 0)
         return gf_sftp_client_readdir (x->sftp, x->handle, x->hlen,
                                        mktag (T_READDIR, 0, 0), NULL) != GF_OK;
@@ -617,6 +690,30 @@ sftp_response (void *user, const gf_sftp_response *rr)
             return 1;
         }
       return pump_xfer (x, put);
+    case T_FSYNC:
+      x->failed_cmd = (int) rr->status;
+      x->closing = 1;
+      return gf_sftp_client_close (x->sftp, x->handle, x->hlen,
+                                   mktag (T_CLOSE, 0, 0), NULL) != GF_OK;
+    case T_OPEN2:
+      if (rr->type == GF_FXP_STATUS)
+        {
+          x->failed_cmd = (int) rr->status;
+          return gf_sftp_client_close (x->sftp, x->handle, x->hlen,
+                                       mktag (T_CLOSE, 0, 0), NULL) != GF_OK;
+        }
+      memcpy (x->handle2, rr->handle.data, rr->handle.len);
+      x->hlen2 = rr->handle.len;
+      return gf_sftp_client_copy_data (x->sftp, x->handle, x->hlen, 0, 0,
+                                       x->handle2, x->hlen2, 0,
+                                       mktag (T_COPY, 0, 0), NULL) != GF_OK;
+    case T_COPY:
+      x->failed_cmd = (int) rr->status;
+      return gf_sftp_client_close (x->sftp, x->handle2, x->hlen2,
+                                   mktag (T_CLOSE2, 0, 0), NULL) != GF_OK;
+    case T_CLOSE2:
+      return gf_sftp_client_close (x->sftp, x->handle, x->hlen,
+                                   mktag (T_CLOSE, 0, 0), NULL) != GF_OK;
     case T_XFER:
       x->outstanding--;
       if (put)
@@ -666,6 +763,34 @@ sftp_response (void *user, const gf_sftp_response *rr)
       return gf_sftp_client_readdir (x->sftp, x->handle, x->hlen,
                                      mktag (T_READDIR, 0, 0), NULL) != GF_OK;
     default:
+      if (rr->type == GF_FXP_EXTENDED_REPLY)
+        {
+          gf_sftp_statvfs sv;
+          gf_sftp_limits lm;
+          gf_slice us, gs, un, gn;
+
+          if (strcmp (cmd, "statvfs") == 0 && gf_sftp_response_statvfs (rr, &sv))
+            printf ("STATVFS bsize=%llu frsize=%llu blocks=%llu bfree=%llu "
+                    "namemax=%llu\n", (unsigned long long) sv.bsize,
+                    (unsigned long long) sv.frsize,
+                    (unsigned long long) sv.blocks,
+                    (unsigned long long) sv.bfree,
+                    (unsigned long long) sv.namemax);
+          else if (strcmp (cmd, "limits") == 0
+                   && gf_sftp_response_limits (rr, &lm))
+            printf ("LIMITS packet=%llu read=%llu write=%llu handles=%llu\n",
+                    (unsigned long long) lm.max_packet,
+                    (unsigned long long) lm.max_read,
+                    (unsigned long long) lm.max_write,
+                    (unsigned long long) lm.max_open_handles);
+          else if (strcmp (cmd, "idnames") == 0
+                   && gf_sftp_response_users_groups (rr, &us, &gs)
+                   && gf_sftp_string_next (&us, &un)
+                   && gf_sftp_string_next (&gs, &gn))
+            printf ("IDNAMES %.*s %.*s\n", (int) un.len, (const char *) un.data,
+                    (int) gn.len, (const char *) gn.data);
+          return finish_command (x, cmd, 0);
+        }
       if (rr->type == GF_FXP_ATTRS)
         {
           printf ("STAT size=%llu perms=%o\n",

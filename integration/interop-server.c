@@ -59,7 +59,10 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <limits.h>
 
@@ -388,6 +391,170 @@ get_handle (struct ctx *x, gf_slice h)
   return &x->handles[h.data[1]];
 }
 
+/* The OpenSSH extensions, on the real file system under the root.  */
+static int
+sftp_extension (struct ctx *x, const gf_sftp_request *q)
+{
+  gf_sftp_ext_request e;
+  char p1[PATH_MAX], p2[PATH_MAX];
+  struct sftp_handle *h, *h2;
+
+  if (gf_sftp_request_extension (q, &e) != GF_OK)
+    return gf_sftp_server_status (x->sftp, q->id, GF_FX_BAD_MESSAGE, "bad") != GF_OK;
+  if ((e.path.len && map_path (x, e.path, p1, sizeof p1))
+      || (e.path2.len && map_path (x, e.path2, p2, sizeof p2)))
+    return sftp_status (x, q->id, ENAMETOOLONG);
+  switch (e.which)
+    {
+    case GF_SFTPX_POSIX_RENAME:
+      return sftp_status (x, q->id, rename (p1, p2) < 0 ? errno : 0);
+    case GF_SFTPX_HARDLINK:
+      return sftp_status (x, q->id, link (p1, p2) < 0 ? errno : 0);
+    case GF_SFTPX_FSYNC:
+      h = get_handle (x, e.handle);
+      if (h == NULL || h->is_dir)
+        return sftp_status (x, q->id, EBADF);
+      return sftp_status (x, q->id, fsync (h->fd) < 0 ? errno : 0);
+    case GF_SFTPX_LSETSTAT:
+      if ((e.attrs.flags & GF_FILEXFER_ATTR_PERMISSIONS)
+          && fchmodat (AT_FDCWD, p1, e.attrs.permissions & 07777,
+                       AT_SYMLINK_NOFOLLOW) < 0)
+        return sftp_status (x, q->id, errno);
+      return sftp_status (x, q->id, 0);
+    case GF_SFTPX_STATVFS:
+    case GF_SFTPX_FSTATVFS:
+      {
+        struct statvfs vs;
+        gf_sftp_statvfs sv;
+        int rc;
+
+        if (e.which == GF_SFTPX_STATVFS)
+          rc = statvfs (p1, &vs);
+        else
+          {
+            h = get_handle (x, e.handle);
+            if (h == NULL || h->is_dir)
+              return sftp_status (x, q->id, EBADF);
+            rc = fstatvfs (h->fd, &vs);
+          }
+        if (rc < 0)
+          return sftp_status (x, q->id, errno);
+        sv.bsize = vs.f_bsize;
+        sv.frsize = vs.f_frsize;
+        sv.blocks = vs.f_blocks;
+        sv.bfree = vs.f_bfree;
+        sv.bavail = vs.f_bavail;
+        sv.files = vs.f_files;
+        sv.ffree = vs.f_ffree;
+        sv.favail = vs.f_favail;
+        sv.fsid = vs.f_fsid;
+        sv.flag = (vs.f_flag & ST_RDONLY ? GF_SFTP_ST_RDONLY : 0)
+          | (vs.f_flag & ST_NOSUID ? GF_SFTP_ST_NOSUID : 0);
+        sv.namemax = vs.f_namemax;
+        return gf_sftp_server_statvfs (x->sftp, q->id, &sv) != GF_OK;
+      }
+    case GF_SFTPX_LIMITS:
+      {
+        gf_sftp_limits l = { GF_SFTP_DEFAULT_MAX_PACKET, 65536, 65536, 64 };
+
+        return gf_sftp_server_limits (x->sftp, q->id, &l) != GF_OK;
+      }
+    case GF_SFTPX_EXPAND_PATH:
+      {
+        gf_sftp_name nm;
+        char virt[PATH_MAX];
+
+        /* "~" and "~/x" are the root of what is served.  */
+        if (e.path.len >= 1 && e.path.data[0] == '~')
+          {
+            gf_slice rest = { e.path.data + 1, e.path.len - 1 };
+
+            if (rest.len > 0 && rest.data[0] != '/')
+              return sftp_status (x, q->id, ENOENT);	/* ~user: no.  */
+            if (rest.len == 0)
+              snprintf (virt, sizeof virt, "/");
+            else if (map_path (x, rest, p2, sizeof p2))
+              return sftp_status (x, q->id, ENAMETOOLONG);
+            else
+              snprintf (virt, sizeof virt, "%s", p2 + strlen (x->sftp_root));
+          }
+        else
+          snprintf (virt, sizeof virt, "%s", p1 + strlen (x->sftp_root));
+        if (virt[0] == '\0')
+          snprintf (virt, sizeof virt, "/");
+        nm.filename.data = (const uint8_t *) virt;
+        nm.filename.len = strlen (virt);
+        nm.longname = nm.filename;
+        memset (&nm.attrs, 0, sizeof nm.attrs);
+        return gf_sftp_server_names (x->sftp, q->id, 1, &nm) != GF_OK;
+      }
+    case GF_SFTPX_COPY_DATA:
+      h = get_handle (x, e.handle);
+      h2 = get_handle (x, e.handle2);
+      if (h == NULL || h2 == NULL || h->is_dir || h2->is_dir)
+        return sftp_status (x, q->id, EBADF);
+      {
+        uint8_t buf[65536];
+        uint64_t left = e.length, off = e.offset, woff = e.offset2;
+        int to_end = e.length == 0;
+
+        while (to_end || left > 0)
+          {
+            size_t want = sizeof buf;
+            ssize_t n;
+
+            if (!to_end && left < want)
+              want = (size_t) left;
+            n = pread (h->fd, buf, want, (off_t) off);
+            if (n < 0)
+              return sftp_status (x, q->id, errno);
+            if (n == 0)
+              {
+                if (to_end)
+                  break;
+                return sftp_status (x, q->id, EIO);
+              }
+            if (pwrite (h2->fd, buf, (size_t) n, (off_t) woff) != n)
+              return sftp_status (x, q->id, errno ? errno : EIO);
+            off += (uint64_t) n;
+            woff += (uint64_t) n;
+            if (!to_end)
+              left -= (uint64_t) n;
+          }
+        return sftp_status (x, q->id, 0);
+      }
+    case GF_SFTPX_USERS_GROUPS:
+      {
+        static char names[2 * GF_SFTP_MAX_IDS][64];
+        const char *users[GF_SFTP_MAX_IDS], *groups[GF_SFTP_MAX_IDS];
+        size_t nu = 0, ng = 0;
+        uint32_t v;
+        gf_slice l;
+
+        for (l = e.uids; gf_sftp_u32_next (&l, &v); nu++)
+          {
+            struct passwd *pw = getpwuid ((uid_t) v);
+
+            snprintf (names[nu], sizeof names[nu], "%s", pw ? pw->pw_name : "");
+            users[nu] = names[nu];
+          }
+        for (l = e.gids; gf_sftp_u32_next (&l, &v); ng++)
+          {
+            struct group *gr = getgrgid ((gid_t) v);
+
+            snprintf (names[GF_SFTP_MAX_IDS + ng], 64, "%s", gr ? gr->gr_name : "");
+            groups[ng] = names[GF_SFTP_MAX_IDS + ng];
+          }
+        return gf_sftp_server_users_groups (x->sftp, q->id, nu, users, ng, groups)
+          != GF_OK;
+      }
+    case GF_SFTPX_UNKNOWN:
+      break;
+    }
+  return gf_sftp_server_status (x->sftp, q->id, GF_FX_OP_UNSUPPORTED,
+                                "unsupported") != GF_OK;
+}
+
 static int
 sftp_request (void *user, const gf_sftp_request *q)
 {
@@ -601,22 +768,7 @@ sftp_request (void *user, const gf_sftp_request *q)
         return gf_sftp_server_names (x->sftp, q->id, 1, &nm) != GF_OK;
       }
     case GF_FXP_EXTENDED:
-      if (q->ext_name.len == 24
-          && memcmp (q->ext_name.data, "posix-rename@openssh.com", 24) == 0)
-        {
-          gf_reader rd;
-          gf_slice a1, a2;
-          char p1[PATH_MAX], p2[PATH_MAX];
-
-          gf_reader_init (&rd, q->ext_data.data, q->ext_data.len);
-          if (gf_rd_string (&rd, &a1) != GF_OK || gf_rd_string (&rd, &a2) != GF_OK
-              || map_path (x, a1, p1, sizeof p1) || map_path (x, a2, p2, sizeof p2))
-            return gf_sftp_server_status (x->sftp, q->id, GF_FX_BAD_MESSAGE,
-                                          "bad") != GF_OK;
-          return sftp_status (x, q->id, rename (p1, p2) < 0 ? errno : 0);
-        }
-      return gf_sftp_server_status (x->sftp, q->id, GF_FX_OP_UNSUPPORTED,
-                                    "unsupported") != GF_OK;
+      return sftp_extension (x, q);
     default:
       return gf_sftp_server_status (x->sftp, q->id, GF_FX_OP_UNSUPPORTED,
                                     "unsupported") != GF_OK;
@@ -731,6 +883,7 @@ chan_request (void *user, const gf_chan_request *q)
 
           memset (&sc, 0, sizeof sc);
           memset (&se, 0, sizeof se);
+          sc.extensions = gf_sftp_standard_extensions (&sc.nextensions);
           se.user = x;
           se.request = sftp_request;
           se.disconnect = sftp_disconnect;

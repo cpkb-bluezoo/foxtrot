@@ -276,8 +276,9 @@ same sanitizers.
 @code{make check-integration} runs foxtrot's client against OpenSSH's
 @command{sshd} and OpenSSH's @command{ssh} and @command{sftp} against
 foxtrot's server, for the algorithms they share, through authentication,
-commands, bulk transfers with rekeying, port forwarding and SFTP, and
-checks that every algorithm foxtrot refuses is refused.
+commands, bulk transfers with rekeying, port forwarding and SFTP (including
+its extensions, against @command{sshd}'s own @command{sftp-server} and
+against @command{sftp} and @command{scp}), and checks that every algorithm foxtrot refuses is refused.
 
 @node Security policy
 @chapter Security policy
@@ -996,6 +997,25 @@ must also decide what to do about symbolic links.
 @item
 The target of SYMLINK comes first on the wire, as in OpenSSH, whatever the
 draft's text says.
+@item
+@strong{Extensions are typed.}  OpenSSH's @samp{posix-rename}, @samp{statvfs},
+@samp{fstatvfs}, @samp{hardlink}, @samp{fsync}, @samp{lsetstat},
+@samp{limits}, @samp{expand-path}, @samp{copy-data} and
+@samp{users-groups-by-id} are all there.  A server lists the ones it
+implements in its configuration (@code{gf_sftp_standard_extensions} has
+all ten with OpenSSH's versions), which go in its VERSION; a request for one
+of them is decoded and checked before the application sees it
+(@code{gf_sftp_request_extension}: a malformed one is answered
+@samp{BAD_MESSAGE} by the library), and the application answers with the
+reply that fits it, which the library holds it to
+(@code{gf_sftp_server_statvfs}, @code{_limits}, @code{_users_groups}, a
+name for @samp{expand-path}, a status for the rest).  A client learns what
+the server advertised (@code{gf_sftp_client_extension}) and does not send an
+extension the server did not say it has, as OpenSSH's client does; and it
+holds the server to the same rules, so that a reply of the wrong kind or
+shape, or a list of names that does not have one name for each id asked
+about, ends the session.  Extensions that are none of these pass through
+as before.
 @end itemize
 
 @node Other rules

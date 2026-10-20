@@ -58,8 +58,10 @@ Pre-alpha.  What exists today:
   chan      the connection protocol (RFC 4254): channels with strict flow
             control, session requests, TCP forwarding; interoperating with
             OpenSSH 9.6
-  sftp      SFTP version 3, client and server, over a channel; interoperating
-            with OpenSSH's sftp and internal-sftp
+  sftp      SFTP version 3, client and server, over a channel, with OpenSSH's
+            extensions (posix-rename, statvfs, hardlink, fsync, lsetstat,
+            limits, expand-path, copy-data, users-groups-by-id);
+            interoperating with OpenSSH's sftp, scp and internal-sftp
 
   session   one object and one set of events over all of the above: routing,
             startup wiring, deadlines, policy defaults, SFTP binding

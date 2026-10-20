@@ -266,6 +266,25 @@ cli_stream = (sftp(101, u32(0) + u32(0) + s('ok') + s('')) + sftp(102, u32(1) + 
               + sftp(105, u32(4) + u32(5) + u64(10) + u32(0o644)) + sftp(201, u32(5) + s('reply')) + sftp(101, u32(6) + u32(1) + s('eof') + s('')))
 add('sftp', 'client-session', b'\x01\x00\x40' + cli_stream)
 add('sftp', 'client-flaky', b'\x01\x80\x05' + cli_stream)
+# The extensions: requests of each kind, and the replies a client can have.
+def ext(i, name, body=b''): return sftp(200, u32(i) + s(name) + body)
+srv_ext = (sftp(1, u32(3))
+           + ext(1, 'posix-rename@openssh.com', s('/a') + s('/b')) + ext(2, 'statvfs@openssh.com', s('/'))
+           + ext(3, 'fstatvfs@openssh.com', s(b'h')) + ext(4, 'hardlink@openssh.com', s('/a') + s('/c'))
+           + ext(5, 'fsync@openssh.com', s(b'h')) + ext(6, 'lsetstat@openssh.com', s('/l') + u32(4) + u32(0o600))
+           + ext(7, 'limits@openssh.com') + ext(8, 'expand-path@openssh.com', s('~/x'))
+           + ext(9, 'copy-data', s(b'h') + u64(0) + u64(0) + s(b'i') + u64(0))
+           + ext(10, 'users-groups-by-id@openssh.com', s(u32(0) + u32(1000)) + s(u32(5)))
+           + ext(11, 'posix-rename@openssh.com', s('/a')) + ext(12, 'users-groups-by-id@openssh.com', s(b'abc') + s(b'')))
+add('sftp', 'server-extensions', b'\x00\x00\x40' + srv_ext)
+add('sftp', 'server-extensions-flaky', b'\x00\x80\x03' + srv_ext)
+cli_ext = (sftp(101, u32(10) + u32(0) + s('ok') + s('')) + sftp(201, u32(11) + bytes(88))
+           + sftp(201, u32(12) + bytes(88)) + sftp(101, u32(13) + u32(0) + s('ok') + s(''))
+           + sftp(101, u32(14) + u32(0) + s('ok') + s('')) + sftp(101, u32(15) + u32(0) + s('ok') + s(''))
+           + sftp(201, u32(16) + bytes(32)) + sftp(104, u32(17) + u32(1) + s('/h') + s('/h') + u32(0))
+           + sftp(201, u32(18) + s(u32(0)*0) + s(b'')))
+add('sftp', 'client-extensions', b'\x01\x00\x40' + cli_ext)
+add('sftp', 'client-extensions-flaky', b'\x01\x80\x05' + cli_ext)
 
 # ---- conn: [which][chunk] bytes ----
 def pkt(payload):

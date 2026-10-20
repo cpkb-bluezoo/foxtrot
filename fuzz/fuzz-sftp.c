@@ -58,6 +58,41 @@ s_request (void *u, const gf_sftp_request *r)
                                        1234, 0, 0, 0644, 0, 0 };
   gf_sftp_name name;
 
+  /* An extension: every kind of reply, right or wrong for it.  */
+  if (r->type == GF_FXP_EXTENDED)
+    {
+      gf_sftp_ext_request e;
+      static const char *nm[GF_SFTP_MAX_IDS];
+      size_t k;
+      gf_sftp_statvfs sv;
+      gf_sftp_limits lim;
+
+      memset (&sv, 0, sizeof sv);
+      memset (&lim, 0, sizeof lim);
+      for (k = 0; k < GF_SFTP_MAX_IDS; k++)
+        nm[k] = "a";
+      if (gf_sftp_request_extension (r, &e) == GF_OK
+          && e.which != GF_SFTPX_UNKNOWN)
+        switch (x->counter++ % 6)
+          {
+          case 0:
+            (void) gf_sftp_server_statvfs (x->s, r->id, &sv);
+            return 0;
+          case 1:
+            (void) gf_sftp_server_limits (x->s, r->id, &lim);
+            return 0;
+          case 2:
+            (void) gf_sftp_server_users_groups (x->s, r->id, e.uids.len / 4 > 2 ? 2 : e.uids.len / 4,
+                                                nm, e.gids.len / 4 > 2 ? 2 : e.gids.len / 4, nm);
+            (void) gf_sftp_server_users_groups (x->s, r->id, e.uids.len / 4, nm, e.gids.len / 4, nm);
+            return 0;
+          case 3:
+            (void) gf_sftp_server_extended_reply (x->s, r->id, (const uint8_t *) "x", 1);
+            return 0;
+          default:
+            break;
+          }
+    }
   /* Every kind of answer, whether or not it fits: the library has to say so.  */
   switch ((x->counter++ + r->type) % 6)
     {
@@ -104,6 +139,20 @@ c_ready (void *u)
   (void) gf_sftp_client_realpath (x->c, ".", NULL, NULL);
   (void) gf_sftp_client_readlink (x->c, "/l", NULL, NULL);
   (void) gf_sftp_client_extended (x->c, "x@y", (const uint8_t *) "z", 1, NULL, NULL);
+  (void) gf_sftp_client_posix_rename (x->c, "/a", "/b", NULL, NULL);
+  (void) gf_sftp_client_statvfs (x->c, "/", NULL, NULL);
+  (void) gf_sftp_client_fstatvfs (x->c, h, 1, NULL, NULL);
+  (void) gf_sftp_client_hardlink (x->c, "/a", "/b", NULL, NULL);
+  (void) gf_sftp_client_fsync (x->c, h, 1, NULL, NULL);
+  (void) gf_sftp_client_lsetstat (x->c, "/a", &a, NULL, NULL);
+  (void) gf_sftp_client_limits (x->c, NULL, NULL);
+  (void) gf_sftp_client_expand_path (x->c, "~", NULL, NULL);
+  (void) gf_sftp_client_copy_data (x->c, h, 1, 0, 0, h, 1, 0, NULL, NULL);
+  {
+    static const uint32_t ids[2] = { 0, 1 };
+
+    (void) gf_sftp_client_users_groups_by_id (x->c, ids, 2, ids, 1, NULL, NULL);
+  }
   (void) gf_sftp_client_close (x->c, h, 1, NULL, NULL);
   return 0;
 }
@@ -119,6 +168,21 @@ c_response (void *u, const gf_sftp_response *r)
   while (copy.type == GF_FXP_NAME && gf_sftp_response_next_name (&copy, &n))
     if (++count > 100000)
       abort ();
+  {
+    gf_sftp_statvfs sv;
+    gf_sftp_limits lim;
+    gf_slice us, gs, one;
+
+    (void) gf_sftp_response_statvfs (r, &sv);
+    (void) gf_sftp_response_limits (r, &lim);
+    if (gf_sftp_response_users_groups (r, &us, &gs))
+      {
+        while (gf_sftp_string_next (&us, &one))
+          count++;
+        while (gf_sftp_string_next (&gs, &one))
+          count++;
+      }
+  }
   return 0;
 }
 
@@ -145,6 +209,7 @@ LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
       cfg.max_packet = 4096;
       cfg.max_requests = 8;
       cfg.max_output = 8192;
+      cfg.extensions = gf_sftp_standard_extensions (&cfg.nextensions);
       memset (&ev, 0, sizeof ev);
       ev.user = &x;
       ev.write = w_write;
@@ -168,7 +233,25 @@ LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
     {
       gf_sftp_client_config cfg;
       gf_sftp_client_events ev;
-      static const uint8_t version[] = { 0, 0, 0, 5, 2, 0, 0, 0, 3 };
+      uint8_t version[1024];
+      gf_writer vw;
+      size_t ne, ei;
+      const gf_sftp_extension *ex = gf_sftp_standard_extensions (&ne);
+
+      /* The server's VERSION, with every extension it can have.  */
+      gf_writer_init (&vw, version, sizeof version);
+      gf_wr_u32 (&vw, 0);
+      gf_wr_u8 (&vw, 2);
+      gf_wr_u32 (&vw, 3);
+      for (ei = 0; ei < ne; ei++)
+        {
+          gf_wr_cstring (&vw, ex[ei].name);
+          gf_wr_cstring (&vw, ex[ei].data);
+        }
+      version[0] = (uint8_t) ((vw.len - 4) >> 24);
+      version[1] = (uint8_t) ((vw.len - 4) >> 16);
+      version[2] = (uint8_t) ((vw.len - 4) >> 8);
+      version[3] = (uint8_t) (vw.len - 4);
 
       memset (&cfg, 0, sizeof cfg);
       cfg.max_packet = 4096;
@@ -185,7 +268,7 @@ LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
       data += 3;
       size -= 3;
       if (gf_sftp_client_start (x.c) == GF_OK
-          && gf_sftp_client_input (x.c, version, sizeof version) == GF_OK)
+          && gf_sftp_client_input (x.c, version, vw.len) == GF_OK)
         while (!x.stop && pos < size)
           {
             size_t n = size - pos < chunk ? size - pos : chunk;
