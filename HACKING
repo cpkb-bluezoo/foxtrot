@@ -108,6 +108,13 @@ never touches:
                       supplies it from python3's bcrypt module, as an
                       application would supply its own); needs ssh-keygen
                       and python3 with the bcrypt module.
+  interop-certsign.sh certificates made by gf_cert_sign (interop-sign is
+                      the tool): ssh-keygen -L reads their fields, sshd
+                      takes user certificates from CAs of each kind and
+                      refuses the expired, the early, the wrong principal,
+                      address or CA and the altered, honours their forced
+                      command and pty permission, and ssh takes their host
+                      certificates; needs ssh, ssh-keygen, sshd.
 
 It skips itself (exit 77) when what it needs is missing, and when
 GF_NO_INTEROP is set.  Set SSHD if sshd is not in /usr/sbin.
@@ -130,7 +137,7 @@ Fuzzing and sanitizers
 
 fuzz/ has a fuzz target for each parser that reads what a peer or a file
 sends: the identification line, the binary packet, KEXINIT, public keys and
-certificates (blob and text), private key files, known_hosts,
+certificates (blob and text, and making them), private key files, known_hosts,
 authorized_keys, revocation lists, X.509 chains,
 authentication, channels, SFTP and the whole connection.  Each is a libFuzzer
 entry point (LLVMFuzzerTestOneInput) that also checks what must hold on any

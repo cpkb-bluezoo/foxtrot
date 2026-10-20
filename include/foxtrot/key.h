@@ -290,6 +290,56 @@ int gf_cert_critical_option (const gf_key *cert, const char *name,
    malformed, 0: an address restriction that cannot be checked is not met.  */
 int gf_cert_source_address_ok (const gf_key *cert, const char *address);
 
+/* ---- Making certificates ----
+
+   gf_cert_sign is the ssh-keygen -s of this library: it makes a certificate
+   for SUBJECT, signed by the CA key, and returns it as a key exactly as
+   gf_key_from_blob would (it is made by that, so the certificate returned is
+   one this library accepts).  gf_key_to_text gives the line for a
+   ".pub" file, and gf_key_blob the bytes.
+
+   It refuses what would be a mistake to sign:
+     - a certificate with no principals (nobody here: gf_cert_has_principal),
+       or whose key ID or names have control characters;
+     - one with no end to its validity, or that ends before it begins: the
+       times are the caller's, in seconds since 1970, and every certificate
+       must end;
+     - a serial number of 0, which no revocation list can name (krl.h);
+     - a user certificate with a source address that is not a list of
+       addresses and ranges, or a host certificate with any user option.
+   Permissions are an allow list: with none of the GF_CERT_ALLOW_ bits a
+   user certificate permits nothing (ssh-keygen -O clear), where ssh-keygen
+   by default permits all five.
+
+   The CA key must have a private part and be a plain key; it signs with the
+   first algorithm of gf_key_sigalgs (never ssh-rsa), or ALG if that is not
+   0.  SUBJECT may be a public key or a key pair, and not a certificate.  */
+#define GF_CERT_ALLOW_PTY 0x01
+#define GF_CERT_ALLOW_PORT_FORWARDING 0x02
+#define GF_CERT_ALLOW_AGENT_FORWARDING 0x04
+#define GF_CERT_ALLOW_X11_FORWARDING 0x08
+#define GF_CERT_ALLOW_USER_RC 0x10
+#define GF_CERT_ALLOW_ALL 0x1f
+
+typedef struct gf_cert_spec
+{
+  int type;			/* GF_CERT_USER or GF_CERT_HOST.  */
+  uint64_t serial;		/* Not 0.  */
+  const char *key_id;		/* For logs: not empty.  */
+  const char *const *principals;	/* User names or host names.  */
+  size_t nprincipals;
+  uint64_t valid_after, valid_before;
+  /* User certificates only: */
+  unsigned allow;		/* GF_CERT_ALLOW_ bits: the extensions.  */
+  const char *force_command;	/* NULL for none.  */
+  const char *source_address;	/* NULL for none: a comma separated list of
+				   addresses and CIDR ranges.  */
+  int verify_required;		/* For security keys.  */
+} gf_cert_spec;
+
+int gf_cert_sign (gf_key **out, const gf_key *ca, const gf_key *subject,
+                  const gf_cert_spec *spec, enum gf_sigalg alg);
+
 /* Attach CERT to KEY, which must have a private part and be the certificate's
    own key.  The result is a key that presents the certificate and signs for
    it; KEY is unchanged.  */

@@ -237,6 +237,18 @@ add('krl', 'main', krlc['vec_krl_main'])
 add('krl', 'wild', krlc['vec_krl_wild'])
 add('krl', 'header-only', krlc['vec_krl_wild'][:50])
 
+# ---- certsign: [type][allow][flags][serial][after][before] strings ----
+def csseed(name, typ, allow, flags, serial, after, before, keyid, cmd, addr, *princ):
+    d = bytes([typ, allow, flags]) + u64(serial) + u64(after) + u64(before)
+    for x in (keyid, cmd, addr) + princ:
+        x = x.encode(); d += bytes([len(x)]) + x
+    add('certsign', name, d)
+csseed('user', 1, 0x1f, 0, 7, 1000, 2000, 'alice@example.org', '/bin/true', '192.0.2.0/24,2001:db8::/32', 'alice', 'bob')
+csseed('host', 2, 0, 0, 8, 1000, 2000, 'host', '', '', '*.example.org', 'example.com')
+csseed('plain', 1, 0, 1, 9, 5, 6, 'id', '', '', 'p')
+csseed('bad-times', 1, 0, 0, 9, 6, 5, 'id', '', '', 'p')
+csseed('bad-addr', 1, 0, 0, 9, 5, 6, 'id', '', 'example.org', 'p')
+
 # ---- sftp: [mode][schedule][chunk] raw ----
 def sftp(t, body): return u32(len(body) + 1) + bytes([t]) + body
 srv_stream = (sftp(1, u32(3)) + sftp(16, u32(1) + s('.')) + sftp(3, u32(2) + s('/a') + u32(1) + u32(0))

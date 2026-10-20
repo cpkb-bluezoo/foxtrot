@@ -414,6 +414,28 @@ restricted by one.  An application that does not use the session asks
 @samp{no-touch-required} extension of a security key's certificate is not
 honoured: the touch is always required.
 
+@cindex certificate authority
+@cindex signing certificates
+@code{gf_cert_sign} is the @command{ssh-keygen -s} of the library: given a
+CA key with a private part, a public key and a @code{gf_cert_spec} (type,
+serial, key ID, principals, dates, and for a user certificate its
+permissions, forced command and source address) it makes a certificate and
+returns it as a key, ready for @code{gf_key_to_text} or
+@code{gf_key_blob}.  The certificate is read back by the same code that
+reads anyone's before it is returned, so the signature, the key and the
+structure have been checked.  It refuses what would be a mistake to sign: no
+principals (a certificate that names nobody), no end to the validity or one
+that ends before it begins, a serial number of 0 (which no revocation list can
+name), control characters in the key ID, names or command, a source address
+that is not a list of addresses and ranges, and user options on a host
+certificate.  Permissions are an allow list, so a spec that allows
+nothing makes @command{ssh-keygen -O clear}'s certificate where
+@command{ssh-keygen}'s default permits all five.  The CA signs with its own
+first algorithm (SHA-512 for RSA), or one the caller names, and never with
+SHA-1.  The certificates were checked by @command{ssh-keygen -L} and
+accepted and refused by @command{sshd} and @command{ssh} as ones from
+@command{ssh-keygen -s} are.
+
 A client presents a certificate by putting the key with the certificate
 attached (@code{gf_key_with_certificate}) in its list.  A server presents a
 host certificate by putting such a key in its host keys: it is offered
@@ -1047,6 +1069,10 @@ RSA keys, with the CA, validity, principal, @samp{source-address},
 text form of public keys.  Verified against OpenSSH 9.6 in both directions
 (@command{ssh-keygen -s}, @samp{TrustedUserCAKeys}, @samp{HostCertificate},
 and @samp{@@cert-authority} in @file{known_hosts}).
+
+@item
+@strong{Done.}  Making OpenSSH user and host certificates
+(@code{gf_cert_sign}), accepted by @command{sshd} and @command{ssh}.
 
 @item
 @strong{Done.}  A @file{known_hosts} reader and checker (patterns, hashed

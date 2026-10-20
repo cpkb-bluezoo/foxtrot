@@ -608,3 +608,220 @@ gf_key_with_certificate (const gf_key *key, const gf_key *cert, gf_key **out)
   *out = k;
   return GF_OK;
 }
+
+/* ---- Making certificates ---- */
+
+#define MAX_ID 255
+#define MAX_PRINCIPALS 256
+#define MAX_COMMAND 4096
+
+/* Printable UTF-8, no controls, between 1 and MAX bytes.  */
+static int
+text_ok (const char *t, size_t max)
+{
+  size_t n, i;
+
+  if (t == NULL)
+    return 0;
+  n = strlen (t);
+  if (n == 0 || n > max || !gf_utf8_valid ((const uint8_t *) t, n))
+    return 0;
+  for (i = 0; i < n; i++)
+    if ((unsigned char) t[i] < 0x20 || t[i] == 0x7f)
+      return 0;
+  return 1;
+}
+
+static int
+addresses_ok (const char *list)
+{
+  size_t n = strlen (list), start = 0, i;
+
+  if (!text_ok (list, MAX_COMMAND))
+    return 0;
+  for (i = 0; i <= n; i++)
+    if (i == n || list[i] == ',')
+      {
+        uint8_t a[16];
+        int fam;
+        unsigned bits;
+
+        if (!gfi_parse_cidr (list + start, i - start, &fam, a, &bits))
+          return 0;
+        start = i + 1;
+      }
+  return 1;
+}
+
+/* A critical option or extension whose data is the string VALUE (or empty,
+   if VALUE is NULL).  */
+static void
+put_option (gf_writer *w, const char *name, const char *value)
+{
+  size_t m, d;
+
+  gf_wr_string (w, name, strlen (name));
+  m = gf_wr_string_begin (w);
+  if (value != NULL)
+    {
+      d = gf_wr_string_begin (w);
+      gf_wr_bytes (w, value, strlen (value));
+      gf_wr_string_end (w, d);
+    }
+  gf_wr_string_end (w, m);
+}
+
+int
+gf_cert_sign (gf_key **out, const gf_key *ca, const gf_key *subject,
+              const gf_cert_spec *sp, enum gf_sigalg alg)
+{
+  /* The extensions in the order the format requires (by name).  */
+  static const struct
+  {
+    const char *name;
+    unsigned bit;
+  } ext[] = {
+    { GF_CERT_PERMIT_X11_FORWARDING, GF_CERT_ALLOW_X11_FORWARDING },
+    { GF_CERT_PERMIT_AGENT_FORWARDING, GF_CERT_ALLOW_AGENT_FORWARDING },
+    { GF_CERT_PERMIT_PORT_FORWARDING, GF_CERT_ALLOW_PORT_FORWARDING },
+    { GF_CERT_PERMIT_PTY, GF_CERT_ALLOW_PTY },
+    { GF_CERT_PERMIT_USER_RC, GF_CERT_ALLOW_USER_RC }
+  };
+  uint8_t sig[GF_SIG_MAX], nonce[32];
+  const uint8_t *pb, *cb;
+  size_t pl, cl, i, cap, m, signed_len, siglen, tl;
+  const char *tname;
+  char cname[128];
+  gf_slice rd_type;
+  gf_reader rd;
+  gf_writer w;
+  uint8_t *buf;
+  size_t nalg;
+  const enum gf_sigalg *algs;
+  int rc;
+
+  if (out == NULL)
+    return GF_ERR_INVAL;
+  *out = NULL;
+  if (ca == NULL || subject == NULL || sp == NULL
+      || gf_key_is_certificate (ca) || gf_key_is_certificate (subject)
+      || (sp->type != GF_CERT_USER && sp->type != GF_CERT_HOST))
+    return GF_ERR_INVAL;
+  if (sp->serial == 0 || !text_ok (sp->key_id, MAX_ID)
+      || sp->principals == NULL || sp->nprincipals == 0
+      || sp->nprincipals > MAX_PRINCIPALS
+      || sp->valid_before == UINT64_MAX || sp->valid_after >= sp->valid_before)
+    return GF_ERR_INVAL;
+  for (i = 0; i < sp->nprincipals; i++)
+    if (!text_ok (sp->principals[i], MAX_ID))
+      return GF_ERR_INVAL;
+  if (sp->type == GF_CERT_HOST)
+    {
+      if (sp->allow != 0 || sp->force_command != NULL
+          || sp->source_address != NULL || sp->verify_required)
+        return GF_ERR_INVAL;
+    }
+  else if ((sp->allow & ~(unsigned) GF_CERT_ALLOW_ALL) != 0
+           || (sp->force_command != NULL && !text_ok (sp->force_command, MAX_COMMAND))
+           || (sp->source_address != NULL && !addresses_ok (sp->source_address)))
+    return GF_ERR_INVAL;
+
+  /* The algorithm: the CA's own first one, unless asked, and one it has.  */
+  algs = gf_key_sigalgs (ca, &nalg);
+  if (algs == NULL || nalg == 0)
+    return GF_ERR_UNSUPPORTED;
+  if (alg == 0)
+    alg = algs[0];
+  else
+    {
+      for (i = 0; i < nalg && algs[i] != alg; i++)
+        ;
+      if (i == nalg)
+        return GF_ERR_UNSUPPORTED;
+    }
+
+  /* The certificate's type name is the key's with the suffix, and where the
+     key's name ends in "@openssh.com" (security keys) that moves to the
+     end of the suffix.  */
+  tname = gf_key_type_name (subject);
+  tl = strlen (tname);
+  if (tl > sizeof "@openssh.com" - 1
+      && strcmp (tname + tl - (sizeof "@openssh.com" - 1), "@openssh.com") == 0)
+    tl -= sizeof "@openssh.com" - 1;
+  if (tl + sizeof CERT_SUFFIX > sizeof cname)
+    return GF_ERR_UNSUPPORTED;
+  memcpy (cname, tname, tl);
+  memcpy (cname + tl, CERT_SUFFIX, sizeof CERT_SUFFIX);
+  tl += sizeof CERT_SUFFIX - 1;
+
+  pb = gf_key_plain_blob (subject, &pl);
+  cb = gf_key_blob (ca, &cl);
+  if (pb == NULL || cb == NULL)
+    return GF_ERR_INVAL;
+  /* The key's blob minus its type name, which is how it is carried.  */
+  gf_reader_init (&rd, pb, pl);
+  if (gf_rd_string (&rd, &rd_type) != GF_OK)
+    return GF_ERR_INVAL;
+  rc = gf_random (nonce, sizeof nonce);
+  if (rc != GF_OK)
+    return rc;
+
+  cap = tl + pl + cl + GF_SIG_MAX + 1024 + MAX_COMMAND * 2 + MAX_ID * 2;
+  for (i = 0; i < sp->nprincipals; i++)
+    cap += strlen (sp->principals[i]) + 4;
+  buf = malloc (cap);
+  if (buf == NULL)
+    return GF_ERR_NOMEM;
+  gf_writer_init (&w, buf, cap);
+  gf_wr_string (&w, cname, tl);
+  gf_wr_string (&w, nonce, sizeof nonce);
+  gf_wr_bytes (&w, pb + (pl - gf_rd_remaining (&rd)), gf_rd_remaining (&rd));
+  gf_wr_u64 (&w, sp->serial);
+  gf_wr_u32 (&w, (uint32_t) sp->type);
+  gf_wr_string (&w, sp->key_id, strlen (sp->key_id));
+  m = gf_wr_string_begin (&w);
+  for (i = 0; i < sp->nprincipals; i++)
+    gf_wr_string (&w, sp->principals[i], strlen (sp->principals[i]));
+  gf_wr_string_end (&w, m);
+  gf_wr_u64 (&w, sp->valid_after);
+  gf_wr_u64 (&w, sp->valid_before);
+  /* Critical options, sorted by name: f, s, v.  */
+  m = gf_wr_string_begin (&w);
+  if (sp->force_command != NULL)
+    put_option (&w, "force-command", sp->force_command);
+  if (sp->source_address != NULL)
+    put_option (&w, "source-address", sp->source_address);
+  if (sp->verify_required)
+    put_option (&w, "verify-required", NULL);
+  gf_wr_string_end (&w, m);
+  m = gf_wr_string_begin (&w);
+  for (i = 0; i < sizeof ext / sizeof ext[0]; i++)
+    if (sp->allow & ext[i].bit)
+      put_option (&w, ext[i].name, NULL);
+  gf_wr_string_end (&w, m);
+  gf_wr_string (&w, "", 0);		/* Reserved.  */
+  gf_wr_string (&w, cb, cl);
+  signed_len = w.len;
+  if (gf_wr_status (&w) != GF_OK)
+    {
+      free (buf);
+      return GF_ERR_BUFSIZE;
+    }
+  rc = gf_key_sign (ca, alg, buf, signed_len, sig, sizeof sig, &siglen);
+  if (rc != GF_OK)
+    {
+      free (buf);
+      return rc;
+    }
+  gf_wr_string (&w, sig, siglen);
+  if (gf_wr_status (&w) != GF_OK)
+    {
+      free (buf);
+      return GF_ERR_BUFSIZE;
+    }
+  /* What was made is read back by the same code that reads anyone's: it
+     checks the signature, the key and the structure.  */
+  rc = gf_key_from_blob (out, buf, w.len);
+  free (buf);
+  return rc;
+}

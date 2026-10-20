@@ -34,7 +34,7 @@ LDADD = $(top_builddir)/src/libfoxtrot.la
 
 FUZZ_TARGETS = fuzz-wire fuzz-ident fuzz-packet fuzz-kexinit fuzz-key \
   fuzz-keytext fuzz-keyfile fuzz-knownhosts fuzz-x509 fuzz-auth \
-  fuzz-chans fuzz-sftp fuzz-conn fuzz-authkeys fuzz-krl
+  fuzz-chans fuzz-sftp fuzz-conn fuzz-authkeys fuzz-krl fuzz-certsign
 
 check_PROGRAMS = $(FUZZ_TARGETS)
 TESTS = $(FUZZ_TARGETS)
@@ -57,5 +57,6 @@ fuzz_sftp_SOURCES = fuzz-sftp.c driver.c fuzz-common.h
 fuzz_conn_SOURCES = fuzz-conn.c driver.c fuzz-common.h
 fuzz_authkeys_SOURCES = fuzz-authkeys.c driver.c fuzz-common.h
 fuzz_krl_SOURCES = fuzz-krl.c driver.c fuzz-common.h
+fuzz_certsign_SOURCES = fuzz-certsign.c driver.c fuzz-common.h
 
 EXTRA_DIST = run-corpus.sh gen-seeds.py lsan.supp corpus

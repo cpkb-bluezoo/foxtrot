@@ -54,6 +54,7 @@ Makefile
 /integration/interop-client
 /integration/interop-server
 /integration/interop-key
+/integration/interop-sign
 *.log
 *.trs
 /test-suite.log

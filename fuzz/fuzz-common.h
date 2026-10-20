@@ -34,6 +34,30 @@ fuzz_frame (const uint8_t **p, size_t *n, const uint8_t **frame, size_t *flen)
   return 1;
 }
 
+/* A length-prefixed (one byte) string from the input, as a NUL-terminated
+   copy in OUT (CAP bytes); 0 if there is none.  */
+static inline int
+fuzz_take (const uint8_t **p, size_t *n, char *out, size_t cap, size_t *len)
+{
+  size_t l;
+
+  if (*n < 1)
+    return 0;
+  l = **p;
+  (*p)++;
+  (*n)--;
+  if (l > *n)
+    l = *n;
+  if (l >= cap)
+    l = cap - 1;
+  memcpy (out, *p, l);
+  out[l] = '\0';
+  *p += l;
+  *n -= l;
+  *len = l;
+  return 1;
+}
+
 /* Hex text to bytes (for the constants of the test vectors); returns the
    length.  */
 static inline size_t

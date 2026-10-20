@@ -23,3 +23,4 @@ foxtrot NEWS - history of user-visible changes.
 ** authorized_keys files (authkeys.h): gf_authkeys_check enforces from, expiry-time, cert-authority, principals and verify-required, and reports command, the no- options, restrict, permitopen, permitlisten and environment.
 ** gf_session_deny and gf_session_force pass an authorized_keys line's restrictions to the session; gf_auth_server_config.principals_by_application lets the application decide who a certificate is for.
 ** OpenSSH key revocation lists (krl.h): gf_krl_load, gf_krl_check; agrees with ssh-keygen -Q. gf_auth_server_config.krl refuses revoked keys and certificates.
+** Certificates can be made (gf_cert_sign, gf_cert_spec): user and host certificates, signed by CAs of each kind, accepted by sshd and ssh.

@@ -38,7 +38,8 @@ Pre-alpha.  What exists today:
             private key files (also passphrase-protected, with the application's
             bcrypt-pbkdf), public key text, and OpenSSH certificates
             (user and host; CA, dates, principals, source-address,
-            force-command); FIDO security keys (verification only)
+            force-command; making them, as ssh-keygen -s); FIDO security
+            keys (verification only)
   x509      X.509 chains as keys (RFC 6187), through GnuTLS: parsing,
             validation against a trust store, CRLs, names, purposes
   knownhosts  known_hosts files: patterns, hashed names, CAs, revocation,
