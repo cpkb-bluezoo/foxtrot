@@ -131,7 +131,7 @@ Fuzzing and sanitizers
 fuzz/ has a fuzz target for each parser that reads what a peer or a file
 sends: the identification line, the binary packet, KEXINIT, public keys and
 certificates (blob and text), private key files, known_hosts,
-authorized_keys, X.509 chains,
+authorized_keys, revocation lists, X.509 chains,
 authentication, channels, SFTP and the whole connection.  Each is a libFuzzer
 entry point (LLVMFuzzerTestOneInput) that also checks what must hold on any
 input, not only that nothing crashes: for example that a known_hosts line we

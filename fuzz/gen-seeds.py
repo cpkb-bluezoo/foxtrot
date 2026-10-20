@@ -231,6 +231,12 @@ aseed('ca-plain', '192.0.2.50', '', 'bob', 'cert-authority ' + capub + '\n' + ed
 aseed('bad', '', '', '', 'command="x ' + edpub + '\nfrom="" ' + edpub + '\nunknown="x" ' + edpub + '\n')
 aseed('expiry', '10.0.0.1', '', 'alice', 'expiry-time="20231114221320Z" ' + edpub + '\nexpiry-time="2024" ' + edpub + '\n')
 
+# ---- krl: the list itself ----
+krlc = hexc('vectors-krl.h')
+add('krl', 'main', krlc['vec_krl_main'])
+add('krl', 'wild', krlc['vec_krl_wild'])
+add('krl', 'header-only', krlc['vec_krl_wild'][:50])
+
 # ---- sftp: [mode][schedule][chunk] raw ----
 def sftp(t, body): return u32(len(body) + 1) + bytes([t]) + body
 srv_stream = (sftp(1, u32(3)) + sftp(16, u32(1) + s('.')) + sftp(3, u32(2) + s('/a') + u32(1) + u32(0))

@@ -2543,6 +2543,127 @@ test_x509 (void)
 }
 #endif /* HAVE_GNUTLS */
 
+/* A revocation list in the configuration: revoked keys and certificates get
+   no further than the machine, the others are unaffected.  */
+static void
+krl_file (uint8_t *out, size_t cap, size_t *len, int what, const gf_key *key,
+          uint64_t serial, const gf_key *ca)
+{
+  gf_writer w;
+  size_t m, b;
+  const uint8_t *blob;
+  size_t bl;
+
+  gf_writer_init (&w, out, cap);
+  gf_wr_bytes (&w, "SSHKRL\n", 8);
+  gf_wr_u32 (&w, 1);
+  gf_wr_u64 (&w, 1);
+  gf_wr_u64 (&w, 1700000000);
+  gf_wr_u64 (&w, 0);
+  gf_wr_string (&w, "", 0);
+  gf_wr_string (&w, "", 0);
+  if (what == 0)		/* The key itself.  */
+    {
+      blob = gf_key_plain_blob (key, &bl);
+      gf_wr_u8 (&w, 2);
+      m = gf_wr_string_begin (&w);
+      gf_wr_string (&w, blob, bl);
+      gf_wr_string_end (&w, m);
+    }
+  else				/* A serial of a CA.  */
+    {
+      blob = gf_key_blob (ca, &bl);
+      gf_wr_u8 (&w, 1);
+      m = gf_wr_string_begin (&w);
+      gf_wr_string (&w, blob, bl);
+      gf_wr_string (&w, "", 0);
+      gf_wr_u8 (&w, 0x20);
+      b = gf_wr_string_begin (&w);
+      gf_wr_u64 (&w, serial);
+      gf_wr_string_end (&w, b);
+      gf_wr_string_end (&w, m);
+    }
+  CHECK_EQ (gf_wr_status (&w), GF_OK);
+  *len = w.len;
+}
+
+static void
+test_krl (void)
+{
+  uint8_t f[512];
+  size_t fl, k;
+  gf_krl *list;
+  gf_key *ca = blob_key (vec_ca_ed_blob);
+  gf_key *ck[2];
+  const gf_key *cas[1];
+  gf_cert_info ci;
+  struct ap x;
+
+  CHECK_EQ (gf_krl_new (&list), GF_OK);
+  krl_file (f, sizeof f, &fl, 0, ukeys[0], 0, NULL);
+  CHECK_EQ (gf_krl_load (list, f, fl), GF_OK);
+  for (k = 0; k < 2; k++)
+    {
+      gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+      struct cli_creds cr = { "alice", { ukeys[k] }, 1, NULL, 0, 0 };
+
+      sc.krl = list;
+      ap_new (&x, &sc, &cr);
+      x.authorized[0] = ukeys[k];
+      x.nauthorized = 1;
+      ap_run (&x);
+      /* The revoked key never reaches the application; the other does.  */
+      CHECK_EQ (x.srv_authenticated, k);
+      CHECK_EQ (x.srv_requests > 0, k);
+      CHECK_EQ (x.cli_authenticated, k);
+      CHECK_EQ (x.srv_disconnect, 0);	/* Refused, not an offence.  */
+      ap_free (&x);
+    }
+  gf_krl_free (list);
+
+  /* Certificates: one serial of the CA.  */
+  ck[0] = cert_key (vec_ed_private, vec_ed_user_cert);
+  ck[1] = cert_key (vec_p256_private, vec_p256_user_cert);
+  cas[0] = ca;
+  CHECK_EQ (gf_key_certificate_info (ck[0], &ci), GF_OK);
+  CHECK (ci.serial != 0);
+  CHECK_EQ (gf_key_certificate_info (ck[1], &ci), GF_OK);
+  {
+    uint64_t other = ci.serial;
+    gf_cert_info c0;
+
+    CHECK_EQ (gf_key_certificate_info (ck[0], &c0), GF_OK);
+    CHECK (other != c0.serial);
+    CHECK_EQ (gf_krl_new (&list), GF_OK);
+    krl_file (f, sizeof f, &fl, 1, NULL, c0.serial, ca);
+    CHECK_EQ (gf_krl_load (list, f, fl), GF_OK);
+    for (k = 0; k < 3; k++)
+      {
+        /* The revoked serial, another serial, and the revoked serial with
+           no list.  */
+        static const int which[3] = { 0, 1, 0 }, use_list[3] = { 1, 1, 0 };
+        gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+        static struct cli_creds cr;
+
+        cr = (struct cli_creds) { "alice", { ck[which[k]] }, 1, NULL, 0, 0 };
+        sc.trusted_user_cas = cas;
+        sc.ntrusted_user_cas = 1;
+        sc.peer_address = "192.0.2.77";
+        sc.krl = use_list[k] ? list : NULL;
+        ap_new (&x, &sc, &cr);
+        x.accept_certs = 1;
+        ap_run (&x);
+        CHECK_EQ (x.srv_authenticated, k != 0);
+        CHECK_EQ (x.srv_disconnect, 0);
+        ap_free (&x);
+      }
+    gf_krl_free (list);
+  }
+  gf_key_free (ck[0]);
+  gf_key_free (ck[1]);
+  gf_key_free (ca);
+}
+
 int
 main (void)
 {
@@ -2558,6 +2679,7 @@ main (void)
   test_construction ();
   test_client_alone ();
   test_publickey ();
+  test_krl ();
   test_key_selection ();
   test_password ();
   test_kbdint ();

@@ -378,6 +378,12 @@ srv_publickey (gf_auth_server *a, gf_reader *rd, gf_auth_request *req,
       gf_key_free (key);
       return srv_attempt_failed (a, counted);
     }
+  /* Revoked, or not to be told: the list says no.  */
+  if (a->cfg.krl != NULL && gf_krl_check (a->cfg.krl, key) != 0)
+    {
+      gf_key_free (key);
+      return srv_attempt_failed (a, counted);
+    }
   if (gf_key_is_certificate (key) && !srv_certificate (a, key, req))
     {
       gf_key_free (key);

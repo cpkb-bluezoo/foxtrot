@@ -45,6 +45,8 @@ Pre-alpha.  What exists today:
             algorithm selection; agrees with ssh-keygen -F
   authkeys  authorized_keys files: from, expiry-time, cert-authority,
             principals, command, permitopen and the no- options
+  krl       OpenSSH key revocation lists: keys, hashes, certificates by
+            serial and key ID, CAs; agrees with ssh-keygen -Q
   conn      the transport: negotiation, key exchange, rekeying, EXT_INFO,
             service request; interoperating with OpenSSH 9.6
 

@@ -143,10 +143,10 @@ libgcrypt at run time as @command{configure} does at build time.
 
 There is no MD5 and no SHA-1 for anything that authenticates or derives
 anything, not even for fingerprints (@samp{SHA256:}), and no HMAC in the
-protocol, since every cipher is AEAD.  SHA-1 appears in two places only, to
-recognise names and not to protect them: the HMAC-SHA-1 of hashed
-@file{known_hosts} names and the SHA-1 hash that identifies an OCSP
-responder.  GnuTLS, if configured (@option{--with-gnutls}, the default if it
+protocol, since every cipher is AEAD.  SHA-1 appears in three places only, to
+recognise names and keys and not to protect them: the HMAC-SHA-1 of hashed
+@file{known_hosts} names, the SHA-1 hash that identifies an OCSP
+responder, and the SHA-1 hashes of keys in revocation lists.  GnuTLS, if configured (@option{--with-gnutls}, the default if it
 is found), is used for the X.509 key formats of RFC 6187.
 
 libgcrypt's ECDH takes any point it is given.  An invalid-curve attack is
@@ -264,7 +264,7 @@ checked by removing it and seeing a test fail.
 @code{make check} also runs the fuzz targets of @file{fuzz/} once over
 their corpora.  There is one for each parser of what a peer or a file
 sends (the identification line, packets, key exchange messages, keys and
-certificates, private key files, @file{known_hosts}, @file{authorized_keys},
+certificates, private key files, @file{known_hosts}, @file{authorized_keys}, revocation lists,
 X.509 chains,
 authentication, channels, SFTP and a whole connection), and each checks
 what must hold on any input as well as that nothing crashes.  Built with
@@ -622,8 +622,8 @@ extension in TLS), and what the CRLs are there for.
 @cindex SHA-1, in OCSP responder names
 A response may name its signer by the SHA-1 hash of its key.  The hash
 only picks out which certificate is meant; the signature, which may not be
-SHA-1, proves it.  With the hashed names of @file{known_hosts}, this is the only
-other place SHA-1 appears.
+SHA-1, proves it.  With the hashed names of @file{known_hosts} and the hashes of revocation
+lists, this is one of three places SHA-1 appears.
 
 @node Known hosts
 @subsection Known hosts
@@ -718,6 +718,40 @@ the machine the union (@code{gf_authkeys_cas} of the global file, say), and
 sets @code{principals_by_application} if it wants @code{principals=} to say
 who a certificate is for rather than the user name; the machine then no
 longer checks the name, and @code{gf_authkeys_check} does.
+
+@node Revocation lists
+@subsection Revocation lists
+@cindex KRL
+@cindex key revocation list
+
+@file{krl.h} reads OpenSSH's binary key revocation lists, the files
+@command{ssh-keygen -k} writes and @command{sshd}'s @code{RevokedKeys} reads.
+The application loads the bytes of the file (lists add up) and
+@code{gf_krl_check} says whether a key is revoked: a key listed in full or by
+the SHA-1 or SHA-256 hash of its blob, a certificate whose key is, a
+certificate whose CA key is, and a certificate by its serial number or key ID,
+for the CA that signed it or, in a list for no CA in particular, for any.  As
+in OpenSSH, serial 0 is never matched.  The answer agrees with
+@command{ssh-keygen -Q} on every key and certificate of the test vectors.
+
+A list that is malformed, has a section or a critical extension this library
+does not know, a serial number of 0, a range that runs backwards or a bitmap
+that runs past 2^64 is refused whole, and nothing of it is added: a
+revocation that is not understood is never ignored.  So is a list with
+signature sections, as OpenSSH 9.4 and later refuse them, its authors
+recommend signing the file (SSHSIG) instead, and nothing here could say
+where a list came from; an application that fetches lists over an untrusted
+channel authenticates the file before it loads it.
+
+Give the authentication machine a list in @code{gf_auth_server_config.krl}
+and it refuses a revoked key, or a certificate that is revoked or has a
+revoked CA, before the application sees the request, whatever method the
+key is for.  A client checks a host key in its @code{host_key} callback.
+
+@cindex SHA-1, in revocation lists
+The SHA-1 sections of a list are the third place SHA-1 appears: it only
+recognises a key in files that @command{ssh-keygen -k} writes, and could at
+worst be made to revoke a key that was not meant to be.
 
 @node Ciphers
 @section Ciphers

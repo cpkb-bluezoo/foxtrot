@@ -49,8 +49,10 @@
    address, and that every critical option is one it understands, and the
    application is told what it must itself honour: the "force-command"
    option is in the request and is kept for gf_auth_server_force_command.
-   Whether to accept the certificate (a revocation list, say, by serial or
-   key id: gf_key_certificate_info) remains the application's decision.
+   A key revocation list in the configuration (krl) is consulted for every
+   key, certificate or not; anything else the application knows about
+   revocation (gf_key_certificate_info has the serial and key id) is its
+   decision.
 
    X.509 chains (RFC 6187, x509.h) are accepted the same way if the server's
    configuration has a trust store (x509_trust): the machine checks the chain
@@ -91,6 +93,7 @@
 #include <stdint.h>
 
 #include <foxtrot/key.h>
+#include <foxtrot/krl.h>
 #include <foxtrot/policy.h>
 #include <foxtrot/wire.h>
 #include <foxtrot/x509.h>
@@ -220,6 +223,11 @@ typedef struct gf_auth_server_config
      the application does check: a certificate for someone else is
      otherwise accepted as the user's.  */
   int principals_by_application;
+  /* A key revocation list (krl.h).  A key it revokes, or a certificate it
+     revokes or whose CA it revokes, is refused before the application sees
+     the request, and so is a key it cannot be asked about.  Not copied: it
+     must outlive the machine.  */
+  const gf_krl *krl;
 } gf_auth_server_config;
 
 typedef struct gf_auth_server gf_auth_server;
