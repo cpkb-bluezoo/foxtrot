@@ -20,6 +20,7 @@
 lib_LTLIBRARIES = libfoxtrot.la
 
 libfoxtrot_la_SOURCES = \
+  auth.c \
   conn.c \
   crypto.c \
   gettext.h \
@@ -42,6 +43,7 @@ libfoxtrot_la_LDFLAGS = -version-info $(LIBFOXTROT_LTVERSION) \
 
 foxtrotincludedir = $(includedir)/foxtrot
 foxtrotinclude_HEADERS = \
+  $(top_srcdir)/include/foxtrot/auth.h \
   $(top_srcdir)/include/foxtrot/conn.h \
   $(top_srcdir)/include/foxtrot/crypto.h \
   $(top_srcdir)/include/foxtrot/ident.h \

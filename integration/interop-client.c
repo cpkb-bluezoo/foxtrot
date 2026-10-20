@@ -19,16 +19,20 @@
 /* A foxtrot SSH client for talking to OpenSSH's sshd.
 
      interop-client PORT [--kex NAME] [--cipher NAME] [--hostkey ALG]
-                         [--fingerprint SHA256:...] [--rekey]
+                         [--fingerprint SHA256:...] [--no-auth]
+                         [--user NAME] [--key FILE] [--password PW]
+                         [--kbd ANSWER] [--rekey]
 
    Connects to 127.0.0.1:PORT, completes the transport handshake with the
    given algorithms (default: the policy's), asks the application to trust
    the host key (it does, unless --fingerprint says which one to expect),
-   requests the ssh-userauth service and sends an authentication request
-   with the method "none", which sshd answers with the list of methods it
-   offers.  With --rekey it then forces a key exchange and sends the request
-   again.  Prints "FAILURE methods" for each answer, "KEX ..." and "HOSTKEY
-   ..." once the transport is established, and exits 0 if all went well.  */
+   and requests the ssh-userauth service.  With --no-auth it stops there.
+   Otherwise it authenticates as NAME (default "nobody") with the OpenSSH
+   private key in FILE, the password PW, or by answering every
+   keyboard-interactive prompt with ANSWER, as given; with --rekey it then
+   forces a key exchange and waits for it.  Prints "KEX ...", "HOSTKEY ...",
+   "SERVICE ...", "AUTH OK" or "AUTH FAILED", "REKEYED ..." and "DONE", and
+   exits 0 if all that was asked went well.  */
 
 #ifdef HAVE_CONFIG_H
 # include <config.h>
@@ -36,6 +40,7 @@
 
 #include "interop-util.h"
 
+#include <foxtrot/auth.h>
 #include <foxtrot/key.h>
 #include <foxtrot/policy.h>
 #include <foxtrot/wire.h>
@@ -44,9 +49,10 @@ struct ctx
 {
   int fd;
   gf_conn *c;
-  const char *expect_fp;
-  int rekey;
-  int established, rekeyed, failures, wanted_failures, bad;
+  gf_auth_client *auth;
+  const char *expect_fp, *kbd_answer;
+  int rekey, no_auth;
+  int established, service, authed, auth_failed, rekeyed, banners;
 };
 
 static int
@@ -72,20 +78,6 @@ on_host_key (void *user, const gf_key *key)
 }
 
 static int
-send_none (struct ctx *x)
-{
-  uint8_t m[128];
-  gf_writer w;
-
-  gf_writer_init (&w, m, sizeof m);
-  gf_wr_u8 (&w, 50);		/* USERAUTH_REQUEST.  */
-  gf_wr_cstring (&w, "nobody");
-  gf_wr_cstring (&w, "ssh-connection");
-  gf_wr_cstring (&w, "none");
-  return gf_conn_send (x->c, now_us (), m, w.len);
-}
-
-static int
 on_established (void *user, const gf_conn_info *info)
 {
   struct ctx *x = user;
@@ -99,45 +91,53 @@ on_established (void *user, const gf_conn_info *info)
 }
 
 static int
-on_rekeyed (void *user, const gf_conn_info *info)
+on_extension (void *user, gf_slice name, gf_slice value)
 {
   struct ctx *x = user;
 
-  printf ("REKEYED %s\n", gf_kex_name (info->kex));
-  x->rekeyed++;
-  return send_none (x) != GF_OK;
+  return x->auth && gf_auth_client_extension (x->auth, name, value) != GF_OK;
 }
 
 static int
 on_service_accepted (void *user, gf_slice name)
 {
   struct ctx *x = user;
+  const gf_conn_info *info = gf_conn_get_info (x->c);
+  size_t bl;
+  const uint8_t *blob = gf_key_blob (info->host_key, &bl);
 
   printf ("SERVICE %.*s\n", (int) name.len, (const char *) name.data);
-  return send_none (x) != GF_OK;
+  x->service = 1;
+  if (x->no_auth)
+    return 0;
+  return gf_auth_client_start (x->auth, now_us (), info->session_id,
+                               info->session_id_len, blob, bl) != GF_OK;
+}
+
+static int
+on_rekeyed (void *user, const gf_conn_info *info)
+{
+  struct ctx *x = user;
+
+  printf ("REKEYED %s\n", gf_kex_name (info->kex));
+  x->rekeyed++;
+  return 0;
 }
 
 static int
 on_message (void *user, const uint8_t *p, size_t n)
 {
   struct ctx *x = user;
-  gf_reader r;
-  gf_slice methods;
-  int partial;
 
-  gf_reader_init (&r, p + 1, n - 1);
-  if (p[0] == 51 && gf_rd_namelist (&r, &methods) == GF_OK
-      && gf_rd_bool (&r, &partial) == GF_OK)
+  if (p[0] >= 50 && p[0] <= 79 && x->auth)
     {
-      printf ("FAILURE %.*s\n", (int) methods.len, (const char *) methods.data);
-      x->failures++;
-      if (x->rekey && x->failures == 1)
-        return gf_conn_rekey (x->c, now_us ()) != GF_OK;
-      return 0;
+      int r = gf_auth_client_input (x->auth, now_us (), p, n);
+
+      if (r != GF_OK && r != GF_ERR_AUTH)
+        printf ("AUTH ERROR %d\n", r);
+      return r != GF_OK && r != GF_ERR_AUTH;
     }
-  x->bad = 1;
-  printf ("UNEXPECTED %d\n", p[0]);
-  return 1;
+  return 0;
 }
 
 static void
@@ -149,11 +149,68 @@ on_closed (void *user, int error, uint32_t reason, gf_slice text)
 }
 
 static int
+auth_send (void *user, const uint8_t *p, size_t n)
+{
+  struct ctx *x = user;
+
+  return gf_conn_send (x->c, now_us (), p, n) != GF_OK;
+}
+
+static void
+auth_banner (void *user, gf_slice text)
+{
+  (void) text;
+  ((struct ctx *) user)->banners++;
+}
+
+static int
+auth_kbdint (void *user, gf_slice name, gf_slice instr, size_t n,
+             const gf_slice *prompts, const int *echo)
+{
+  struct ctx *x = user;
+  const char *answers[GF_AUTH_MAX_PROMPTS];
+  size_t i;
+
+  (void) name;
+  (void) instr;
+  (void) prompts;
+  (void) echo;
+  for (i = 0; i < n; i++)
+    answers[i] = x->kbd_answer;
+  return gf_auth_client_kbdint_respond (x->auth, now_us (), n, answers)
+    != GF_OK;
+}
+
+static int
+auth_ok (void *user)
+{
+  struct ctx *x = user;
+
+  printf ("AUTH OK\n");
+  x->authed = 1;
+  if (x->rekey)
+    return gf_conn_rekey (x->c, now_us ()) != GF_OK;
+  return 0;
+}
+
+static int
+auth_failed (void *user)
+{
+  printf ("AUTH FAILED\n");
+  ((struct ctx *) user)->auth_failed = 1;
+  return 0;
+}
+
+static int
 finished (void *user)
 {
   struct ctx *x = user;
 
-  return x->failures >= (x->rekey ? 2 : 1);
+  if (x->no_auth)
+    return x->service;
+  if (x->auth_failed)
+    return 1;
+  return x->authed && (!x->rekey || x->rekeyed);
 }
 
 int
@@ -163,9 +220,14 @@ main (int argc, char **argv)
   struct ctx x;
   gf_conn_config cfg;
   gf_conn_events ev;
+  gf_auth_client_config ac;
+  gf_auth_client_events ae;
   enum gf_kex kex = 0;
   enum gf_cipher cipher = 0;
   enum gf_sigalg alg = 0;
+  const char *user = "nobody", *keyfile = NULL, *password = NULL;
+  gf_key *key = NULL;
+  const gf_key *keys[1];
   int i, r;
 
   if (argc < 2)
@@ -194,8 +256,18 @@ main (int argc, char **argv)
         }
       else if (strcmp (argv[i], "--fingerprint") == 0 && i + 1 < argc)
         x.expect_fp = argv[++i];
+      else if (strcmp (argv[i], "--user") == 0 && i + 1 < argc)
+        user = argv[++i];
+      else if (strcmp (argv[i], "--key") == 0 && i + 1 < argc)
+        keyfile = argv[++i];
+      else if (strcmp (argv[i], "--password") == 0 && i + 1 < argc)
+        password = argv[++i];
+      else if (strcmp (argv[i], "--kbd") == 0 && i + 1 < argc)
+        x.kbd_answer = argv[++i];
       else if (strcmp (argv[i], "--rekey") == 0)
         x.rekey = 1;
+      else if (strcmp (argv[i], "--no-auth") == 0)
+        x.no_auth = 1;
       else
         {
           fprintf (stderr, "bad option %s\n", argv[i]);
@@ -217,6 +289,26 @@ main (int argc, char **argv)
       cfg.prefs.sigalgs = &alg;
       cfg.prefs.nsigalgs = 1;
     }
+  if (keyfile)
+    {
+      char text[8192];
+      FILE *f = fopen (keyfile, "r");
+      size_t n;
+
+      if (f == NULL)
+        {
+          perror (keyfile);
+          return 2;
+        }
+      n = fread (text, 1, sizeof text, f);
+      fclose (f);
+      if (gf_key_from_openssh_private (&key, text, n) != GF_OK)
+        {
+          fprintf (stderr, "cannot read %s\n", keyfile);
+          return 2;
+        }
+      keys[0] = key;
+    }
 
   x.fd = socket (AF_INET, SOCK_STREAM, 0);
   memset (&sa, 0, sizeof sa);
@@ -235,19 +327,45 @@ main (int argc, char **argv)
   ev.established = on_established;
   ev.rekeyed = on_rekeyed;
   ev.service_accepted = on_service_accepted;
+  ev.extension = on_extension;
   ev.message = on_message;
   ev.closed = on_closed;
-  if (gf_conn_client_new (&x.c, &cfg, &ev) != GF_OK
-      || gf_conn_start (x.c, now_us ()) != GF_OK)
+  if (gf_conn_client_new (&x.c, &cfg, &ev) != GF_OK)
     {
       fprintf (stderr, "cannot start\n");
       return 2;
     }
+  if (!x.no_auth)
+    {
+      memset (&ac, 0, sizeof ac);
+      ac.user = user;
+      ac.keys = keyfile ? keys : NULL;
+      ac.nkeys = keyfile ? 1 : 0;
+      ac.password = password;
+      memset (&ae, 0, sizeof ae);
+      ae.user = &x;
+      ae.send = auth_send;
+      ae.banner = auth_banner;
+      ae.kbdint = x.kbd_answer ? auth_kbdint : NULL;
+      ae.authenticated = auth_ok;
+      ae.failed = auth_failed;
+      if (gf_auth_client_new (&x.auth, &ac, &ae) != GF_OK)
+        {
+          fprintf (stderr, "cannot start authentication\n");
+          return 2;
+        }
+    }
+  if (gf_conn_start (x.c, now_us ()) != GF_OK)
+    return 2;
   r = drive (x.c, x.fd, finished, &x, 20000);
   if (!gf_conn_is_closed (x.c))
     gf_conn_disconnect (x.c, now_us (), GF_DISCONNECT_BY_APPLICATION, "done");
-  printf ("DONE %d failures=%d rekeyed=%d\n", r, x.failures, x.rekeyed);
+  printf ("DONE %d authed=%d rekeyed=%d\n", r, x.authed, x.rekeyed);
+  gf_auth_client_free (x.auth);
   gf_conn_free (x.c);
+  gf_key_free (key);
   close (x.fd);
-  return finished (&x) && !x.bad && r >= 0 && (!x.rekey || x.rekeyed) ? 0 : 1;
+  if (x.no_auth)
+    return x.service && r >= 0 ? 0 : 1;
+  return x.authed && r >= 0 && (!x.rekey || x.rekeyed) ? 0 : 1;
 }

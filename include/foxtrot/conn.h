@@ -184,6 +184,10 @@ typedef struct gf_conn_config
      the connection.  */
   gf_key *const *host_keys;
   size_t nhost_keys;
+  /* Server: announce publickey-hostbound@openssh.com in EXT_INFO, so that
+     clients use the host-bound public key method (auth.h).  Set it only
+     if the authentication layer accepts that method.  */
+  int announce_hostbound;
   /* Rekey after this much traffic in either direction (0: 1 GiB), this
      many packets (0: 2^28), or this long since the last key exchange
      (0: one hour).  The first is RFC 4253 section 9's advice.  */

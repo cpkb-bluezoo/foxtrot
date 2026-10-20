@@ -39,7 +39,11 @@ Pre-alpha.  What exists today:
   conn      the transport: negotiation, key exchange, rekeying, EXT_INFO,
             service request; interoperating with OpenSSH 9.6
 
-Not yet written: user authentication, channels, SFTP.  See the manual
+  auth      user authentication (RFC 4252, RFC 4256): public key, also
+            host-bound, password and keyboard-interactive, client and
+            server; interoperating with OpenSSH 9.6
+
+Not yet written: channels and SFTP.  See the manual
 (doc/foxtrot.texi) for the design, security policy and roadmap.
 
 Building

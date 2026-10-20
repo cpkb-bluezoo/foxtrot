@@ -1,0 +1,268 @@
+/* Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+   This file is part of foxtrot.
+
+   foxtrot is free software: you can redistribute it and/or modify it
+   under the terms of the GNU General Public License as published
+   by the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   foxtrot is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License for more details.
+
+   You should have received a copy of the GNU General Public
+   License along with this program.  If not, see
+   <https://www.gnu.org/licenses/>.  */
+
+/* User authentication (RFC 4252, RFC 4256), as client and server state
+   machines.
+
+   They sit on top of the transport (conn.h) but do not depend on it.  The
+   application routes the messages numbered 50 to 79 that gf_conn delivers
+   to gf_auth_server_input or gf_auth_client_input, and each machine sends
+   its own through a send callback, normally gf_conn_send.  Time is a
+   caller-supplied clock in microseconds, as everywhere.
+
+   Methods:
+
+     none                  only to learn the methods a server offers
+     publickey             RFC 4252 section 7: the client first asks
+                           whether a key would be accepted, then signs;
+                           the signature covers the session identifier
+     publickey-hostbound-v00@openssh.com
+                           the same, with the server's host key in the
+                           signed data, so that a signature made for one
+                           server cannot be replayed to another by a
+                           forwarding agent
+     password              RFC 4252 section 8, without password change
+     keyboard-interactive  RFC 4256
+
+   Not implemented: hostbased (it trusts a client machine's identity on
+   the word of its administrator and the DNS), and password change (a
+   request to change the password is refused).  A signature algorithm
+   is only ever one of policy.h: a client cannot sign, and a server
+   will not accept, an ssh-rsa signature.
+
+   The server's side is asynchronous.  A request is handed to the
+   application, which decides now or later and answers with one of
+   gf_auth_server_accept, _reject, _pk_ok or _kbdint_prompt.  Everything
+   that can be checked without the application is checked first: the
+   encoding, the algorithm against the key, the key against the policy, and
+   the signature.  The application therefore only sees signed requests
+   whose signature is valid, and only has to say whether it trusts the key
+   for the user.
+
+   Limits: a server ends the connection after max_failures failed
+   attempts (default 6; a "none" request and a public key query are not
+   attempts), and after a grace time (default 120 s) without success.  A
+   client gives up after max_attempts requests.  */
+
+#ifndef FOXTROT_AUTH_H
+#define FOXTROT_AUTH_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <foxtrot/key.h>
+#include <foxtrot/policy.h>
+#include <foxtrot/wire.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum gf_auth_msg
+{
+  GF_MSG_USERAUTH_REQUEST = 50,
+  GF_MSG_USERAUTH_FAILURE = 51,
+  GF_MSG_USERAUTH_SUCCESS = 52,
+  GF_MSG_USERAUTH_BANNER = 53,
+  GF_MSG_USERAUTH_PK_OK = 60,		/* Also INFO_REQUEST, PASSWD_CHANGEREQ.  */
+  GF_MSG_USERAUTH_INFO_RESPONSE = 61
+};
+
+/* The service user authentication opens.  */
+#define GF_SERVICE_CONNECTION "ssh-connection"
+
+/* Methods, as bits: for what a server offers and a client may try.  */
+enum gf_auth_method
+{
+  GF_AUTH_NONE = 1,
+  GF_AUTH_PUBLICKEY = 2,
+  GF_AUTH_PASSWORD = 4,
+  GF_AUTH_KBDINT = 8
+};
+
+#define GF_AUTH_HOSTBOUND_METHOD "publickey-hostbound-v00@openssh.com"
+#define GF_AUTH_HOSTBOUND_EXTENSION "publickey-hostbound@openssh.com"
+
+/* The most prompts or responses of one keyboard-interactive round.  */
+#define GF_AUTH_MAX_PROMPTS 32
+/* The longest user name.  */
+#define GF_AUTH_MAX_USER 255
+
+/* ================================================================== */
+/* Server                                                             */
+/* ================================================================== */
+
+typedef struct gf_auth_request
+{
+  enum gf_auth_method method;
+  gf_slice user;
+  gf_slice service;
+  /* GF_AUTH_PUBLICKEY: the key, and the algorithm of the signature.  If
+     HAS_SIGNATURE the signature is present and has been verified; the
+     request is then the final one and the answer is accept or reject.
+     Otherwise it asks whether the key would be accepted: answer
+     gf_auth_server_pk_ok or gf_auth_server_reject.  */
+  const gf_key *key;
+  enum gf_sigalg sigalg;
+  int has_signature;
+  int hostbound;
+  /* GF_AUTH_PASSWORD.  Valid only during the call: copy it if it is needed
+     later, and wipe the copy.  */
+  gf_slice password;
+  /* GF_AUTH_KBDINT: the submethods the client asked for.  */
+  gf_slice submethods;
+} gf_auth_request;
+
+typedef struct gf_auth_server_events
+{
+  void *user;
+  /* Send a message (to gf_conn_send).  Required.  Nonzero fails.  */
+  int (*send) (void *user, const uint8_t *payload, size_t len);
+  /* A request to decide.  Required.  The request and what it points to are
+     valid only during the call.  Answer inside it or later.  */
+  int (*request) (void *user, const gf_auth_request *req);
+  /* Keyboard-interactive: the client answered the prompts.  Valid only
+     during the call.  Answer as for a request.  Required if the method is
+     offered.  */
+  int (*kbdint_response) (void *user, const gf_slice *responses, size_t n);
+  /* Authentication succeeded for USER.  The service is ssh-connection.  */
+  int (*authenticated) (void *user, gf_slice username);
+  /* The machine wants the connection ended, for REASON (an
+     enum gf_disconnect value).  Required.  */
+  int (*disconnect) (void *user, uint32_t reason);
+} gf_auth_server_events;
+
+typedef struct gf_auth_server_config
+{
+  unsigned methods;		/* Offered methods; 0: publickey.  */
+  int hostbound;		/* Accept the host-bound public key method.  */
+  unsigned max_failures;	/* 0: 6.  */
+  uint64_t grace_us;		/* 0: 120 seconds.  */
+} gf_auth_server_config;
+
+typedef struct gf_auth_server gf_auth_server;
+
+int gf_auth_server_new (gf_auth_server **out,
+                        const gf_auth_server_config *config,
+                        const gf_auth_server_events *events);
+void gf_auth_server_free (gf_auth_server *a);
+
+/* Tell it the session identifier and our host key blob once the
+   transport is established (gf_conn_info).  Starts the grace time.  */
+int gf_auth_server_start (gf_auth_server *a, uint64_t now_us,
+                          const uint8_t *session_id, size_t session_id_len,
+                          const uint8_t *host_key_blob, size_t host_key_len);
+
+/* A message numbered 50 to 79 from the client.  Returns GF_OK, or an error
+   after which the machine has asked for the connection to be ended.  */
+int gf_auth_server_input (gf_auth_server *a, uint64_t now_us,
+                          const uint8_t *payload, size_t len);
+
+/* Answers.  Each is valid once, after a request.  */
+int gf_auth_server_accept (gf_auth_server *a, uint64_t now_us);
+int gf_auth_server_reject (gf_auth_server *a, uint64_t now_us,
+                           int partial_success);
+int gf_auth_server_pk_ok (gf_auth_server *a, uint64_t now_us);
+/* Ask the client NPROMPTS questions.  PROMPTS are NUL-terminated UTF-8;
+   ECHO says which answers may be shown as typed.  */
+int gf_auth_server_kbdint_prompt (gf_auth_server *a, uint64_t now_us,
+                                  const char *name, const char *instruction,
+                                  size_t nprompts, const char *const *prompts,
+                                  const int *echo);
+
+/* Send a banner (RFC 4252 section 5.4), UTF-8 and without control
+   characters.  Allowed before success.  */
+int gf_auth_server_banner (gf_auth_server *a, uint64_t now_us,
+                           const char *text);
+
+uint64_t gf_auth_server_timeout (const gf_auth_server *a);
+int gf_auth_server_on_timeout (gf_auth_server *a, uint64_t now_us);
+int gf_auth_server_is_done (const gf_auth_server *a);
+
+/* ================================================================== */
+/* Client                                                             */
+/* ================================================================== */
+
+typedef struct gf_auth_client_events
+{
+  void *user;
+  int (*send) (void *user, const uint8_t *payload, size_t len);
+  /* A banner from the server.  The text is the server's and may contain
+     terminal control sequences: sanitize it.  Optional.  */
+  void (*banner) (void *user, gf_slice text);
+  /* Keyboard-interactive prompts.  Answer with gf_auth_client_kbdint_respond
+     inside the call or later.  If this is NULL the method is not tried.
+     PROMPTS and the text are valid only during the call.  */
+  int (*kbdint) (void *user, gf_slice name, gf_slice instruction,
+                 size_t nprompts, const gf_slice *prompts, const int *echo);
+  /* Authentication succeeded.  */
+  int (*authenticated) (void *user);
+  /* Nothing is left to try, or max_attempts is used up.  Required.  The
+     application normally disconnects.  */
+  int (*failed) (void *user);
+} gf_auth_client_events;
+
+typedef struct gf_auth_client_config
+{
+  const char *user;		/* Required, UTF-8.  */
+  /* The keys to offer, in order.  Each must have a private part.  */
+  const gf_key *const *keys;
+  size_t nkeys;
+  /* The password, or NULL.  It must stay valid while authenticating; wipe
+     it afterwards.  */
+  const char *password;
+  /* Methods to try; 0: public key, then keyboard-interactive if the event
+     is set, then password.  */
+  unsigned methods;
+  unsigned max_attempts;	/* 0: 6.  */
+} gf_auth_client_config;
+
+typedef struct gf_auth_client gf_auth_client;
+
+int gf_auth_client_new (gf_auth_client **out,
+                        const gf_auth_client_config *config,
+                        const gf_auth_client_events *events);
+void gf_auth_client_free (gf_auth_client *a);
+
+/* The server's extensions (RFC 8308), from the transport's extension
+   event: "server-sig-algs" limits the RSA hash the client uses, and
+   "publickey-hostbound@openssh.com" switches to the host-bound method.
+   Others are ignored.  Call before start.  */
+int gf_auth_client_extension (gf_auth_client *a, gf_slice name, gf_slice value);
+
+/* Begin: the session identifier and the host key blob of the connection
+   (gf_conn_info), and send the first request.  Call once the service
+   request was accepted.  */
+int gf_auth_client_start (gf_auth_client *a, uint64_t now_us,
+                          const uint8_t *session_id, size_t session_id_len,
+                          const uint8_t *host_key_blob, size_t host_key_len);
+
+int gf_auth_client_input (gf_auth_client *a, uint64_t now_us,
+                          const uint8_t *payload, size_t len);
+
+/* Answer keyboard-interactive prompts: one response per prompt.  */
+int gf_auth_client_kbdint_respond (gf_auth_client *a, uint64_t now_us,
+                                   size_t n, const char *const *responses);
+
+int gf_auth_client_is_done (const gf_auth_client *a);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FOXTROT_AUTH_H */

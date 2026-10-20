@@ -3,3 +3,4 @@ foxtrot NEWS - history of user-visible changes.
 * Noteworthy changes in release ?.? (????-??-??) [?]
 
 ** First development version.
+** User authentication: gf_auth_server and gf_auth_client.

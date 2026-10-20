@@ -439,9 +439,14 @@ send_ext_info (gf_conn *c)
     }
   gf_writer_init (&w, buf, sizeof buf);
   gf_wr_u8 (&w, GF_MSG_EXT_INFO);
-  gf_wr_u32 (&w, 1);
+  gf_wr_u32 (&w, c->cfg.announce_hostbound ? 2 : 1);
   gf_wr_cstring (&w, "server-sig-algs");
   gf_wr_string (&w, list, n);
+  if (c->cfg.announce_hostbound)
+    {
+      gf_wr_cstring (&w, "publickey-hostbound@openssh.com");
+      gf_wr_cstring (&w, "0");
+    }
   if (gf_wr_status (&w) != GF_OK)
     return GF_ERR_BUFSIZE;
   return send_packet (c, buf, w.len);

@@ -40,6 +40,8 @@ struct msg
   size_t len;
 };
 
+struct end;
+
 struct end
 {
   gf_conn *c;
@@ -57,6 +59,12 @@ struct end
   int unimpl_calls;
   int debug_calls;
   gf_conn_info info;
+  /* Optional hooks, for the tests of the layers above.  */
+  int (*on_established) (struct end *e);
+  int (*on_service_accepted) (struct end *e);
+  int (*on_extension) (struct end *e, gf_slice name, gf_slice value);
+  int (*on_message) (struct end *e, const uint8_t *p, size_t n);
+  void *hook;
 };
 
 static uint64_t tst_now = 1000000;
@@ -93,7 +101,7 @@ end_established (void *user, const gf_conn_info *info)
 
   e->established++;
   e->info = *info;
-  return 0;
+  return e->on_established ? e->on_established (e) : 0;
 }
 
 static int
@@ -111,6 +119,8 @@ end_message (void *user, const uint8_t *p, size_t n)
 {
   struct end *e = user;
 
+  if (e->on_message)
+    return e->on_message (e, p, n);
   if (e->nmsgs == e->capmsgs)
     {
       e->capmsgs = e->capmsgs ? e->capmsgs * 2 : 16;
@@ -131,7 +141,7 @@ end_service_accepted (void *user, gf_slice name)
   e->accepted++;
   snprintf (e->service, sizeof e->service, "%.*s", (int) name.len,
             (const char *) name.data);
-  return 0;
+  return e->on_service_accepted ? e->on_service_accepted (e) : 0;
 }
 
 static int
@@ -153,7 +163,7 @@ end_extension (void *user, gf_slice name, gf_slice value)
   snprintf (e->extension + used, sizeof e->extension - used, "%.*s=%.*s;",
             (int) name.len, (const char *) name.data, (int) value.len,
             (const char *) value.data);
-  return 0;
+  return e->on_extension ? e->on_extension (e, name, value) : 0;
 }
 
 static void

@@ -109,12 +109,14 @@ why for each.
 @item @file{kex.h} @tab Key exchange values, the exchange hash and key derivation.
 @item @file{key.h} @tab Host and user keys: blobs, signatures, OpenSSH private key files.
 @item @file{conn.h} @tab The transport as a state machine.
+@item @file{auth.h} @tab User authentication, client and server.
 @end multitable
 
 Each header below @file{conn.h} can be used on its own and is tested on
-its own.  @file{conn.h} ties them together.  Layers above it -- user
-authentication, channels, SFTP -- see only messages numbered 50 and up
-through one callback and send with @code{gf_conn_send}; see @ref{Roadmap}.
+its own.  @file{conn.h} ties them together.  Layers above it see only
+messages numbered 50 and up through one callback and send with
+@code{gf_conn_send}.  @file{auth.h} is the first of them; channels and
+SFTP are still to come (@pxref{Roadmap}).
 
 @node Crypto
 @section Crypto: libgcrypt only
@@ -192,6 +194,7 @@ rejected by name.
 * Ciphers::
 * Strict key exchange::
 * Rekeying::
+* Authentication::
 * Other rules::
 @end menu
 
@@ -291,6 +294,57 @@ connection.  Between a peer's KEXINIT and its NEWKEYS the peer may send
 only transport and key exchange messages.  Application messages sent
 during our own key exchange are held and sent after it, up to 1 MiB.
 
+@node Authentication
+@section Authentication
+@cindex authentication, user
+
+@file{auth.h} implements RFC 4252 and RFC 4256 as client and server
+state machines that the application attaches to the transport: it hands
+them the messages numbered 50 to 79 and they send theirs through a
+callback.  The methods are @samp{none} (only to learn what is offered),
+@samp{publickey}, @samp{publickey-hostbound-v00@@openssh.com},
+@samp{password} and @samp{keyboard-interactive}.
+
+@itemize @bullet
+@item
+A public key request is checked before the application sees it: the
+encoding, the algorithm (one of @file{policy.h}; @samp{ssh-rsa} and the
+rest are not there to be offered), that the key is one the policy accepts
+and of the type the algorithm says, and the signature over the session
+identifier.  The application only has to say whether it trusts the key for
+the user.  A query (a request without a signature) asks only that.
+@item
+The host-bound method puts the server's host key in the signed data, so a
+signature obtained for one server cannot be replayed to another through a
+forwarding agent.  The server announces it in EXT_INFO
+(@code{announce_hostbound} in the connection's configuration) and the
+client then uses it; a request that names a different host key is refused.
+@item
+Password change is not supported: such a request fails without the
+application seeing it.  Hostbased authentication is not implemented.
+@item
+A server ends the connection after six failed attempts (configurable); a
+@samp{none} request and a public key query are not attempts.  It also ends
+it if the user is not authenticated within 120 seconds, if the user name
+or the service changes between requests, if a second request arrives
+while the application is still deciding on the first, or if anything
+else is malformed.  The user name is UTF-8 and at most 255 bytes.
+@item
+After success, further requests are ignored.
+@item
+The password is in the received packet only for the duration of the
+callback, and the transport wipes its buffer after each packet; the
+application should copy and wipe it as it needs.
+@end itemize
+
+The server's answers are asynchronous so that the application can ask a
+database or another process: it answers a request now or later with
+@code{gf_auth_server_accept}, @code{_reject}, @code{_pk_ok} or
+@code{_kbdint_prompt}.  A client tries its keys in order, asking first
+whether each would be accepted, then keyboard-interactive if it can answer,
+then the password, within the methods the server says continue, and uses
+the RSA hash the server lists in @code{server-sig-algs}.
+
 @node Other rules
 @section Other rules
 
@@ -328,13 +382,11 @@ EXT_INFO and the service request.  Verified against OpenSSH 9.6 in both
 directions.
 
 @item
-@strong{Next.}  User authentication (RFC 4252): @samp{none},
-@samp{publickey} (with the query, and with
-@samp{publickey-hostbound-v00@@openssh.com}) and @samp{password}, as
-client and server state machines; then keyboard-interactive (RFC 4256).
-Rekeying against OpenSSH becomes testable once this exists, since sshd
-refuses it before authentication.  Hostbased authentication will not be
-implemented.
+@strong{Done.}  User authentication (RFC 4252, RFC 4256): public key with
+the query and the host-bound variant, password and keyboard-interactive,
+as client and server state machines.  Verified against OpenSSH 9.6 in both
+directions, including rekeying after authentication.  Hostbased
+authentication will not be implemented.
 
 @item
 The connection protocol (RFC 4254): channels with flow control, requests
