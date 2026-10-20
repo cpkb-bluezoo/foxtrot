@@ -1,0 +1,79 @@
+foxtrot
+=======
+
+foxtrot is an SSH-2 engine written in C for the GNU system: the transport
+layer (RFC 4253), user authentication (RFC 4252), the connection protocol
+(RFC 4254) and SFTP.  It is the substrate on which SSH and SFTP clients and
+servers are meant to be built.
+
+It is a sibling of quickstep (QUIC and TLS) and follows the same design: a
+thin cryptographic layer over libgcrypt, incremental push parsers that
+deliver semantic events, and reactive state machines that never block and
+never own a socket.  The library does no I/O.  The caller reads bytes from
+its transport and hands them in; the library calls back with the bytes to
+write.
+
+Like quickstep it deliberately refuses what is known to be insecure.  The
+aim is a complete, conformant, secure-by-design implementation, not one that
+is interoperable with every legacy system: no SSH-1, no CBC or CTR
+ciphers, no separate MACs, no SHA-1, no finite-field Diffie-Hellman, no
+ssh-rsa or DSA, no compression, and Strict KEX (the Terrapin countermeasure)
+is mandatory.  See the manual (doc/foxtrot.texi) for the security policy.
+
+Status
+------
+
+Pre-alpha.  What exists today:
+
+  wire      the data types of RFC 4251 (string, mpint, name-list)
+  policy    the closed set of key exchanges, signatures and ciphers
+  ident     the protocol version exchange
+  packet    the binary packet protocol: chacha20-poly1305@openssh.com,
+            aes256-gcm@openssh.com, aes128-gcm@openssh.com
+  kexinit   SSH_MSG_KEXINIT and negotiation; strict key exchange required
+  kex       mlkem768x25519, sntrup761x25519, mlkem768nistp256,
+            mlkem1024nistp384, curve25519 and ECDH P-256/P-384; exchange
+            hash and key derivation
+  key       Ed25519, ECDSA P-256/P-384 and RSA host and user keys; OpenSSH
+            private key files
+  conn      the transport: negotiation, key exchange, rekeying, EXT_INFO,
+            service request; interoperating with OpenSSH 9.6
+
+Not yet written: user authentication, channels, SFTP.  See the manual
+(doc/foxtrot.texi) for the design, security policy and roadmap.
+
+Building
+--------
+
+Requires libgcrypt >= 1.12.
+
+  ./autogen.sh        # only when building from a repository checkout
+  ./configure
+  make
+  make check
+
+autogen.sh needs autoconf, automake, libtool and gettext (autopoint).
+The build is expected to be free of compiler warnings.
+
+Reporting bugs
+--------------
+
+Report bugs, including documentation bugs, to <dog@gnu.org>.
+
+Licence
+-------
+
+foxtrot is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.  See COPYING.
+
+It is released under the GPL, not the LGPL: a program that links against
+libfoxtrot is a combined work and must itself be distributed under the
+GPL, or a licence compatible with it, when it is distributed.  The
+libraries it builds on, libgcrypt and GnuTLS, are LGPL version 2.1 or later
+and are compatible with this.
+
+Copyright is held by the authors until assigned to the Free Software
+Foundation.  Contributions will need a copyright assignment before they
+can be accepted.  See HACKING.

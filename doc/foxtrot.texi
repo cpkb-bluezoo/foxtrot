@@ -1,0 +1,378 @@
+\input texinfo   @c -*-texinfo-*-
+@c %**start of header
+@setfilename foxtrot.info
+@include version.texi
+@settitle foxtrot @value{VERSION}
+@documentencoding UTF-8
+@c %**end of header
+
+@copying
+This manual is for foxtrot (version @value{VERSION}, @value{UPDATED}),
+an SSH engine written in C.
+
+Copyright @copyright{} 2026 Chris Burdess.
+
+@quotation
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3 or
+any later version published by the Free Software Foundation; with no
+Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.  A
+copy of the license is included in the section entitled ``GNU Free
+Documentation License''.
+@end quotation
+@end copying
+
+@dircategory Software libraries
+@direntry
+* foxtrot: (foxtrot).          SSH and SFTP engine.
+@end direntry
+
+@titlepage
+@title foxtrot
+@subtitle An SSH and SFTP engine in C
+@subtitle for version @value{VERSION}, @value{UPDATED}
+@author Chris Burdess
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+
+@contents
+
+@ifnottex
+@node Top
+@top foxtrot
+
+@insertcopying
+@end ifnottex
+
+@menu
+* Introduction::          What foxtrot is and is not.
+* Design::                Layers, the push-parser contract, layout.
+* Security policy::       What is negotiated, and what is absent.
+* Roadmap::               Implementation status and plans.
+* Internationalization::  Message catalogues.
+* GNU Free Documentation License::  Copying this manual.
+* Concept index::
+@end menu
+
+@node Introduction
+@chapter Introduction
+@cindex foxtrot
+
+foxtrot is an engine for the Secure Shell protocol (SSH-2), written in C
+for the GNU system.  It is the SSH counterpart of quickstep, which does the
+same for QUIC and TLS, and is meant to be the substrate on which SSH and
+SFTP clients and servers are built.
+
+It is designed in the same way.  A thin cryptographic layer over
+libgcrypt; incremental parsers that deliver semantic events; reactive state
+machines that never block and never own a socket.  The library does no I/O.
+The caller reads bytes from its transport and hands them to
+@code{gf_conn_receive}, and the connection calls back with the bytes to
+write.  Time is a caller-supplied clock in microseconds.  Because nothing is
+hidden in the library, the same code runs under any event loop, in tests
+with a virtual clock and in-memory pipes, and in programs that cannot have a
+thread or a signal handler.
+
+It is also deliberately incomplete.  Like quickstep it refuses what is
+known to be insecure.  The aim is a complete, conformant, secure-by-design
+implementation rather than one that is interoperable with every legacy
+system.  There is no SSH-1, no CBC or CTR cipher, no separate MAC, no
+finite-field Diffie-Hellman, no SHA-1 and no @samp{ssh-rsa}; a peer that can
+speak nothing else is refused, and the chapter @ref{Security policy} says
+why for each.
+
+@node Design
+@chapter Design
+
+@menu
+* Layers::
+* Crypto::
+* The push-parser contract::
+* Source layout::
+* Testing::
+@end menu
+
+@node Layers
+@section Layers
+
+@multitable @columnfractions .2 .8
+@headitem Header @tab What it is
+@item @file{status.h} @tab Status codes.  Failures are negative, @code{GF_NEED_MORE} is positive and is not an error.
+@item @file{crypto.h} @tab Initialization, random bytes, constant-time compare, wiping, hashes.
+@item @file{wire.h} @tab The data types of RFC 4251: string, mpint, name-list; a reader and a writer.
+@item @file{policy.h} @tab The closed lists of key exchange methods, signature algorithms and ciphers.
+@item @file{ident.h} @tab The protocol version exchange (RFC 4253 section 4.2).
+@item @file{packet.h} @tab The binary packet protocol: AEAD sealing and opening, sequence numbers.
+@item @file{kexinit.h} @tab SSH_MSG_KEXINIT and algorithm negotiation.
+@item @file{kex.h} @tab Key exchange values, the exchange hash and key derivation.
+@item @file{key.h} @tab Host and user keys: blobs, signatures, OpenSSH private key files.
+@item @file{conn.h} @tab The transport as a state machine.
+@end multitable
+
+Each header below @file{conn.h} can be used on its own and is tested on
+its own.  @file{conn.h} ties them together.  Layers above it -- user
+authentication, channels, SFTP -- see only messages numbered 50 and up
+through one callback and send with @code{gf_conn_send}; see @ref{Roadmap}.
+
+@node Crypto
+@section Crypto: libgcrypt only
+
+Every primitive is libgcrypt's: SHA-2, ChaCha20, Poly1305, AES-GCM, X25519,
+ECDH on P-256 and P-384, ML-KEM, sntrup761, Ed25519, ECDSA and RSA.
+foxtrot adds the glue SSH defines: the OpenSSH ChaCha20-Poly1305
+construction and the RFC 5647 AES-GCM one in @file{src/packet.c}, the
+hybrid key exchange composition in @file{src/kex.c}, and the SSH
+signature formats in @file{src/key.c}.  libgcrypt 1.12 or later is
+required, the first whose ML-KEM is the final FIPS 203.
+
+There is no MD5 and no SHA-1 anywhere, not even for fingerprints
+(@samp{SHA256:}), and no HMAC, since every cipher is AEAD.  GnuTLS is
+configured with @option{--with-gnutls} but nothing uses it yet; it is
+reserved for the X.509 key formats of RFC 6187.
+
+libgcrypt's ECDH takes any point it is given.  An invalid-curve attack is
+what that invites, so foxtrot checks the peer's point itself before the
+agreement (@code{gfi_ec_point_ok}), and a test pins this.
+
+@node The push-parser contract
+@section The push-parser contract
+
+The binary packet reader (@code{gf_packet_receive}) takes the stream so far
+and consumes whole packets, decrypting them in place; a partial packet
+leaves the buffer at its start and returns @code{GF_NEED_MORE}.  The length
+of a packet is validated as soon as the first four bytes can be read (for
+ChaCha20-Poly1305, as soon as they can be decrypted), so a forged length is
+refused before any of the packet it announces has to arrive.  A packet is
+all-or-nothing: no byte of it is delivered before its tag has verified.
+@code{gf_conn_receive} holds the partial tail internally and wipes each
+packet from its buffer after use.
+
+@node Source layout
+@section Source layout
+
+Public headers are in @file{include/foxtrot}; sources, in @file{src}, are
+one file per header, plus @file{internal.h} for the @code{gfi_} symbols.
+Unit tests are in @file{tests}, interoperability programs in
+@file{integration}.  Test vectors are generated by Python scripts that
+use libraries independent of libgcrypt.
+
+@node Testing
+@section Testing
+
+@code{make check} runs the unit tests: known answers from independent
+implementations (OpenSSL through python's cryptography package, and
+OpenSSH's @command{ssh-keygen}) for the packet layer, the keys and the key
+derivation; every key exchange method between a client and a server in
+memory with every cipher; delivery in every chunk size; rekeying by
+request, by packet count, by byte count and by time; a scripted client that
+completes a real key exchange and then sends the server what it must refuse;
+and the Terrapin attack's injection and deletion.  Each protection was
+checked by removing it and seeing a test fail.
+
+@code{make check-integration} runs foxtrot's client against OpenSSH's
+@command{sshd} and OpenSSH's @command{ssh} against foxtrot's server, for
+the algorithms they share, and checks that every algorithm foxtrot
+refuses is refused.
+
+@node Security policy
+@chapter Security policy
+@cindex security policy
+
+Every item below is absent by design, not disabled by default.  The lists
+are stated as code in @file{include/foxtrot/policy.h}, and
+@file{tests/test-policy.c} asserts that everything excluded here is
+rejected by name.
+
+@menu
+* Protocol version::
+* Key exchange::
+* Host keys and signatures::
+* Ciphers::
+* Strict key exchange::
+* Rekeying::
+* Other rules::
+@end menu
+
+@node Protocol version
+@section Protocol version
+
+SSH 2.0 only.  An identification line that says 1.99 (which means
+``compatible with SSH-1'') or 1.x is refused, and so is a line that does
+not end in CR LF, contains a NUL or a byte outside printable ASCII, or is
+over 255 bytes.  A client skips text a server sends before its line, up to
+16 KiB; a server skips none.
+
+@node Key exchange
+@section Key exchange
+
+@multitable @columnfractions .45 .55
+@headitem Method @tab Where
+@item @code{mlkem768x25519-sha256} @tab draft-ietf-sshm-mlkem-hybrid-kex
+@item @code{sntrup761x25519-sha512} (and @code{@dots{}@@openssh.com}) @tab draft-ietf-sshm-ntruprime-ssh
+@item @code{mlkem768nistp256-sha256}, @code{mlkem1024nistp384-sha384} @tab draft-ietf-sshm-mlkem-hybrid-kex
+@item @code{curve25519-sha256} @tab RFC 8731
+@item @code{ecdh-sha2-nistp256}, @code{ecdh-sha2-nistp384} @tab RFC 5656
+@end multitable
+
+The post-quantum hybrids come first in the default preference.  There is no
+pure post-quantum method: a hybrid also holds if the post-quantum half were
+broken.  Absent: every @code{diffie-hellman-group*} method and group
+exchange (finite-field groups with negotiable or weak parameters, and the
+Logjam family), all of SHA-1, @code{ecdh-sha2-nistp521},
+@code{curve25519-sha256@@libssh.org} (the pre-RFC name), and GSS-API key
+exchange.
+
+The shared secret of a plain method is an mpint; of a hybrid, the hash of
+the two secrets as a string, as the drafts say.  An X25519 result of all
+zeros is refused on both sides (RFC 7748 section 6.1) and so is an ECDH
+point that is not on its curve.
+
+@node Host keys and signatures
+@section Host keys and signatures
+
+@multitable @columnfractions .35 .65
+@headitem Algorithm @tab Rule
+@item @code{ssh-ed25519} @tab A non-canonical S (not less than the group order) is rejected.
+@item @code{ecdsa-sha2-nistp256}, @code{-nistp384} @tab The point must be uncompressed and on the curve.
+@item @code{rsa-sha2-256}, @code{rsa-sha2-512} @tab Modulus 2048 to 16384 bits, odd; exponent odd and at least 65537.
+@end multitable
+
+Absent: @code{ssh-rsa} (RSA with SHA-1) and the SHA-1 signatures of the
+@code{sk-} and certificate types, @code{ssh-dss}, ECDSA over P-521, Ed448,
+and RSA keys under 2048 bits.  The key type name @samp{ssh-rsa} appears in
+an RSA key's blob and is accepted there; the signature algorithm
+@samp{ssh-rsa} is refused, and a signature's name must be the algorithm
+that was negotiated.  OpenSSH certificates, security-key types and X.509
+(RFC 6187) are not supported yet.
+
+A client has no default trust in a host key.  The signature on the exchange
+hash is verified first, then the application is asked through the
+@code{host_key} callback; a client without one refuses every key.  At a
+rekey the server must present the same key.
+
+@node Ciphers
+@section Ciphers
+
+@code{chacha20-poly1305@@openssh.com}, @code{aes256-gcm@@openssh.com},
+@code{aes128-gcm@@openssh.com}.  ChaCha20-Poly1305 is first: it hides the
+packet length and does not depend on AES hardware.
+
+Absent: every CBC and CTR cipher (CBC's padding oracle, and the
+unauthenticated length that made Terrapin and the plaintext-recovery
+attacks on SSH possible), RC4, 3DES, Blowfish, CAST, the @samp{none}
+cipher, and all separate MACs including the encrypt-then-MAC ones.  The MAC
+lists of KEXINIT are empty when sent and ignored when received.  Compression
+is absent too (@samp{none} only): zlib before authentication was an attack
+surface, and after it still leaks lengths.
+
+@node Strict key exchange
+@section Strict key exchange
+
+The Terrapin attack (CVE-2023-48795) deletes or inserts packets in the
+unauthenticated start of a connection.  OpenSSH's countermeasure, which
+foxtrot @emph{requires}, has both sides declare it
+(@code{kex-strict-c-v00@@openssh.com} and @code{kex-strict-s-v00@@openssh.com})
+and then: the first packet each way must be KEXINIT; during the first key
+exchange nothing but key exchange messages is accepted (so no IGNORE, DEBUG
+or UNIMPLEMENTED to pad the transcript); and the sequence numbers restart at
+zero at every NEWKEYS.  A peer that does not declare it is refused rather
+than served without protection.
+
+@node Rekeying
+@section Rekeying
+
+A connection rekeys after 1 GiB in either direction, 2^28 packets, or an
+hour, whichever comes first (all configurable downwards or upwards), and
+whenever the peer starts one.  The packet layer refuses to let a sequence
+number wrap.  A key exchange that does not finish in 60 seconds ends the
+connection.  Between a peer's KEXINIT and its NEWKEYS the peer may send
+only transport and key exchange messages.  Application messages sent
+during our own key exchange are held and sent after it, up to 1 MiB.
+
+@node Other rules
+@section Other rules
+
+@itemize @bullet
+@item
+@code{first_kex_packet_follows} is never set, and a peer that sets it is
+refused: an optimistic guess is a key exchange message sent before
+agreement.
+@item
+A user name or text field in a transport message must not contain NUL
+(and, where RFC 4251 says UTF-8, must be valid UTF-8).
+@item
+Disconnect descriptions sent to the peer are fixed English text; they never
+carry local detail.  Descriptions and debug text received from a peer are
+untrusted and may contain terminal escape sequences.
+@item
+Key material is wiped after use, and so is each decrypted packet once
+handled.  The library never logs.
+@end itemize
+
+@node Roadmap
+@chapter Roadmap
+
+Each step is tested against independent implementations before the next
+one starts.
+
+@enumerate
+@item
+@strong{Done.}  Status codes, wire types, policy, identification exchange,
+the binary packet protocol for the three AEAD ciphers (OpenSSL known
+answers), KEXINIT and negotiation, the seven key exchange methods with the
+exchange hash and key derivation, Ed25519, ECDSA and RSA keys (OpenSSH and
+OpenSSL known answers), and the transport state machine with rekeying,
+EXT_INFO and the service request.  Verified against OpenSSH 9.6 in both
+directions.
+
+@item
+@strong{Next.}  User authentication (RFC 4252): @samp{none},
+@samp{publickey} (with the query, and with
+@samp{publickey-hostbound-v00@@openssh.com}) and @samp{password}, as
+client and server state machines; then keyboard-interactive (RFC 4256).
+Rekeying against OpenSSH becomes testable once this exists, since sshd
+refuses it before authentication.  Hostbased authentication will not be
+implemented.
+
+@item
+The connection protocol (RFC 4254): channels with flow control, requests
+(@samp{exec}, @samp{shell}, @samp{subsystem}, @samp{pty-req}, @samp{env},
+@samp{window-change}, signals, exit status), and direct and forwarded TCP.
+Agent forwarding and X11 forwarding are not planned: both extend the
+trust of the connection to a machine's other credentials.
+
+@item
+SFTP version 3 (draft-ietf-secsh-filexfer-02, the version in use) as a
+packet codec and client and server state machines over a channel, with
+the file system left to the application.
+
+@item
+A session object tying the transport, authentication and channels together
+with one event interface.
+
+@item
+OpenSSH certificates, FIDO security keys, passphrase-protected private key
+files (which needs bcrypt-pbkdf, not in libgcrypt), a @file{known_hosts}
+parser, and the X.509 formats of RFC 6187 through GnuTLS.
+@end enumerate
+
+@node Internationalization
+@chapter Internationalization
+
+Every string a person might read is wrapped in @code{_()} and looked up in
+the @samp{foxtrot} domain; text sent to a peer is not translated.
+@code{gf_crypto_init} binds the domain to the installed catalogues.
+
+@node GNU Free Documentation License
+@appendix GNU Free Documentation License
+
+@include fdl.texi
+
+@node Concept index
+@unnumbered Concept index
+
+@printindex cp
+
+@bye

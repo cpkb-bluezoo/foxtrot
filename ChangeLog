@@ -1,0 +1,3 @@
+This file is a placeholder.  In a checkout, see the git history
+(git log) for change details.  "make dist" replaces this file in the
+distributed tarball with one generated from that history.
