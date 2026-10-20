@@ -30,9 +30,11 @@
    SHA-1) and x509v3-ssh-dss, the P-521 curve, keys the policy would not
    take outside a certificate (RSA under 2048 bits), and any chain that
    GnuTLS finds to be signed with an algorithm it considers broken.
-   OCSP responses that come with the chain are parsed and ignored:
-   revocation is checked against the CRLs the application gives the trust
-   store, and nothing is fetched from anywhere.
+   Revocation is checked against the CRLs the application gives the trust
+   store, and against the OCSP responses that came with the chain (stapled,
+   as RFC 6187 provides).  Nothing is fetched from anywhere: a server gets its
+   own responses by whatever means it has and attaches them
+   (gf_key_with_x509_ocsp), and a client uses what it is shown.
 
    Without GnuTLS (configure --without-gnutls) these keys are not
    available and every function here returns GF_ERR_UNAVAILABLE.  */
@@ -64,6 +66,18 @@ int gf_x509_chain_cert (const gf_key *key, size_t index, const uint8_t **der,
 int gf_key_with_x509 (const gf_key *key, const uint8_t *const *certs,
                       const size_t *lens, size_t n, gf_key **out);
 
+/* As gf_key_with_x509, with OCSP responses (DER, at most 8) to staple to the
+   chain.  The responses are sent as they are; a server that wants fresh ones
+   makes a new key from time to time and offers that to new connections.  */
+int gf_key_with_x509_ocsp (const gf_key *key, const uint8_t *const *certs,
+                           const size_t *lens, size_t n,
+                           const uint8_t *const *ocsp, const size_t *ocsp_lens,
+                           size_t nocsp, gf_key **out);
+/* The stapled responses of a key: how many, and one as DER.  */
+size_t gf_x509_ocsp_count (const gf_key *key);
+int gf_x509_ocsp_response (const gf_key *key, size_t index, const uint8_t **der,
+                           size_t *len);
+
 /* Trust: the certificate authorities that may stand at the top of a chain,
    and the revocation lists of them.  Nothing is trusted by default and
    nothing is read from the system.  */
@@ -77,6 +91,12 @@ int gf_x509_trust_add_ca (gf_x509_trust *t, const uint8_t *der, size_t len);
    these after them; one by a CA that is not trusted is refused.  */
 int gf_x509_trust_add_crl (gf_x509_trust *t, const uint8_t *der, size_t len);
 
+/* With REQUIRE, a chain is good only if the end certificate comes with a
+   good, fresh OCSP response from its issuer (default: it is not required,
+   but one that is there is always checked).  A server that does not staple
+   then fails the client; for a closed PKI whose servers all do.  */
+void gf_x509_trust_require_ocsp (gf_x509_trust *t, int require);
+
 #define GF_X509_SERVER 1	/* A host's chain: id-kp-secureShellServer.  */
 #define GF_X509_CLIENT 2	/* A user's: id-kp-secureShellClient.  */
 
@@ -89,6 +109,16 @@ int gf_x509_trust_add_crl (gf_x509_trust *t, const uint8_t *der, size_t len);
        of them a key weaker than 112 bits;
      - every certificate, the CA's too, is in its dates at NOW;
      - none is on a CRL of the store;
+     - every stapled OCSP response that is about a certificate of the chain
+       is well formed, signed (by the issuer, or by a responder certificate
+       it issued for OCSP signing, in its dates) without SHA-1 or MD5, current
+       at NOW (thisUpdate not later than NOW, and NOW before nextUpdate; where
+       there is no nextUpdate, within seven days of thisUpdate), and does not
+       say "revoked" or "unknown".  A response that is not about any
+       certificate of the chain is ignored; one that cannot be read, is not
+       successful, or is not signed as above fails the chain, since a
+       server that staples a broken response is misbehaving.  A response that
+       is stale fails it too;
      - if a certificate has an extended key usage, it allows the purpose (the
        secure shell server or client OID of RFC 6187; "any" and the
        TLS server and client OIDs do not count);

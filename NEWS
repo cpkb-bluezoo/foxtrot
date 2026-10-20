@@ -13,3 +13,4 @@ foxtrot NEWS - history of user-visible changes.
 ** Passphrase-protected private key files (the application supplies bcrypt-pbkdf).
 ** New status GF_ERR_PASSPHRASE.
 ** X.509 chains as keys (RFC 6187), with GnuTLS: gf_key_with_x509, gf_x509_trust, gf_x509_verify.
+** Stapled OCSP responses are checked with an X.509 chain (gf_key_with_x509_ocsp, gf_x509_trust_require_ocsp).

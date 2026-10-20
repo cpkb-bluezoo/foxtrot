@@ -537,10 +537,53 @@ and at least two labels after it, or an iPAddress.  The common name is not
 looked at.
 @item
 Revocation is by the CRLs in the store (their signatures are checked against
-the CAs).  OCSP responses that come with the chain are parsed and ignored,
-and nothing is fetched: a PKI that relies on OCSP alone should not rely on
-this.
+the CAs) and by the OCSP responses that come with the chain.  Those are
+@dfn{stapled}, as RFC 6187 provides: the server puts them in its key blob, so
+the client does not have to ask a responder, and the library, which does no
+I/O, never does.  A server gets its responses by whatever means it has and
+attaches them with @code{gf_key_with_x509_ocsp}, making a new key from
+time to time as they age; a client uses what it is shown.  Checking one is
+parsing and verifying a buffer, as for the certificates.
 @end itemize
+
+A response about a certificate of the chain (the end certificate or an
+intermediate) is held to these:
+
+@itemize @bullet
+@item
+It is signed by that certificate's issuer, or by a responder certificate
+the issuer issued for OCSP signing (the OCSP signing extended key usage),
+carried in the response and in its dates by the caller's clock; the signature
+is not MD5 or SHA-1.  The responder is identified as the response says, by
+the hash of its key or by its name, so that an expired responder cannot be
+passed off with an unrelated certificate beside it.
+@item
+It is current: @code{thisUpdate} is not in the future, and the time is before
+@code{nextUpdate}, or, if there is none, less than seven days after
+@code{thisUpdate}.
+@item
+It says @samp{good}.  @samp{revoked} fails the chain with the reason
+@samp{revoked}, and so does @samp{unknown}.
+@end itemize
+
+A response that is not about any certificate of the chain is ignored.  One
+that is about it and is stale, unsigned, signed by the wrong party or by an
+expired or unauthorized responder, one that is damaged, one that is
+@samp{tryLater} or another failure, or a stapled item that is not OCSP at all,
+fails the chain: a server that staples a broken response is misbehaving, and
+accepting it would be the same as accepting none, with the attacker choosing
+which.  No response at all is not a failure unless the store says
+@code{gf_x509_trust_require_ocsp}, which makes a good response for the end
+certificate a condition; use it for a PKI whose servers all staple.  Without
+it, whoever can drop a staple can hide a revocation, which is the weakness
+of stapling that is not required (the reason for the @dfn{must-staple}
+extension in TLS), and what the CRLs are there for.
+
+@cindex SHA-1, in OCSP responder names
+A response may name its signer by the SHA-1 hash of its key.  The hash
+only picks out which certificate is meant; the signature, which may not be
+SHA-1, proves it.  With the hashed names of @file{known_hosts}, this is the only
+other place SHA-1 appears.
 
 @node Known hosts
 @subsection Known hosts
@@ -868,7 +911,7 @@ application through a function.
 signing and verifying, validation against a trust store with CRLs, names and
 purposes, as host keys and user keys.  Not tested against any other SSH
 implementation, which would have to be a commercial one; see the section on
-them.  OCSP is not evaluated.
+them.  Stapled OCSP responses are evaluated.
 @end enumerate
 
 @node Internationalization

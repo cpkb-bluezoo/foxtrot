@@ -211,7 +211,7 @@ test_parse (void)
   CHECK_EQ (parse_rc (vec_x_p256_alone_blob), GF_OK);
   CHECK_EQ (parse_rc (vec_x_p256_with_root_blob), GF_OK);
   CHECK_EQ (parse_rc (vec_x_p256_unsorted_blob), GF_OK);	/* Order is verify's. */
-  CHECK_EQ (parse_rc (vec_x_p256_ocsp_blob), GF_OK);
+  CHECK_EQ (parse_rc (vec_x_p256_ocsp_blob), GF_OK);	/* Parsing does not judge them. */
   /* Refused: a name that does not fit the key, a key the policy refuses, an
      algorithm there is none of.  */
   CHECK_EQ (parse_rc (vec_x_p256_as_p384_blob), GF_ERR_UNSUPPORTED);
@@ -258,16 +258,28 @@ test_blob_shapes (void)
   c[count_off + 4 + 4] ^= 0xff;		/* In the first certificate's DER. */
   CHECK (gf_key_from_blob (&k, c, n) != GF_OK);
   /* The OCSP count: more than the cap even with the responses there, and
-     as many as the cap, with the responses; one that is too long.  */
-  memcpy (c, b, n);
-  memset (c + n - 4, 0, 4);
-  c[n - 1] = 9;
-  memset (c + n, 0, 9 * 4);
-  CHECK_EQ (gf_key_from_blob (&k, c, n + 9 * 4), GF_ERR_ENCODING);
-  c[n - 1] = 8;
-  CHECK_EQ (gf_key_from_blob (&k, c, n + 8 * 4), GF_OK);
-  gf_key_free (k);
-  k = NULL;
+     as many as the cap; a response that is empty.  */
+  {
+    size_t m = n - 4, j;
+
+    memcpy (c, b, m);
+    c[m] = c[m + 1] = c[m + 2] = 0;
+    c[m + 3] = 9;
+    for (j = 0; j < 9; j++)
+      {
+        memset (c + m + 4 + j * 5, 0, 4);
+        c[m + 4 + j * 5 + 3] = 1;
+        c[m + 4 + j * 5 + 4] = 0x30;
+      }
+    CHECK_EQ (gf_key_from_blob (&k, c, m + 4 + 9 * 5), GF_ERR_ENCODING);
+    c[m + 3] = 8;
+    CHECK_EQ (gf_key_from_blob (&k, c, m + 4 + 8 * 5), GF_OK);
+    gf_key_free (k);
+    k = NULL;
+    c[m + 3] = 1;
+    memset (c + m + 4, 0, 4);			/* One of no bytes. */
+    CHECK_EQ (gf_key_from_blob (&k, c, m + 8), GF_ERR_ENCODING);
+  }
   memcpy (c, b, n);
   c[n - 1] = 1;
   CHECK_EQ (gf_key_from_blob (&k, c, n), GF_ERR_ENCODING);
@@ -420,7 +432,6 @@ test_verify (void)
   GOOD (t, vec_x_p256_blob, GF_X509_SERVER, NULL, NOW);		/* No name asked. */
   GOOD (t, vec_x_p256_with_root_blob, GF_X509_SERVER, "host.example.org", NOW);
   GOOD (t, vec_x_noeku_blob, GF_X509_SERVER, "host.example.org", NOW);
-  GOOD (t, vec_x_p256_ocsp_blob, GF_X509_SERVER, "host.example.org", NOW);
   /* Names: a dNSName, case-blind, a one-label wildcard, an address. */
   GOOD (t, vec_x_p256_blob, GF_X509_SERVER, "HOST.Example.ORG", NOW);
   GOOD (t, vec_x_p256_blob, GF_X509_SERVER, "a.wild.example.org", NOW);
@@ -526,6 +537,136 @@ test_verify (void)
   gf_x509_trust_free (old);
 }
 
+/* Stapled OCSP responses: judged with the chain, by the caller's clock. */
+static void
+test_ocsp (void)
+{
+  const char *roots[] = { vec_x_root };
+  gf_x509_trust *t = trust_with (roots, 1), *req = trust_with (roots, 1);
+  static uint8_t r1[4096], r2[4096];
+  gf_key *k, *priv;
+
+  gf_x509_trust_require_ocsp (req, 1);
+
+  /* Good ones: signed by the issuer by key hash or by name, or by a responder
+     it certified; with no nextUpdate and recent; about the intermediate too. */
+  GOOD (t, vec_x_ocsp_good_blob, GF_X509_SERVER, "host.example.org", NOW);
+  GOOD (t, vec_x_ocsp_name_id_blob, GF_X509_SERVER, NULL, NOW);
+  GOOD (t, vec_x_ocsp_deleg_blob, GF_X509_SERVER, NULL, NOW);
+  GOOD (t, vec_x_ocsp_nonext_ok_blob, GF_X509_SERVER, NULL, NOW);
+  GOOD (t, vec_x_ocsp_good_inter_blob, GF_X509_SERVER, NULL, NOW);
+  /* One about something else is not about this chain.  */
+  GOOD (t, vec_x_ocsp_other_cert_blob, GF_X509_SERVER, NULL, NOW);
+  /* What they say.  */
+  BAD (t, vec_x_ocsp_revoked_blob, GF_X509_SERVER, NULL, NOW, "revoked");
+  BAD (t, vec_x_ocsp_inter_revoked_blob, GF_X509_SERVER, NULL, NOW, "revoked");
+  BAD (t, vec_x_ocsp_revoked_and_good_blob, GF_X509_SERVER, NULL, NOW, "revoked");
+  BAD (t, vec_x_ocsp_unknown_blob, GF_X509_SERVER, NULL, NOW, "OCSP status unknown");
+  /* Freshness, by our clock: past nextUpdate, before thisUpdate, and with no
+     nextUpdate a week from thisUpdate (not a second more).  */
+  BAD (t, vec_x_ocsp_stale_blob, GF_X509_SERVER, NULL, NOW, "stale OCSP response");
+  BAD (t, vec_x_ocsp_future_blob, GF_X509_SERVER, NULL, NOW, "stale OCSP response");
+  BAD (t, vec_x_ocsp_nonext_old_blob, GF_X509_SERVER, NULL, NOW, "stale OCSP response");
+  GOOD (t, vec_x_ocsp_nonext_ok_blob, GF_X509_SERVER, NULL, 1700438399);
+  BAD (t, vec_x_ocsp_nonext_ok_blob, GF_X509_SERVER, NULL, 1700438400, "stale OCSP response");
+  GOOD (t, vec_x_ocsp_good_blob, GF_X509_SERVER, NULL, 4000000000u);
+  GOOD (t, vec_x_ocsp_edge_blob, GF_X509_SERVER, NULL, 1700524799);
+  BAD (t, vec_x_ocsp_edge_blob, GF_X509_SERVER, NULL, 1700524800, "stale OCSP response");
+  /* The responder is the one the response names: an unrelated expired
+     certificate in the response does no harm, and an expired signer is not
+     made good by a valid certificate beside it.  */
+  GOOD (t, vec_x_ocsp_two_valid_signs_blob, GF_X509_SERVER, NULL, NOW);
+  GOOD (t, vec_x_ocsp_two_valid_signs_name_blob, GF_X509_SERVER, NULL, NOW);
+  BAD (t, vec_x_ocsp_two_expired_signs_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_two_expired_signs_name_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  /* Responses that cannot be relied on: not signed by the issuer, signed by
+     a responder that is not allowed or out of date, damaged, not
+     successful, not even OCSP, or a good one with a bad one behind it.  */
+  BAD (t, vec_x_ocsp_badsig_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_untrusted_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_deleg_noeku_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_deleg_expired_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_trylater_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_ocsp_junk_after_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  BAD (t, vec_x_p256_ocsp_blob, GF_X509_SERVER, NULL, NOW, "bad OCSP response");
+  /* By default nothing need be stapled; when required, a good response for the
+     end certificate must be.  */
+  GOOD (t, vec_x_p256_blob, GF_X509_SERVER, NULL, NOW);
+  BAD (req, vec_x_p256_blob, GF_X509_SERVER, NULL, NOW, "no OCSP response");
+  BAD (req, vec_x_ocsp_other_cert_blob, GF_X509_SERVER, NULL, NOW, "no OCSP response");
+  GOOD (t, vec_x_ocsp_inter_only_blob, GF_X509_SERVER, NULL, NOW);
+  BAD (req, vec_x_ocsp_inter_only_blob, GF_X509_SERVER, NULL, NOW, "no OCSP response");
+  GOOD (req, vec_x_ocsp_good_blob, GF_X509_SERVER, NULL, NOW);
+  GOOD (req, vec_x_ocsp_deleg_blob, GF_X509_SERVER, NULL, NOW);
+  BAD (req, vec_x_ocsp_revoked_blob, GF_X509_SERVER, NULL, NOW, "revoked");
+  /* The same for a user.  */
+  BAD (req, vec_x_client_blob, GF_X509_CLIENT, NULL, NOW, "no OCSP response");
+
+  /* A server staples what it has (gf_key_with_x509_ocsp), and a client sees
+     it.  */
+  k = from_hex (vec_x_p256_blob);
+  priv = private_key (vec_x_p256_private);
+  {
+    const uint8_t *cd[2], *od[9];
+    size_t cl[2], ol[9], i;
+    gf_key *signer = NULL, *back = NULL, *s2 = NULL;
+    const uint8_t *g, *rd;
+    size_t gl, rl;
+
+    for (i = 0; i < 2; i++)
+      CHECK_EQ (gf_x509_chain_cert (k, i, &cd[i], &cl[i]), GF_OK);
+    ol[0] = unhex (vec_x_ocsp_good_resp, r1, sizeof r1);
+    od[0] = r1;
+    ol[1] = unhex (vec_x_ocsp_revoked_resp, r2, sizeof r2);
+    od[1] = r2;
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, ol, 1, &signer), GF_OK);
+    CHECK_EQ (gf_x509_ocsp_count (signer), 1);
+    CHECK_EQ (gf_x509_ocsp_response (signer, 0, &rd, &rl), GF_OK);
+    CHECK (rl == ol[0] && memcmp (rd, r1, rl) == 0);
+    CHECK (gf_x509_ocsp_response (signer, 1, &rd, &rl) != GF_OK);
+    /* It goes out in the blob, and back in.  */
+    g = gf_key_blob (signer, &gl);
+    CHECK_EQ (gf_key_from_blob (&back, g, gl), GF_OK);
+    CHECK_EQ (gf_x509_ocsp_count (back), 1);
+    CHECK_EQ (gf_x509_verify (t, back, GF_X509_SERVER, "host.example.org", NOW, NULL),
+              GF_OK);
+    CHECK_EQ (gf_x509_verify (req, back, GF_X509_SERVER, NULL, NOW, NULL), GF_OK);
+    /* One that says revoked, attached, is seen too.  */
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od + 1, ol + 1, 1, &s2), GF_OK);
+    CHECK_EQ (gf_x509_verify (t, s2, GF_X509_SERVER, NULL, NOW, NULL), GF_ERR_HOSTKEY);
+    gf_key_free (s2);
+    /* Limits and arguments.  */
+    s2 = NULL;
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, ol, 0, &s2), GF_OK);
+    CHECK_EQ (gf_x509_ocsp_count (s2), 0);
+    gf_key_free (s2);
+    s2 = NULL;
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, NULL, ol, 1, &s2), GF_ERR_INVAL);
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, NULL, 1, &s2), GF_ERR_INVAL);
+    for (i = 2; i < 9; i++)
+      {
+        od[i] = r1;
+        ol[i] = unhex (vec_x_ocsp_good_resp, r1, sizeof r1);
+      }
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, ol, 8, &s2), GF_OK);
+    gf_key_free (s2);
+    s2 = NULL;
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, ol, 9, &s2), GF_ERR_INVAL);
+    ol[1] = 0;
+    CHECK_EQ (gf_key_with_x509_ocsp (priv, cd, cl, 2, od, ol, 2, &s2), GF_ERR_INVAL);
+    CHECK (s2 == NULL);
+    CHECK_EQ (gf_x509_ocsp_count (k), 0);
+    CHECK_EQ (gf_x509_ocsp_count (priv), 0);
+    CHECK (gf_x509_ocsp_response (k, 0, &rd, &rl) != GF_OK);
+    gf_key_free (signer);
+    gf_key_free (back);
+  }
+  gf_key_free (k);
+  gf_key_free (priv);
+  gf_x509_trust_free (t);
+  gf_x509_trust_free (req);
+}
+
 static void
 test_names (void)
 {
@@ -572,6 +713,7 @@ main (void)
   test_sign_verify ();
   test_with_x509_errors ();
   test_verify ();
+  test_ocsp ();
   test_names ();
   TST_DONE ();
 }

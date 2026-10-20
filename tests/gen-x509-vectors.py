@@ -12,6 +12,7 @@ import datetime, os, struct, subprocess, tempfile, warnings
 warnings.simplefilter('ignore')
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.x509 import ocsp
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
 import ipaddress
@@ -245,3 +246,86 @@ emit('vec_x_p256_as_p521_blob', blob('x509v3-ecdsa-sha2-nistp521', chain))
 emit('vec_x_rsa1024_blob', blob(keyname('rsa'), leaves['rsa1024'][2]))
 emit('vec_x_ed_blob', blob(keyname('p256'), leaves['ed'][2]))
 emit('vec_x_p521_blob', blob(keyname('p384'), leaves['p521'][2]))
+
+# ---- OCSP responses (RFC 6960), stapled ----
+def ocsp_resp(cert, issuer, status, signer_key, responder, embed=False, certs=None, this=D(2023, 11, 1, tzinfo=UTC),
+              next_=D(2099, 1, 1, tzinfo=UTC), revoked_at=None, reason=None, by_name=False,
+              sigmod=hashes.SHA256()):
+    b = ocsp.OCSPResponseBuilder().add_response(
+        cert=cert, issuer=issuer, algorithm=hashes.SHA1(), cert_status=status,
+        this_update=this, next_update=next_, revocation_time=revoked_at, revocation_reason=reason)
+    b = b.responder_id(ocsp.OCSPResponderEncoding.NAME if by_name else ocsp.OCSPResponderEncoding.HASH, responder)
+    if certs is not None:
+        b = b.certificates(certs)
+    elif embed:
+        b = b.certificates([responder])
+    return b.sign(signer_key, sigmod).public_bytes(serialization.Encoding.DER)
+
+G, R, U = ocsp.OCSPCertStatus.GOOD, ocsp.OCSPCertStatus.REVOKED, ocsp.OCSPCertStatus.UNKNOWN
+lc, lk, lchain = leaves['p256']
+oc = {}   # name -> list of response DER
+oc['good'] = [ocsp_resp(lc, inter, G, inter_k, inter)]
+oc['name_id'] = [ocsp_resp(lc, inter, G, inter_k, inter, by_name=True)]
+# A delegated responder: a certificate the intermediate issued for OCSP signing.
+def responder(cn, key, eku, start=dt(2020), end=dt(2099)):
+    return make(cn, key, 'Intermediate CA', inter_k, eku=eku, start=start, end=end)
+rk = newkey('p256')
+r_ok = responder('Responder', rk, [ExtendedKeyUsageOID.OCSP_SIGNING])
+r_old = responder('Old Responder', rk, [ExtendedKeyUsageOID.OCSP_SIGNING], start=dt(2010), end=dt(2011))
+r_noeku = responder('Plain Responder', rk, [ExtendedKeyUsageOID.SERVER_AUTH])
+oc['deleg'] = [ocsp_resp(lc, inter, G, rk, r_ok, embed=True)]
+oc['deleg_expired'] = [ocsp_resp(lc, inter, G, rk, r_old, embed=True)]
+oc['deleg_noeku'] = [ocsp_resp(lc, inter, G, rk, r_noeku, embed=True)]
+oc['revoked'] = [ocsp_resp(lc, inter, R, inter_k, inter, revoked_at=D(2023, 1, 2, tzinfo=UTC),
+                           reason=x509.ReasonFlags.key_compromise)]
+oc['unknown'] = [ocsp_resp(lc, inter, U, inter_k, inter)]
+oc['stale'] = [ocsp_resp(lc, inter, G, inter_k, inter, this=D(2023, 1, 1, tzinfo=UTC), next_=D(2023, 2, 1, tzinfo=UTC))]
+oc['future'] = [ocsp_resp(lc, inter, G, inter_k, inter, this=D(2024, 1, 1, tzinfo=UTC))]
+oc['nonext_ok'] = [ocsp_resp(lc, inter, G, inter_k, inter, this=D(2023, 11, 13, tzinfo=UTC), next_=None)]
+oc['nonext_old'] = [ocsp_resp(lc, inter, G, inter_k, inter, this=D(2023, 10, 1, tzinfo=UTC), next_=None)]
+oc['other_cert'] = [ocsp_resp(leaves['p384'][0], inter, G, inter_k, inter)]
+_g = bytearray(oc['good'][0])
+_g[-1] ^= 1          # the end of the signature
+oc['badsig'] = [bytes(_g)]
+oc['untrusted'] = [ocsp_resp(lc, inter, G, inter2_k, inter2, embed=True)]
+oc['trylater'] = [ocsp.OCSPResponseBuilder.build_unsuccessful(ocsp.OCSPResponseStatus.TRY_LATER).public_bytes(serialization.Encoding.DER)]
+oc['junk_after'] = [oc['good'][0], b'\x30\x03\x0a\x01\x00']
+oc['good_inter'] = [oc['good'][0], ocsp_resp(inter, root, G, root_k, root)]
+oc['inter_revoked'] = [oc['good'][0], ocsp_resp(inter, root, R, root_k, root, revoked_at=D(2023, 1, 2, tzinfo=UTC))]
+oc['revoked_and_good'] = [oc['revoked'][0], oc['good'][0]]
+oc['edge'] = [ocsp_resp(lc, inter, G, inter_k, inter, next_=D(2023, 11, 21, tzinfo=UTC))]
+oc['inter_only'] = [ocsp_resp(inter, root, G, root_k, root)]
+# Two responder certificates in one response: which one signed is what the
+# response says, not which one is convenient.
+rkA, rkB = newkey('p256'), newkey('p256')
+rA = responder('Responder AA', rkA, [ExtendedKeyUsageOID.OCSP_SIGNING], start=dt(2010), end=dt(2011))
+rB = responder('Responder BB', rkB, [ExtendedKeyUsageOID.OCSP_SIGNING])
+oc['two_expired_signs'] = [ocsp_resp(lc, inter, G, rkA, rA, certs=[rB, rA])]
+oc['two_expired_signs_name'] = [ocsp_resp(lc, inter, G, rkA, rA, certs=[rB, rA], by_name=True)]
+oc['two_valid_signs'] = [ocsp_resp(lc, inter, G, rkB, rB, certs=[rA, rB])]
+oc['two_valid_signs_name'] = [ocsp_resp(lc, inter, G, rkB, rB, certs=[rA, rB], by_name=True)]
+
+# openssl as the oracle for what a response says and who signed it.
+def ocsp_oracle(resp, signer_extra=None):
+    f = os.path.join(tmp, 'resp.der')
+    open(f, 'wb').write(resp)
+    open(os.path.join(tmp, 'bundle.pem'), 'wb').write(pem(root) + pem(inter))
+    open(os.path.join(tmp, 'leafc.pem'), 'wb').write(pem(lc))
+    open(os.path.join(tmp, 'interc.pem'), 'wb').write(pem(inter))
+    r = subprocess.run(['openssl', 'ocsp', '-respin', f, '-issuer', os.path.join(tmp, 'interc.pem'),
+                        '-cert', os.path.join(tmp, 'leafc.pem'), '-CAfile', os.path.join(tmp, 'bundle.pem'),
+                        '-no_nonce', '-no-CApath', '-no-CAstore'], capture_output=True)
+    out = (r.stdout + r.stderr).decode()
+    return r.returncode == 0, out
+for name_, want in (('good', 'good'), ('name_id', 'good'), ('deleg', 'good'), ('two_valid_signs', 'good'), ('two_valid_signs_name', 'good'), ('revoked', 'revoked'), ('unknown', 'unknown')):
+    ok, out = ocsp_oracle(oc[name_][0])
+    assert ok and ('leafc.pem: ' + want) in out, (name_, out)
+for name_ in ('badsig', 'untrusted', 'deleg_noeku'):
+    ok, out = ocsp_oracle(oc[name_][0])
+    assert not ok, (name_, out)
+
+print()
+for name_, lst in oc.items():
+    emit('vec_x_ocsp_%s_blob' % name_, blob(keyname('p256'), lchain if not name_.startswith('inter') else lchain, lst))
+emit('vec_x_ocsp_good_resp', oc['good'][0])
+emit('vec_x_ocsp_revoked_resp', oc['revoked'][0])

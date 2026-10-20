@@ -46,11 +46,16 @@ struct gf_cert
 /* An X.509 chain (RFC 6187): the DER of each certificate, the end
    certificate first.  The key's blob is the RFC 6187 public key.  */
 #define GFI_X509_MAX_CHAIN 8
+#define GFI_X509_MAX_OCSP 8
 struct gf_x509
 {
   size_t n;
   uint8_t *der[GFI_X509_MAX_CHAIN];
   size_t len[GFI_X509_MAX_CHAIN];
+  /* OCSP responses that came with the chain (stapled), DER.  */
+  size_t nocsp;
+  uint8_t *ocsp[GFI_X509_MAX_OCSP];
+  size_t ocsplen[GFI_X509_MAX_OCSP];
 };
 
 struct gf_key

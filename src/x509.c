@@ -30,6 +30,9 @@
 #ifdef HAVE_GNUTLS
 # include <gnutls/gnutls.h>
 # include <gnutls/x509.h>
+# include <gnutls/abstract.h>
+# include <gnutls/ocsp.h>
+# include <gcrypt.h>
 #endif
 
 #include <foxtrot/status.h>
@@ -51,6 +54,8 @@ gfi_x509_free (struct gf_x509 *x)
     return;
   for (i = 0; i < x->n; i++)
     free (x->der[i]);
+  for (i = 0; i < x->nocsp; i++)
+    free (x->ocsp[i]);
   free (x);
 }
 
@@ -68,6 +73,24 @@ gf_x509_chain_cert (const gf_key *k, size_t i, const uint8_t **der, size_t *len)
     return GF_ERR_INVAL;
   *der = k->x509->der[i];
   *len = k->x509->len[i];
+  return GF_OK;
+}
+
+size_t
+gf_x509_ocsp_count (const gf_key *k)
+{
+  return k && k->x509 ? k->x509->nocsp : 0;
+}
+
+int
+gf_x509_ocsp_response (const gf_key *k, size_t i, const uint8_t **der,
+                       size_t *len)
+{
+  if (k == NULL || k->x509 == NULL || i >= k->x509->nocsp || der == NULL
+      || len == NULL)
+    return GF_ERR_INVAL;
+  *der = k->x509->ocsp[i];
+  *len = k->x509->ocsplen[i];
   return GF_OK;
 }
 
@@ -222,8 +245,20 @@ gfi_x509_parse (gf_key **out, const uint8_t *blob, size_t len, gf_slice name)
   if (gf_rd_u32 (&r, &ocsp) != GF_OK || ocsp > MAX_OCSP)
     goto bad_encoding;
   for (i = 0; i < ocsp; i++)
-    if (gf_rd_string (&r, &der) != GF_OK || der.len > MAX_OCSP_LEN)
-      goto bad_encoding;
+    {
+      if (gf_rd_string (&r, &der) != GF_OK || der.len == 0
+          || der.len > MAX_OCSP_LEN)
+        goto bad_encoding;
+      x->ocsp[i] = malloc (der.len);
+      if (x->ocsp[i] == NULL)
+        {
+          rc = GF_ERR_NOMEM;
+          goto fail;
+        }
+      memcpy (x->ocsp[i], der.data, der.len);
+      x->ocsplen[i] = der.len;
+      x->nocsp = i + 1;
+    }
   if (gf_rd_finish (&r) != GF_OK)
     goto bad_encoding;
 
@@ -267,6 +302,15 @@ int
 gf_key_with_x509 (const gf_key *key, const uint8_t *const *certs,
                   const size_t *lens, size_t n, gf_key **out)
 {
+  return gf_key_with_x509_ocsp (key, certs, lens, n, NULL, NULL, 0, out);
+}
+
+int
+gf_key_with_x509_ocsp (const gf_key *key, const uint8_t *const *certs,
+                       const size_t *lens, size_t n,
+                       const uint8_t *const *ocsp, const size_t *ocsp_lens,
+                       size_t nocsp, gf_key **out)
+{
   uint8_t *buf;
   size_t cap = 64, i, pl;
   const char *name;
@@ -277,7 +321,9 @@ gf_key_with_x509 (const gf_key *key, const uint8_t *const *certs,
 
   if (key == NULL || certs == NULL || lens == NULL || out == NULL || n < 1
       || n > GFI_X509_MAX_CHAIN || key->priv == NULL || key->cert != NULL
-      || key->app != NULL || key->x509 != NULL)
+      || key->app != NULL || key->x509 != NULL
+      || nocsp > GFI_X509_MAX_OCSP
+      || (nocsp > 0 && (ocsp == NULL || ocsp_lens == NULL)))
     return GF_ERR_INVAL;
   switch (key->type)
     {
@@ -299,6 +345,12 @@ gf_key_with_x509 (const gf_key *key, const uint8_t *const *certs,
         return GF_ERR_INVAL;
       cap += lens[i] + 4;
     }
+  for (i = 0; i < nocsp; i++)
+    {
+      if (ocsp[i] == NULL || ocsp_lens[i] == 0 || ocsp_lens[i] > MAX_OCSP_LEN)
+        return GF_ERR_INVAL;
+      cap += ocsp_lens[i] + 4;
+    }
   buf = malloc (cap);
   if (buf == NULL)
     return GF_ERR_NOMEM;
@@ -307,7 +359,9 @@ gf_key_with_x509 (const gf_key *key, const uint8_t *const *certs,
   gf_wr_u32 (&w, (uint32_t) n);
   for (i = 0; i < n; i++)
     gf_wr_string (&w, certs[i], lens[i]);
-  gf_wr_u32 (&w, 0);
+  gf_wr_u32 (&w, (uint32_t) nocsp);
+  for (i = 0; i < nocsp; i++)
+    gf_wr_string (&w, ocsp[i], ocsp_lens[i]);
   if (gf_wr_status (&w) != GF_OK)
     {
       free (buf);
@@ -340,7 +394,15 @@ struct gf_x509_trust
   gnutls_x509_trust_list_t list;
   gnutls_x509_crt_t *cas;
   size_t nca;
+  int require_ocsp;
 };
+
+void
+gf_x509_trust_require_ocsp (gf_x509_trust *t, int require)
+{
+  if (t)
+    t->require_ocsp = require != 0;
+}
 
 int
 gf_x509_trust_new (gf_x509_trust **out)
@@ -538,6 +600,253 @@ name_matches (gnutls_x509_crt_t crt, const char *name)
   return 0;
 }
 
+/* ---- OCSP responses that came with the chain ---- */
+
+/* A response with no nextUpdate is good for this long after thisUpdate.  */
+#define OCSP_NO_NEXT_SECONDS (7u * 24 * 3600)
+
+/* The header of the DER element at POS: its tag, header size and content
+   length, if it fits in the N bytes.  */
+static int
+der_header (const uint8_t *p, size_t n, size_t pos, uint8_t *tag, size_t *hdr,
+            size_t *len)
+{
+  size_t l, nb, j;
+
+  if (pos + 2 > n)
+    return 0;
+  *tag = p[pos];
+  if (p[pos + 1] < 0x80)
+    {
+      l = p[pos + 1];
+      *hdr = 2;
+    }
+  else
+    {
+      nb = p[pos + 1] & 0x7f;
+      if (nb == 0 || nb > 3 || pos + 2 + nb > n)
+        return 0;
+      for (l = 0, j = 0; j < nb; j++)
+        l = l << 8 | p[pos + 2 + j];
+      *hdr = 2 + nb;
+    }
+  *len = l;
+  return pos + *hdr + l <= n;
+}
+
+/* SHA-1 of the subjectPublicKey bits of CRT (the contents of the BIT STRING
+   in its SubjectPublicKeyInfo), which is what an OCSP response's KeyHash
+   responder identifier is (RFC 6960 section 4.2.2.3).  GnuTLS has a key
+   identifier of its own that is not this one.  The hash only names a
+   responder, which the signature then has to prove; nothing rests on it,
+   and with the known_hosts names it is one of two places SHA-1 appears.
+   Returns 1 and 20 bytes in OUT.  */
+static int
+key_hash (gnutls_x509_crt_t crt, unsigned char out[20])
+{
+  gnutls_pubkey_t pk;
+  gnutls_datum_t spki = { NULL, 0 };
+  const uint8_t *p;
+  size_t n, pos, hdr, len;
+  uint8_t tag;
+  int ok = 0;
+
+  if (gnutls_pubkey_init (&pk) != 0)
+    return 0;
+  if (gnutls_pubkey_import_x509 (pk, crt, 0) != 0
+      || gnutls_pubkey_export2 (pk, GNUTLS_X509_FMT_DER, &spki) != 0)
+    {
+      gnutls_pubkey_deinit (pk);
+      return 0;
+    }
+  p = spki.data;
+  n = spki.size;
+  /* SEQUENCE { SEQUENCE { algorithm }, BIT STRING { unused bits, key } }.  */
+  if (!der_header (p, n, 0, &tag, &hdr, &len) || tag != 0x30)
+    goto done;
+  pos = hdr;
+  if (!der_header (p, n, pos, &tag, &hdr, &len) || tag != 0x30)
+    goto done;
+  pos += hdr + len;
+  if (!der_header (p, n, pos, &tag, &hdr, &len) || tag != 0x03 || len < 2
+      || p[pos + hdr] != 0)
+    goto done;
+  gcry_md_hash_buffer (GCRY_MD_SHA1, out, p + pos + hdr + 1, len - 1);
+  ok = 1;
+done:
+  gnutls_free (spki.data);
+  gnutls_pubkey_deinit (pk);
+  return ok;
+}
+
+/* Who signed RESP: the issuer itself, or a responder certificate that came
+   in the response, which then has to be in its dates.  GnuTLS has checked
+   the signature and that the signer was the issuer's or its delegate; the
+   dates are ours to check.  */
+static int
+responder_in_dates (gnutls_ocsp_resp_t resp, gnutls_x509_crt_t issuer,
+                    uint64_t now)
+{
+  gnutls_x509_crt_t *certs = NULL;
+  size_t ncerts = 0, i;
+  gnutls_datum_t kid = { NULL, 0 }, dn = { NULL, 0 };
+  unsigned char ik[20], ck[20];
+  int by_key = gnutls_ocsp_resp_get_responder_raw_id (resp, GNUTLS_OCSP_RESP_ID_KEY,
+                                                      &kid) == 0;
+  int ok = 0, decided = 0;
+  const char *unused;
+
+  if (!by_key
+      && gnutls_ocsp_resp_get_responder_raw_id (resp, GNUTLS_OCSP_RESP_ID_DN,
+                                                &dn) != 0)
+    return 0;
+  /* Signed by the issuer itself: its dates were checked with the chain's. */
+  if (by_key)
+    {
+      if (kid.size == 20 && key_hash (issuer, ik)
+          && memcmp (ik, kid.data, 20) == 0)
+        {
+          gnutls_free (kid.data);
+          return 1;
+        }
+    }
+  else
+    {
+      gnutls_datum_t idn;
+
+      if (gnutls_x509_crt_get_raw_dn (issuer, &idn) == 0 && idn.size == dn.size
+          && memcmp (idn.data, dn.data, dn.size) == 0)
+        {
+          gnutls_free (dn.data);
+          return 1;
+        }
+    }
+  if (gnutls_ocsp_resp_get_certs (resp, &certs, &ncerts) != 0)
+    {
+      gnutls_free (kid.data);
+      gnutls_free (dn.data);
+      return 0;
+    }
+  for (i = 0; i < ncerts && !decided; i++)
+    {
+      int same = 0;
+
+      if (by_key)
+        {
+          same = kid.size == 20 && key_hash (certs[i], ck)
+            && memcmp (ck, kid.data, 20) == 0;
+        }
+      else
+        {
+          gnutls_datum_t cdn;
+
+          same = gnutls_x509_crt_get_raw_dn (certs[i], &cdn) == 0
+            && cdn.size == dn.size && memcmp (cdn.data, dn.data, dn.size) == 0;
+        }
+      if (same)
+        {
+          decided = 1;
+          ok = in_dates (certs[i], now, &unused);
+        }
+    }
+  for (i = 0; i < ncerts; i++)
+    gnutls_x509_crt_deinit (certs[i]);
+  gnutls_free (certs);
+  gnutls_free (kid.data);
+  gnutls_free (dn.data);
+  return ok;			/* A signer we could not find is no signer.  */
+}
+
+/* The stapled responses of KEY against the chain CRT[0..N-1], whose last
+   certificate was issued by CA.  Sets *WHY if the chain fails.  */
+static int
+check_ocsp (const gf_x509_trust *t, const gf_key *key, gnutls_x509_crt_t *crt,
+            size_t n, gnutls_x509_crt_t ca, uint64_t now, const char **why)
+{
+  size_t r, i;
+  int leaf_good = 0;
+  unsigned idx;
+
+  for (r = 0; r < key->x509->nocsp; r++)
+    {
+      gnutls_ocsp_resp_t resp;
+      gnutls_datum_t d;
+
+      d.data = key->x509->ocsp[r];
+      d.size = (unsigned) key->x509->ocsplen[r];
+      if (gnutls_ocsp_resp_init (&resp) != 0)
+        {
+          *why = "bad OCSP response";
+          return 0;
+        }
+      if (gnutls_ocsp_resp_import (resp, &d) != 0
+          || gnutls_ocsp_resp_get_status (resp) != GNUTLS_OCSP_RESP_SUCCESSFUL)
+        {
+          gnutls_ocsp_resp_deinit (resp);
+          *why = "bad OCSP response";
+          return 0;
+        }
+      for (idx = 0; idx < 64; idx++)
+        {
+          unsigned int cstatus = 0, reason = 0;
+          time_t this_u = 0, next_u = 0, revoked_at = 0;
+
+          /* (3.8 leaves the times out unless it is asked for them all.)  */
+          if (gnutls_ocsp_resp_get_single (resp, idx, NULL, NULL, NULL, NULL,
+                                           &cstatus, &this_u, &next_u,
+                                           &revoked_at, &reason) < 0)
+            break;
+          for (i = 0; i < n; i++)
+            {
+              unsigned int v = 0;
+              gnutls_x509_crt_t issuer = i + 1 < n ? crt[i + 1] : ca;
+
+              if (gnutls_ocsp_resp_check_crt (resp, idx, crt[i]) != 0)
+                continue;
+              /* It is about this certificate: it has to be right.  */
+              if (gnutls_ocsp_resp_verify_direct (resp, issuer, &v,
+                                                  GNUTLS_VERIFY_DISABLE_TIME_CHECKS) != 0
+                  || v != 0 || !responder_in_dates (resp, issuer, now))
+                {
+                  gnutls_ocsp_resp_deinit (resp);
+                  *why = "bad OCSP response";
+                  return 0;
+                }
+              if (this_u <= 0 || now < (uint64_t) this_u
+                  || (next_u != (time_t) -1 && next_u > 0
+                      ? now >= (uint64_t) next_u
+                      : now >= (uint64_t) this_u + OCSP_NO_NEXT_SECONDS))
+                {
+                  gnutls_ocsp_resp_deinit (resp);
+                  *why = "stale OCSP response";
+                  return 0;
+                }
+              if (cstatus == GNUTLS_OCSP_CERT_REVOKED)
+                {
+                  gnutls_ocsp_resp_deinit (resp);
+                  *why = "revoked";
+                  return 0;
+                }
+              if (cstatus != GNUTLS_OCSP_CERT_GOOD)
+                {
+                  gnutls_ocsp_resp_deinit (resp);
+                  *why = "OCSP status unknown";
+                  return 0;
+                }
+              if (i == 0)
+                leaf_good = 1;
+            }
+        }
+      gnutls_ocsp_resp_deinit (resp);
+    }
+  if (t->require_ocsp && !leaf_good)
+    {
+      *why = "no OCSP response";
+      return 0;
+    }
+  return 1;
+}
+
 int
 gf_x509_verify (const gf_x509_trust *t, const gf_key *key, int purpose,
                 const char *name, uint64_t now, const char **why)
@@ -606,6 +915,7 @@ gf_x509_verify (const gf_x509_trust *t, const gf_key *key, int purpose,
   {
     int found = 0;
     const char *cw = "no valid CA";
+    gnutls_x509_crt_t ca = NULL;
 
     for (i = 0; i < t->nca && !found; i++)
       {
@@ -618,13 +928,19 @@ gf_x509_verify (const gf_x509_trust *t, const gf_key *key, int purpose,
             || st != 0)
           continue;
         if (in_dates (t->cas[i], now, &cw))
-          found = 1;
+          {
+            found = 1;
+            ca = t->cas[i];
+          }
       }
     if (!found)
       {
         w = cw;
         goto out;
       }
+    /* Revocation by what the server stapled.  */
+    if (!check_ocsp (t, key, crt, n, ca, now, &w))
+      goto out;
   }
   /* The end certificate's own purposes, if it lists any, must name this one:
      GnuTLS lets "any" pass for everything, and here it does not.  */
@@ -813,6 +1129,29 @@ gf_x509_trust_add_crl (gf_x509_trust *t, const uint8_t *der, size_t len)
   (void) t;
   (void) der;
   (void) len;
+  return GF_ERR_UNAVAILABLE;
+}
+
+void
+gf_x509_trust_require_ocsp (gf_x509_trust *t, int require)
+{
+  (void) t;
+  (void) require;
+}
+
+int
+gf_key_with_x509_ocsp (const gf_key *key, const uint8_t *const *certs,
+                       const size_t *lens, size_t n, const uint8_t *const *ocsp,
+                       const size_t *ocsp_lens, size_t nocsp, gf_key **out)
+{
+  (void) key;
+  (void) certs;
+  (void) lens;
+  (void) n;
+  (void) ocsp;
+  (void) ocsp_lens;
+  (void) nocsp;
+  (void) out;
   return GF_ERR_UNAVAILABLE;
 }
 
