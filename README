@@ -39,7 +39,8 @@ Pre-alpha.  What exists today:
             bcrypt-pbkdf), public key text, and OpenSSH certificates
             (user and host; CA, dates, principals, source-address,
             force-command; making them, as ssh-keygen -s); FIDO security
-            keys (verification only)
+            keys (verified by a server; a client reads their key handle and
+            packs the answer of a token the application drives)
   keyfmt    other key formats: RFC 4716, PEM/DER (SPKI, PKCS#8 also under
             PBES2, PKCS#1, SEC1), PuTTY .ppk 3, and randomart; read
             from what openssl, ssh-keygen and puttygen write

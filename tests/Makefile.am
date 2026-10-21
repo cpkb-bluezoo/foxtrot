@@ -32,6 +32,7 @@ EXTRA_DIST = tst-util.h tst-pair.h vectors-packet.h gen-packet-vectors.py \
   vectors-cert.h gen-cert-vectors.py \
   vectors-knownhosts.h gen-knownhosts-vectors.py \
   vectors-sk.h gen-sk-vectors.py \
+  vectors-skfile.h gen-skfile-vectors.py \
   vectors-keyfile.h gen-keyfile-vectors.py \
   vectors-x509.h gen-x509-vectors.py \
   vectors-krl.h gen-krl-vectors.py \

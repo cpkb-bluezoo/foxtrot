@@ -29,8 +29,9 @@
        16384 bits, one with a public exponent under 65537 or even, an
        ECDSA point that is not on its curve or not in uncompressed form,
        and every key type not listed above (ssh-dss, ECDSA over P-521).
-       Security keys (FIDO) are accepted for verification only, with an
-       application beginning "ssh:".
+       Security keys (FIDO) are accepted as public keys, with an
+       application beginning "ssh:"; their signing is done by a token the
+       application drives (see FIDO security keys below).
      - gf_key_verify and gf_key_sign take the signature algorithm
        explicitly and refuse "ssh-rsa" (RSA with SHA-1): an RSA key signs
        with rsa-sha2-256 or rsa-sha2-512 only, and the signature blob must
@@ -72,7 +73,10 @@ int gf_key_from_blob (gf_key **out, const uint8_t *blob, size_t len);
 /* Read an unencrypted OpenSSH private key file ("-----BEGIN OPENSSH
    PRIVATE KEY-----", the format of ssh-keygen -N ''), given as text.
    A passphrase-protected key is refused with GF_ERR_UNSUPPORTED; see
-   gf_key_from_openssh_private_encrypted.  */
+   gf_key_from_openssh_private_encrypted.  The file of a security key
+   (ssh-keygen -t ed25519-sk or ecdsa-sk) holds a key handle and not a key:
+   it gives the public key, as gf_key_from_blob would, with its key handle
+   and flags (below), and no private part.  */
 int gf_key_from_openssh_private (gf_key **out, const char *text, size_t len);
 
 /* The one-line text form of a public key, as in ssh-keygen's .pub files and
@@ -176,19 +180,72 @@ int gf_key_verify (const gf_key *key, enum gf_sigalg alg, const uint8_t *data,
 /* ---- FIDO security keys (PROTOCOL.u2f) ----
 
    A security key signs on a token held by its user, and the library never
-   talks to one: these keys exist here to be verified, by a server that
-   authenticates users.  "sk-ssh-ed25519@openssh.com" and
+   talks to one: a server verifies what a token signed, and a client has
+   the application drive the token (the sign event of auth.h) and gives the
+   token's answer to gf_sk_signature_pack.  "sk-ssh-ed25519@openssh.com" and
    "sk-ecdsa-sha2-nistp256@openssh.com" keys are an Ed25519 or P-256 key
    with an application string, which must begin "ssh:".  Their signatures
    carry a flags byte and a counter after the signature itself, and sign
    SHA256(application) || flags || counter || SHA256(message), so that a
    signature can not be taken from one relying party to another.  They can
-   not be generated, read from a private key file or used to sign here, and
-   are never host keys.  A signature made with the token's "user presence"
-   flag clear is not accepted. */
+   not be generated or used to sign here, and are never host keys.  A
+   signature made with the token's "user presence" flag clear is not
+   accepted, by a server or by a client checking its token's answer: a key
+   made with ssh-keygen -O no-touch-required, whose stored flags lack
+   GF_SK_USER_PRESENT, cannot be used to log in with by this library, even
+   though a server that allows it would take the signature.
+
+   The token needs the key's application and key handle (the credential ID)
+   to sign.  The private key file of a security key holds them and no
+   private key, so reading one gives a public key that also carries its
+   handle and flags; a client that finds its keys on a token can give a
+   handle to a public key it built with gf_key_from_blob.  The handle is 1 to
+   255 bytes, and is wiped when the key is freed.
+
+   To sign, the token is given SHA256(data) as its challenge, the
+   application (gf_key_application) and the key handle (gf_key_sk_handle),
+   and answers with a signature and the flags and counter from the
+   authenticator data.  gf_sk_signature_pack makes the signature blob that
+   gf_auth_client_sign_respond expects from them.  */
 
 #define GF_SK_USER_PRESENT 0x01
 #define GF_SK_USER_VERIFIED 0x04
+/* The credential is stored on the token (a resident key).  A flag of the
+   key, as it was enrolled, not of a signature.  */
+#define GF_SK_RESIDENT_KEY 0x20
+/* The longest key handle.  */
+#define GF_SK_HANDLE_MAX 255
+
+/* The key handle of a security key and its stored flags (a mask of
+   GF_SK_USER_PRESENT, GF_SK_USER_VERIFIED, GF_SK_RESIDENT_KEY), as the
+   private key file had them or gf_key_sk_attach_handle gave them.  The
+   handle is NULL, and the flags 0, for a key that has none; the pointer is
+   valid until the key is changed or freed.  */
+const uint8_t *gf_key_sk_handle (const gf_key *key, size_t *len);
+uint8_t gf_key_sk_flags (const gf_key *key);
+/* Give a security key (or a certificate for one) a copy of a key handle of
+   1 to GF_SK_HANDLE_MAX bytes, and the flags, replacing any it has.  The key
+   itself, and so gf_key_equal and its blob, are unchanged.  GF_ERR_RANGE for
+   another length (the old handle is kept), GF_ERR_UNSUPPORTED for a key
+   that is not a security key.  */
+int gf_key_sk_attach_handle (gf_key *key, uint8_t flags, const uint8_t *handle,
+                             size_t len);
+
+/* The signature blob for a token's answer: string algorithm name, string
+   signature, uint8 FLAGS, uint32 COUNTER.  ALG is the security key's
+   algorithm (for a certificate, its certificate algorithm; the name inside
+   is its key's) and must belong to KEY.  RAW is the signature as a FIDO
+   library returns it: for Ed25519 the 64 bytes, for ECDSA the DER
+   ECDSA-Sig-Value, which must be strict DER (definite minimal lengths,
+   positive integers with no unneeded leading zero, nothing after it) or is
+   refused with GF_ERR_ENCODING.  FLAGS and COUNTER are those of the
+   authenticator data that was signed.  Nothing is checked about the
+   signature itself, which gf_auth_client_sign_respond checks against the
+   key before it sends it.  GF_ERR_BUFSIZE if CAP is too small.  */
+int gf_sk_signature_pack (const gf_key *key, enum gf_sigalg alg,
+                          const uint8_t *raw, size_t rawlen, uint8_t flags,
+                          uint32_t counter, uint8_t *out, size_t cap,
+                          size_t *outlen);
 
 int gf_key_is_security_key (const gf_key *key);
 /* The application of a security key (not NUL-terminated), or NULL.  */

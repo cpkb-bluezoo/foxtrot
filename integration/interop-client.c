@@ -25,6 +25,7 @@
                          [--exec COMMAND [--send N] [--check-pattern]]
                          [--sftp "COMMAND; COMMAND; ..."]
                          [--cert FILE] [--known-hosts FILE] [--host-name NAME]
+                         [--sk-token FILE [--print-sk-pub]]
 
    Connects to 127.0.0.1:PORT, completes the transport handshake with the
    given algorithms (default: the policy's), asks the application to trust
@@ -35,7 +36,14 @@
    and requests the ssh-userauth service.  With --no-auth it stops there.
    Otherwise it authenticates as NAME (default "nobody") with the OpenSSH
    private key in FILE (with the certificate in the file given by --cert, if
-   any), the password PW, or by answering every
+   any), the password PW, a FIDO security key held by a token in software
+   (--sk-token: FILE is an Ed25519 or P-256 OpenSSH private key that stands
+   for the token's credential; the key offered is the security key
+   "sk-ssh-ed25519@openssh.com" or "sk-ecdsa-sha2-nistp256@openssh.com" made
+   from its public part, application "ssh:", with a key handle; the signature
+   is made as a token and a FIDO library would give it, raw or DER, and
+   packed by the library; --print-sk-pub prints the key as an
+   authorized_keys line and exits), or by answering every
    keyboard-interactive prompt with ANSWER, as given; with --rekey it then
    forces a key exchange and waits for it; --rekey-bytes N makes the
    connection rekey by itself every N bytes.  With --exec it then runs
@@ -79,6 +87,7 @@
 #include <sys/stat.h>
 
 #include <foxtrot/session.h>
+#include <foxtrot/crypto.h>
 #include <foxtrot/key.h>
 #include <foxtrot/knownhosts.h>
 #include <foxtrot/policy.h>
@@ -91,6 +100,8 @@ struct ctx
   gf_chans *chans;
   const char *expect_fp, *kbd_answer, *command;
   gf_knownhosts *kh;
+  const gf_key *token;		/* --sk-token: the credential's private key.  */
+  uint32_t token_counter;
   const char *host_name;	/* The name looked up in it.  */
   unsigned port;
   int rekey, no_auth, check_pattern;
@@ -247,6 +258,71 @@ auth_ok (void *user, gf_slice none)
   if (x->command || x->sftp_script)
     return gf_chans_open_session (x->chans, &x->chan, 0, 0) != GF_OK;
   return 0;
+}
+
+/* A FIDO token in software.  It is given what a FIDO library is: the
+   application and key handle of the key (checked to be the ones this token
+   has), and the challenge, SHA256(data), and answers with what the
+   authenticator signed: SHA256(application) || flags || counter ||
+   challenge, with the flags and counter in the answer too.  Ed25519 comes
+   as 64 raw bytes and ECDSA as DER.  */
+static int
+sk_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
+{
+  struct ctx *x = user;
+  uint8_t buf[69], sig[GF_SIG_MAX], raw[80], out[GF_SIG_MAX];
+  uint8_t flags = GF_SK_USER_PRESENT;
+  const uint8_t *app, *h;
+  size_t al, hl, sl, rl, n;
+  gf_reader r, rr;
+  gf_slice name, body, ri, si;
+  int ed = gf_key_type (x->token) == GF_KEY_ED25519;
+  uint32_t counter = ++x->token_counter;
+
+  app = gf_key_application (key, &al);
+  h = gf_key_sk_handle (key, &hl);
+  if (app == NULL || h == NULL || hl == 0)
+    return gf_session_auth_sign_fail (x->s) != GF_OK;
+  if (gf_hash_compute (GF_HASH_SHA256, app, al, buf, 32) != GF_OK)
+    return 1;
+  buf[32] = flags;
+  buf[33] = (uint8_t) (counter >> 24);
+  buf[34] = (uint8_t) (counter >> 16);
+  buf[35] = (uint8_t) (counter >> 8);
+  buf[36] = (uint8_t) counter;
+  if (gf_hash_compute (GF_HASH_SHA256, data.data, data.len, buf + 37, 32) != GF_OK
+      || gf_key_sign (x->token, ed ? GF_SIG_ED25519 : GF_SIG_ECDSA_NISTP256, buf,
+                      sizeof buf, sig, sizeof sig, &sl) != GF_OK)
+    return 1;
+  gf_reader_init (&r, sig, sl);
+  if (gf_rd_string (&r, &name) != GF_OK || gf_rd_string (&r, &body) != GF_OK)
+    return 1;
+  if (ed)
+    {
+      memcpy (raw, body.data, body.len);
+      rl = body.len;
+    }
+  else
+    {
+      /* The mpints of the SSH form are the contents of DER integers.  */
+      gf_reader_init (&rr, body.data, body.len);
+      if (gf_rd_string (&rr, &ri) != GF_OK || gf_rd_string (&rr, &si) != GF_OK
+          || ri.len > 33 || si.len > 33)
+        return 1;
+      raw[0] = 0x30;
+      raw[1] = (uint8_t) (4 + ri.len + si.len);
+      raw[2] = 0x02;
+      raw[3] = (uint8_t) ri.len;
+      memcpy (raw + 4, ri.data, ri.len);
+      raw[4 + ri.len] = 0x02;
+      raw[5 + ri.len] = (uint8_t) si.len;
+      memcpy (raw + 6 + ri.len, si.data, si.len);
+      rl = 6 + ri.len + si.len;
+    }
+  if (gf_sk_signature_pack (key, alg, raw, rl, flags, counter, out, sizeof out,
+                            &n) != GF_OK)
+    return 1;
+  return gf_session_auth_sign_respond (x->s, out, n) != GF_OK;
 }
 
 static int
@@ -951,7 +1027,9 @@ main (int argc, char **argv)
   enum gf_cipher cipher = 0;
   enum gf_sigalg alg = 0;
   const char *user = "nobody", *keyfile = NULL, *certfile = NULL, *password = NULL;
-  gf_key *key = NULL;
+  const char *tokenfile = NULL;
+  int print_sk_pub = 0;
+  gf_key *key = NULL, *token = NULL;
   const gf_key *keys[1];
   enum gf_sigalg known_algs[16];
   gf_key *ckey = NULL;		/* The key with its certificate.  */
@@ -987,6 +1065,10 @@ main (int argc, char **argv)
         user = argv[++i];
       else if (strcmp (argv[i], "--key") == 0 && i + 1 < argc)
         keyfile = argv[++i];
+      else if (strcmp (argv[i], "--sk-token") == 0 && i + 1 < argc)
+        tokenfile = argv[++i];
+      else if (strcmp (argv[i], "--print-sk-pub") == 0)
+        print_sk_pub = 1;
       else if (strcmp (argv[i], "--password") == 0 && i + 1 < argc)
         password = argv[++i];
       else if (strcmp (argv[i], "--kbd") == 0 && i + 1 < argc)
@@ -1059,6 +1141,70 @@ main (int argc, char **argv)
         x.host_name ? x.host_name : "127.0.0.1", x.port, known_algs, 16);
       cfg.conn.prefs.sigalgs = known_algs;
     }
+  if (tokenfile)
+    {
+      /* The security key of a token in software: its public part is the
+         credential's, with the application and a key handle.  */
+      static const uint8_t handle[] = "foxtrot interop credential id 0123456789abcdef";
+      char text[8192], line[1024];
+      uint8_t b[512];
+      FILE *f = fopen (tokenfile, "r");
+      size_t n, kl;
+      const uint8_t *kb;
+      gf_reader rd;
+      gf_slice s, point, curve = { NULL, 0 };
+      gf_writer w;
+
+      if (f == NULL)
+        {
+          perror (tokenfile);
+          return 2;
+        }
+      n = fread (text, 1, sizeof text, f);
+      fclose (f);
+      if (gf_key_from_openssh_private (&token, text, n) != GF_OK
+          || (gf_key_type (token) != GF_KEY_ED25519
+              && gf_key_type (token) != GF_KEY_ECDSA_P256))
+        {
+          fprintf (stderr, "cannot use %s as a token\n", tokenfile);
+          return 2;
+        }
+      kb = gf_key_blob (token, &kl);
+      gf_reader_init (&rd, kb, kl);
+      if (gf_rd_string (&rd, &s) != GF_OK
+          || (gf_key_type (token) == GF_KEY_ECDSA_P256
+              && gf_rd_string (&rd, &curve) != GF_OK)
+          || gf_rd_string (&rd, &point) != GF_OK)
+        return 2;
+      gf_writer_init (&w, b, sizeof b);
+      if (gf_key_type (token) == GF_KEY_ED25519)
+        gf_wr_cstring (&w, "sk-ssh-ed25519@openssh.com");
+      else
+        {
+          gf_wr_cstring (&w, "sk-ecdsa-sha2-nistp256@openssh.com");
+          gf_wr_string (&w, curve.data, curve.len);
+        }
+      gf_wr_string (&w, point.data, point.len);
+      gf_wr_string (&w, "ssh:", 4);
+      if (gf_wr_status (&w) != GF_OK || gf_key_from_blob (&key, b, w.len) != GF_OK
+          || gf_key_sk_attach_handle (key, GF_SK_USER_PRESENT, handle,
+                                      sizeof handle - 1) != GF_OK)
+        {
+          fprintf (stderr, "cannot make a security key from %s\n", tokenfile);
+          return 2;
+        }
+      if (print_sk_pub)
+        {
+          if (gf_key_to_text (key, line, sizeof line, NULL) != GF_OK)
+            return 2;
+          printf ("%s\n", line);
+          return 0;
+        }
+      x.token = token;
+      keys[0] = key;
+      keyfile = tokenfile;		/* There is a key to offer.  */
+    }
+  else
   if (keyfile)
     {
       char text[8192];
@@ -1114,6 +1260,7 @@ main (int argc, char **argv)
   ev.rekeyed = on_rekeyed;
   ev.auth_banner = auth_banner;
   ev.auth_kbdint = x.kbd_answer ? auth_kbdint : NULL;
+  ev.auth_sign = x.token ? sk_sign : NULL;
   ev.authenticated = auth_ok;
   ev.auth_failed = auth_failed;
   ev.channel_open = chan_open;

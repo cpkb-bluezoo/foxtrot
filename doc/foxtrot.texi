@@ -484,9 +484,10 @@ A server accepts @samp{sk-ssh-ed25519@@openssh.com} and
 These are Ed25519 and P-256 keys held in a token whose signature carries a
 flags byte and a counter after the signature proper, and covers
 @code{SHA256(application) || flags || counter || SHA256(message)}.  The
-library never talks to a token (it does no I/O), so there is no client
-side: such a key cannot be generated, read from a private key file (its
-private part is a key handle) or used to sign.
+library never talks to a token (it does no I/O): a server verifies what a
+token signed, and a client has the application drive the token
+(@pxref{Keys elsewhere}).  Such a key cannot be generated or used to sign
+here.
 
 @itemize @bullet
 @item
@@ -509,6 +510,20 @@ algorithms and the two security keys.
 @item
 The counter is reported but not checked: only a server that remembers the
 last one per key can use it.
+@item
+A key with the user presence flag clear in its stored flags
+(@command{ssh-keygen -O no-touch-required}) can be read and offered, but the
+library refuses its token's answer as it does a server's: the touch is always
+required, and a client check that was looser than the server policy would
+only let an unchecked answer through.  Such a key cannot log in through this
+library, whatever a server that allows it would take.
+@item
+The key handle and stored flags travel with the key (@code{gf_key_sk_handle},
+@code{gf_key_sk_flags}, @code{GF_SK_RESIDENT_KEY} for a credential stored on
+the token).  An application that finds its keys on a token, such as the
+resident keys it enumerates, builds the public key with
+@code{gf_key_from_blob} and gives it its handle with
+@code{gf_key_sk_attach_handle}.
 @end itemize
 
 The signature format was checked against OpenSSH's own verifier: the test
@@ -559,8 +574,16 @@ The passphrase is not copied or kept, the derived key and IV are wiped
 after use, and the decrypted private section is wiped with the rest of the
 file's buffers.
 @item
-A file holds one key.  Security keys (FIDO) have a key handle for their
-private part, not a key, and are refused.
+A file holds one key.  The file of a security key (FIDO;
+@command{ssh-keygen -t ed25519-sk} or @code{ecdsa-sk}) holds no key but the
+application, the flags and the key handle (the credential ID) that the
+token needs to sign, and is read, with or without a passphrase, as a public
+key that carries them: @code{gf_key_sk_handle} and @code{gf_key_sk_flags}
+(@pxref{Security keys}).  The handle is 1 to 255 bytes, the application must
+agree with the file's public key and begin @samp{ssh:}, and the reserved
+field is ignored.  The result has no private part and cannot sign.  A
+certificate for a security key is not read from a private key file, which
+@command{ssh-keygen} does not write.
 @end itemize
 
 Checked against @command{ssh-keygen}: in the unit tests, files it wrote with
@@ -979,8 +1002,22 @@ request on the wire, so a bad agent or an untouched token costs one attempt.
 @item
 For a certificate the name in the signature is its key's, as when the
 library signs; for a security key the whole blob with the flags and counter
-is the answer, which is what a FIDO library returns once its output is
-packed.
+is the answer, which is what @code{gf_sk_signature_pack} makes of a FIDO
+library's output.
+@item
+A FIDO token is driven by the application, by a library such as
+@code{libfido2} or by whatever else it has.  The @code{sign} callback
+receives @code{data}, the bytes the signature is over; the token is to be
+given @code{SHA256(data)} as the challenge, the application
+(@code{gf_key_application}) and the key handle (@code{gf_key_sk_handle}) of
+the key, and it signs the authenticator data (@code{SHA256(application)},
+the flags, the counter) and the challenge as the format says.  The
+application takes the signature and the flags and counter from the
+authenticator data and calls @code{gf_sk_signature_pack}, with the raw
+64 bytes of an Ed25519 signature or the DER of an ECDSA one, which makes the
+blob that @code{gf_auth_client_sign_respond} wants.  The DER is parsed
+strictly; the packed blob is then checked against the public key like any
+other answer, so an answer the token got wrong costs only the key.
 @item
 Signing can take as long as a person does, and the server's grace time (two
 minutes) runs meanwhile.  A key with a private part is signed for at once, as
@@ -1205,10 +1242,11 @@ with plain and certificate host keys.
 
 @item
 @strong{Done.}  FIDO security keys (@samp{sk-ssh-ed25519@@openssh.com},
-@samp{sk-ecdsa-sha2-nistp256@@openssh.com}, and certificates for them) for
-verification: a server takes them, with the presence and verification flags
-and the counter.  There is no signing side: it would be a callback to
-whatever drives the token.
+@samp{sk-ecdsa-sha2-nistp256@@openssh.com}, and certificates for them): a
+server takes them, with the presence and verification flags and the counter;
+a client reads the key handle from the private key file, has the application
+drive the token through the @code{sign} callback, and packs the token's
+answer into the signature blob.  Talking to the token is the application's.
 
 @item
 @strong{Done.}  Passphrase-protected private key files, read and written, with

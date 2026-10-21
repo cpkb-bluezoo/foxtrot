@@ -53,6 +53,8 @@ sk = hexc('vectors-sk.h')
 x509 = hexc('vectors-x509.h')
 kh = consts('vectors-knownhosts.h')
 keyfile = consts('vectors-keyfile.h')
+skfile = consts('vectors-skfile.h')
+skfilex = hexc('vectors-skfile.h')
 
 # ---- wire ----
 add('wire', 'ops', bytes([12]) + bytes([5, 5, 8, 9, 6, 7, 1, 2, 3, 0, 4, 10]) + s('hello') + s(b'\x00\x80\x01') + s('a,b,c') + s('text') + s('\xc3\xa9') + b'\0\0\0\1\2\3\4\5\6\7\x08\x09')
@@ -95,6 +97,10 @@ def keyseed(name, blob, sig=b'', data=b'foxtrot'):
     add('key', name, frame(blob, sig) + data)
 for t in ('ed', 'p256', 'p384', 'rsa'):
     keyseed('plain-' + t, key['vec_%s_blob' % t], key.get('vec_%s_sig' % t, key.get('vec_rsa_sig256', b'')), key['vec_msg'])
+# A token's answer before it is packed: Ed25519 raw, ECDSA in DER.
+keyseed('sk-token-ed', skfilex['vec_skf_ed_blob'], skfilex['vec_skf_ed_raw'], skfilex['vec_skf_msg'])
+for shape in ('both_high', 'short_r', 'short_s'):
+    keyseed('sk-token-p256-' + shape, skfilex['vec_skf_p256_blob'], skfilex['vec_skf_p256_der_' + shape], skfilex['vec_skf_msg'])
 for t in ('ed', 'p256', 'p384', 'rsa'):
     keyseed('usercert-' + t, cert['vec_%s_user_cert' % t], cert.get('vec_%s_sig' % t, cert.get('vec_rsa_sig256', b'')), cert['vec_msg'])
     keyseed('hostcert-' + t, cert['vec_%s_host_cert' % t])
@@ -123,6 +129,8 @@ add('keytext', 'bad', 'ssh-ed25519 AAAA\n')
 for k, v in textc('vectors-key.h').items():
     if k.endswith('_private'): add('keyfile', k, v)
 for k, v in keyfile.items():
+    if k.endswith('_enc') or k.endswith('_plain'): add('keyfile', k, v)
+for k, v in skfile.items():
     if k.endswith('_enc') or k.endswith('_plain'): add('keyfile', k, v)
 
 # ---- knownhosts: [hostlen][host][port][text] ----

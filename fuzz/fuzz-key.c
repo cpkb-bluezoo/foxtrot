@@ -70,6 +70,20 @@ LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
   algs = gf_key_sigalgs (k, &na);
   for (i = 0; i < na; i++)
     (void) gf_key_verify (k, algs[i], data, size, sig ? sig : data, sl);
+  /* A token's answer, raw or DER, packed (or refused) and then checked.  */
+  for (i = 0; i < na; i++)
+    if (gf_sk_signature_pack (k, algs[i], sig ? sig : data, sig ? sl : size, 1, 1,
+                              (uint8_t *) text, sizeof text, &n) == GF_OK)
+      (void) gf_key_verify_sk (k, algs[i], data, size, (uint8_t *) text, n,
+                               NULL, NULL);
+  if (gf_key_sk_attach_handle (k, 1, data, size) == GF_OK)
+    {
+      const uint8_t *h = gf_key_sk_handle (k, &n);
+
+      if (h == NULL || n != size || memcmp (h, data, size) != 0
+          || gf_key_sk_flags (k) != 1)
+        abort ();
+    }
   /* It is no use signing with another algorithm's name.  */
   (void) gf_key_verify (k, GF_SIG_ED25519, data, size, sig ? sig : data, sl);
   (void) gf_key_verify_sk (k, GF_SIG_SK_ED25519, data, size, sig ? sig : data, sl,

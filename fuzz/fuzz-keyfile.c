@@ -43,6 +43,17 @@ LLVMFuzzerTestOneInput (const uint8_t *data, size_t size)
   if (gf_key_from_openssh_private_encrypted (&k, (const char *) data, size,
                                              "passphrase", kdf, NULL) != GF_OK)
     return 0;
+  if (gf_key_is_security_key (k))
+    {
+      /* A security key's file holds no key, only the handle for its token. */
+      size_t hl;
+
+      if (gf_key_has_private (k) || gf_key_sk_handle (k, &hl) == NULL || hl == 0
+          || hl > GF_SK_HANDLE_MAX)
+        abort ();
+      gf_key_free (k);
+      return 0;
+    }
   if (!gf_key_has_private (k))
     abort ();
   /* What was read can be written, read again, and is the same key.  */

@@ -96,6 +96,9 @@ gf_key_free (gf_key *k)
   free (k->blob);
   free (k->plain);
   free (k->app);
+  if (k->handle != NULL)
+    gf_wipe (k->handle, k->handlelen);
+  free (k->handle);
   free (k);
 }
 
@@ -144,6 +147,53 @@ gf_key_application (const gf_key *k, size_t *len)
     return NULL;
   *len = k->applen;
   return k->app;
+}
+
+/* A security key's key handle is a credential ID: the token needs it to sign
+   and it is not secret, but it is wiped on free as private key files are.  */
+static int
+set_handle (gf_key *k, uint8_t flags, const uint8_t *h, size_t len)
+{
+  uint8_t *copy;
+
+  if (len == 0 || len > GF_SK_HANDLE_MAX)
+    return GF_ERR_RANGE;
+  copy = malloc (len);
+  if (copy == NULL)
+    return GF_ERR_NOMEM;
+  memcpy (copy, h, len);
+  if (k->handle != NULL)
+    gf_wipe (k->handle, k->handlelen);
+  free (k->handle);
+  k->handle = copy;
+  k->handlelen = len;
+  k->sk_flags = flags;
+  return GF_OK;
+}
+
+int
+gf_key_sk_attach_handle (gf_key *k, uint8_t flags, const uint8_t *h, size_t len)
+{
+  if (k == NULL || h == NULL)
+    return GF_ERR_INVAL;
+  if (k->app == NULL)
+    return GF_ERR_UNSUPPORTED;
+  return set_handle (k, flags, h, len);
+}
+
+const uint8_t *
+gf_key_sk_handle (const gf_key *k, size_t *len)
+{
+  if (k->handle == NULL)
+    return NULL;
+  *len = k->handlelen;
+  return k->handle;
+}
+
+uint8_t
+gf_key_sk_flags (const gf_key *k)
+{
+  return k->sk_flags;
 }
 
 const uint8_t *
@@ -980,6 +1030,108 @@ gf_key_verify_sk (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
   return rc;
 }
 
+/* ---- A token's answer as a signature blob ---- */
+
+/* A DER length, in the shortest form that holds it (X.690 section 10.1): a
+   signature is under 128 bytes, so the one-byte long form is the most there
+   can be, and indefinite lengths are not DER at all.  */
+static int
+der_length (const uint8_t **p, const uint8_t *end, size_t *len)
+{
+  if (*p == end)
+    return -1;
+  *len = *(*p)++;
+  if (*len < 0x80)
+    return 0;
+  if (*len != 0x81 || *p == end)
+    return -1;
+  *len = *(*p)++;
+  return *len < 0x80 ? -1 : 0;
+}
+
+/* A positive INTEGER of at most MAX bytes, with no unneeded leading zero.
+   Its contents are what an SSH mpint holds, so they are returned as they
+   are.  */
+static int
+der_integer (const uint8_t **p, const uint8_t *end, size_t max, gf_slice *v)
+{
+  size_t len;
+
+  if (*p == end || *(*p)++ != 0x02 || der_length (p, end, &len) != 0
+      || len == 0 || len > max || len > (size_t) (end - *p))
+    return -1;
+  v->data = *p;
+  v->len = len;
+  *p += len;
+  if (v->data[0] & 0x80)			/* Negative.  */
+    return -1;
+  if (v->len == 1 ? v->data[0] == 0 : v->data[0] == 0 && !(v->data[1] & 0x80))
+    return -1;					/* Zero, or not minimal.  */
+  return 0;
+}
+
+/* ECDSA-Sig-Value (RFC 3279): SEQUENCE { INTEGER r, INTEGER s }, DER and
+   nothing after it, as the mpint pair an SSH signature holds.  */
+static int
+der_to_mpints (const uint8_t *der, size_t len, size_t max, gf_writer *w)
+{
+  const uint8_t *p = der, *end = der + len;
+  gf_slice r, s;
+  size_t seq;
+
+  if (p == end || *p++ != 0x30 || der_length (&p, end, &seq) != 0
+      || seq != (size_t) (end - p)
+      || der_integer (&p, end, max, &r) != 0
+      || der_integer (&p, end, max, &s) != 0 || p != end)
+    return GF_ERR_ENCODING;
+  gf_wr_string (w, r.data, r.len);
+  gf_wr_string (w, s.data, s.len);
+  return GF_OK;
+}
+
+int
+gf_sk_signature_pack (const gf_key *k, enum gf_sigalg alg, const uint8_t *raw,
+                      size_t rawlen, uint8_t flags, uint32_t counter,
+                      uint8_t *out, size_t cap, size_t *outlen)
+{
+  uint8_t sig[2 * (4 + 33)];
+  gf_writer w, sw;
+  size_t siglen;
+
+  if (k == NULL || raw == NULL || out == NULL || outlen == NULL)
+    return GF_ERR_INVAL;
+  if (!gf_sigalg_is_user_only (alg) || !alg_fits_key (k, alg))
+    return GF_ERR_UNSUPPORTED;
+  alg = gf_sigalg_base (alg);
+  if (alg == GF_SIG_SK_ED25519)
+    {
+      if (rawlen != 2 * ED_LEN)
+        return GF_ERR_ENCODING;
+      memcpy (sig, raw, rawlen);
+      siglen = rawlen;
+    }
+  else
+    {
+      int rc;
+
+      /* The integers of P-256 are 32 bytes, 33 with a zero in front.  */
+      gf_writer_init (&sw, sig, sizeof sig);
+      rc = der_to_mpints (raw, rawlen, 33, &sw);
+      if (rc != GF_OK)
+        return rc;
+      siglen = sw.len;
+    }
+  gf_writer_init (&w, out, cap);
+  gf_wr_cstring (&w, gf_sigalg_name (alg));
+  gf_wr_string (&w, sig, siglen);
+  gf_wr_u8 (&w, flags);
+  gf_wr_u32 (&w, counter);
+  if (gf_wr_status (&w) != GF_OK)
+    return GF_ERR_BUFSIZE;
+  *outlen = w.len;
+  return GF_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Fingerprints and the OpenSSH private key format                    */
 /* ------------------------------------------------------------------ */
@@ -1278,6 +1430,66 @@ file_derive (const struct file_cipher *fc, const char *pass,
   return GF_OK;
 }
 
+/* The end of a private section: the comment, and the padding (1, 2, 3, ...)
+   to the cipher's block size.  */
+static int
+comment_and_padding (gf_reader *r)
+{
+  gf_slice s;
+  uint8_t want = 1;
+
+  if (gf_rd_string (r, &s) != GF_OK)
+    return GF_ERR_ENCODING;
+  while (gf_rd_remaining (r) > 0)
+    {
+      uint8_t pb;
+
+      if (gf_rd_u8 (r, &pb) != GF_OK || pb != want++)
+        return GF_ERR_ENCODING;
+    }
+  return GF_OK;
+}
+
+static int
+same_slice (gf_slice a, gf_slice b)
+{
+  return a.len == b.len && (a.len == 0 || memcmp (a.data, b.data, a.len) == 0);
+}
+
+/* The private section of a security key's file, after its type name
+   (PROTOCOL.u2f): the public key again, the application, the flags, the key
+   handle and a reserved string, then the comment and padding.  Each part
+   must agree with K, the public key of the file, and the handle is
+   attached to it.  There is no private key to import.  */
+static int
+sk_private_read (gf_key *k, gf_reader *r)
+{
+  gf_reader br;
+  gf_slice name, a, b, handle, reserved;
+  uint8_t flags;
+
+  gf_reader_init (&br, k->blob, k->bloblen);
+  if (gf_rd_string (&br, &name) != GF_OK)
+    return GF_ERR_ENCODING;
+  if (k->type != GF_KEY_ED25519		/* The curve name, then the point.  */
+      && (gf_rd_string (&br, &a) != GF_OK || gf_rd_string (r, &b) != GF_OK
+          || !same_slice (a, b)))
+    return GF_ERR_ENCODING;
+  if (gf_rd_string (&br, &a) != GF_OK || gf_rd_string (r, &b) != GF_OK
+      || !same_slice (a, b))
+    return GF_ERR_ENCODING;
+  if (gf_rd_string (r, &a) != GF_OK || a.len != k->applen
+      || memcmp (a.data, k->app, k->applen) != 0)
+    return GF_ERR_ENCODING;
+  if (gf_rd_u8 (r, &flags) != GF_OK || gf_rd_string (r, &handle) != GF_OK
+      || handle.len == 0 || handle.len > GF_SK_HANDLE_MAX
+      || gf_rd_string (r, &reserved) != GF_OK)
+    return GF_ERR_ENCODING;
+  if (comment_and_padding (r) != GF_OK)
+    return GF_ERR_ENCODING;
+  return set_handle (k, flags, handle.data, handle.len);
+}
+
 static int
 private_read (gf_key **out, const char *text, size_t len, const char *pass,
               gf_bcrypt_pbkdf_fn kdf, void *kuser)
@@ -1286,7 +1498,7 @@ private_read (gf_key **out, const char *text, size_t len, const char *pass,
   uint8_t *der = NULL;
   long dn;
   gf_reader r, pr, kr;
-  gf_slice s, cipher, kdfname, kdfopts, pubblob, priv, ktype, tag = { NULL, 0 };
+  gf_slice cipher, kdfname, kdfopts, pubblob, priv, ktype, tag = { NULL, 0 };
   const struct file_cipher *fc = NULL;
   int decrypted = 0;
   uint32_t nkeys, c1, c2;
@@ -1374,8 +1586,9 @@ private_read (gf_key **out, const char *text, size_t len, const char *pass,
   rc = gf_key_from_blob (&chk, pubblob.data, pubblob.len);
   if (rc != GF_OK)
     goto done;
-  if (chk->app != NULL)		/* The private part is a key handle.  */
+  if (chk->app != NULL && chk->cert != NULL)
     {
+      /* ssh-keygen keeps a certificate in a file of its own.  */
       rc = GF_ERR_UNSUPPORTED;
       goto done;
     }
@@ -1391,10 +1604,23 @@ private_read (gf_key **out, const char *text, size_t len, const char *pass,
       rc = decrypted ? GF_ERR_PASSPHRASE : GF_ERR_ENCODING;
       goto done;
     }
-  if (gf_rd_string (&pr, &ktype) != GF_OK
-      || !gf_slice_equals (ktype, type_name (chk->type)))
-    goto done;
   ti = type_index (chk->type);
+  if (gf_rd_string (&pr, &ktype) != GF_OK
+      || !gf_slice_equals (ktype, chk->app ? types[ti].sk_name
+                           : type_name (chk->type)))
+    goto done;
+  if (chk->app != NULL)
+    {
+      /* A security key has no private key to keep: its file holds the
+         handle the token needs to sign.  */
+      rc = sk_private_read (chk, &pr);
+      if (rc == GF_OK)
+        {
+          *out = chk;
+          chk = NULL;
+        }
+      goto done;
+    }
   k = calloc (1, sizeof *k);
   if (k == NULL)
     {
@@ -1469,26 +1695,9 @@ private_read (gf_key **out, const char *text, size_t len, const char *pass,
     }
   if (rc != GF_OK)
     goto done;
-  /* The comment and the padding (1, 2, 3, ...) follow.  */
-  if (gf_rd_string (&kr, &s) != GF_OK)
-    {
-      rc = GF_ERR_ENCODING;
-      goto done;
-    }
-  {
-    uint8_t want = 1;
-
-    while (gf_rd_remaining (&kr) > 0)
-      {
-        uint8_t pb;
-
-        if (gf_rd_u8 (&kr, &pb) != GF_OK || pb != want++)
-          {
-            rc = GF_ERR_ENCODING;
-            goto done;
-          }
-      }
-  }
+  rc = comment_and_padding (&kr);
+  if (rc != GF_OK)
+    goto done;
   rc = selftest (k);
   if (rc == GF_OK)
     {

@@ -149,6 +149,25 @@ done
 client --user "$user" --key "$dir/stranger" && fail "client authenticated with an unknown key"
 grep -q '^AUTH FAILED' "$dir/client.out" || fail "unknown key: no failure reported"
 client --user no-such-user-here --key "$dir/uk_ed25519" && fail "client authenticated as an unknown user"
+# FIDO security keys: a token in software signs (with the application and
+# key handle the library gives it), the library packs its raw or DER answer
+# into the signature blob, and sshd's own verifier checks the result against
+# the sk key in authorized_keys.  The key made from the token's key has the
+# fingerprint ssh-keygen gives its public line.
+for t in ed25519 ecdsa; do
+  "$CLIENT" 0 --sk-token "$dir/uk_$t" --print-sk-pub > "$dir/sk_$t.pub" \
+    || { fail "sk $t: no public key"; continue; }
+  cat "$dir/sk_$t.pub" >> "$dir/authorized_keys"
+  client --user "$user" --sk-token "$dir/uk_$t" \
+    || { fail "client security key $t"; cat "$dir/client.out"; }
+  grep -q '^AUTH OK' "$dir/client.out" || fail "client security key $t: not authenticated"
+  client --user "$user" --sk-token "$dir/uk_$t" --rekey \
+    || { fail "client security key $t with a rekey"; cat "$dir/client.out"; }
+done
+# A token whose key sshd has not been told about.
+$SSH_KEYGEN -q -t ecdsa -N '' -f "$dir/sk_stranger" || exit 99
+client --user "$user" --sk-token "$dir/sk_stranger" && fail "client authenticated with an unknown security key"
+grep -q '^AUTH FAILED' "$dir/client.out" || fail "unknown security key: no failure reported"
 # Rekeying after authentication, in the middle of the session.
 client --user "$user" --key "$dir/uk_ed25519" --rekey \
   || { fail "client rekey"; cat "$dir/client.out"; }

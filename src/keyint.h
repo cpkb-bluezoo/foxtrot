@@ -72,6 +72,9 @@ struct gf_key
   struct gf_cert *cert;
   uint8_t *app;			/* A security key's application, else NULL.  */
   size_t applen;
+  uint8_t sk_flags;		/* A security key's stored flags.  */
+  uint8_t *handle;		/* Its key handle (credential ID), or NULL.  */
+  size_t handlelen;
   struct gf_x509 *x509;		/* An X.509 chain, else NULL.  */
 };
 

@@ -74,7 +74,7 @@ Certificates (key.h): a client may present an OpenSSH user certificate in place 
 .PP
 X.509 chains (RFC 6187, x509.h) are accepted the same way if the server's configuration has a trust store (x509_trust): the machine checks the chain against it for a user (id\-kp\-secureShellClient), at the current time, before the application sees the request, which is then marked x509 and left to the application to map to a user from the subject (gf_x509_subject, gf_x509_san).  Without a trust store no chain is accepted.
 .PP
-Security keys (FIDO, key.h) are accepted as public keys: the machine verifies the token's signature, requires the user presence flag, and hands the application the flags and counter.  There is no client side: the library does not talk to tokens.
+Security keys (FIDO, key.h) are accepted as public keys: the machine verifies the token's signature, requires the user presence flag, and hands the application the flags and counter.  A client signs with one through the sign event, the application driving the token (the library does not talk to tokens).
 .PP
 Not implemented: hostbased (it trusts a client machine's identity on the word of its administrator and the DNS), and password change (a request to change the password is refused).  A signature algorithm is only ever one of policy.h: a client cannot sign, and a server will not accept, an ssh\-rsa signature.
 .PP
@@ -256,12 +256,16 @@ typedef struct gf_auth_client_events
                  size_t nprompts, const gf_slice *prompts, const int *echo);
   /* Sign DATA with KEY, which has no private part here, under ALG: the key
      lives in an agent, a security token, a smart card or a remote service.
+     For a security key the token is given SHA256(DATA) as its challenge,
+     gf_key_application and gf_key_sk_handle of KEY (key.h), and the flags
+     and counter of its authenticator data go in the blob.
      Required for such a key.  Return 0 to take the job, and answer with
      gf_auth_client_sign_respond or gf_auth_client_sign_fail, inside the call
      or later; DATA is valid only until you answer.  Return nonzero to say
      you cannot, and the key is skipped.  The signature is the whole blob
      (string algorithm name, then the signature, and for a security key the
-     flags and counter after it), as gf_key_sign makes it; for a certificate
+     flags and counter after it, which gf_sk_signature_pack makes from what a
+     token returns), as gf_key_sign makes it; for a certificate
      the name inside is its key's.  The machine checks the answer against KEY
      before it sends it, so a wrong or untouched\-token answer only costs the
      key.  Signing may take as long as a person does; the server's grace

@@ -84,6 +84,8 @@ struct ap
   const gf_key *wrong_signer;	/* Signs under SIGN_OTHER.  */
   const gf_key *token_plain;	/* The token's key, for SIGN_TOKEN.  */
   uint8_t token_flags;
+  const uint8_t *token_handle;	/* SIGN_TOKEN_PACKED: the credential.  */
+  size_t token_handle_len;
   uint8_t stash[GF_SIG_MAX];
   size_t stashlen;
   int pending;
@@ -285,12 +287,17 @@ enum
 {
   SIGN_NONE, SIGN_SYNC, SIGN_ASYNC, SIGN_REFUSE, SIGN_FAIL, SIGN_FAIL_ASYNC,
   SIGN_BADSIG, SIGN_WRONGDATA, SIGN_OTHER, SIGN_TOKEN, SIGN_TOKEN_ASYNC,
-  SIGN_SYNC_AND_REFUSE		/* Answers, then says it could not.  */
+  SIGN_SYNC_AND_REFUSE,		/* Answers, then says it could not.  */
+  SIGN_TOKEN_PACKED		/* A token's raw answer, packed by the library.  */
 };
 
 static size_t token_sign (const gf_key *plain, const char *app, const uint8_t *m,
                           size_t ml, uint8_t flags, uint32_t counter,
                           uint8_t *out, size_t cap);
+
+static size_t token_answer_packed (const struct ap *x, const gf_key *key,
+                                   enum gf_sigalg alg, gf_slice data,
+                                   uint8_t *out, size_t cap);
 
 static int
 cli_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
@@ -316,6 +323,8 @@ cli_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
   if (x->sign_mode == SIGN_TOKEN || x->sign_mode == SIGN_TOKEN_ASYNC)
     n = token_sign (x->token_plain, "ssh:", data.data, data.len, x->token_flags,
                     7, sig, sizeof sig);
+  else if (x->sign_mode == SIGN_TOKEN_PACKED)
+    n = token_answer_packed (x, key, alg, data, sig, sizeof sig);
   else
     {
       for (i = 0; i < x->nsigners; i++)
@@ -1975,6 +1984,90 @@ token_sign (const gf_key *plain, const char *app, const uint8_t *m, size_t ml,
   return w.len;
 }
 
+/* A security key for a P-256 token key.  */
+static gf_key *
+soft_sk_public_p256 (const gf_key *plain, const char *app)
+{
+  uint8_t b[256];
+  size_t pl;
+  const uint8_t *pb = gf_key_blob (plain, &pl);
+  gf_reader r;
+  gf_slice s, q;
+  gf_writer w;
+  gf_key *k = NULL;
+
+  gf_reader_init (&r, pb, pl);
+  CHECK_EQ (gf_rd_string (&r, &s), GF_OK);
+  CHECK_EQ (gf_rd_string (&r, &s), GF_OK);
+  CHECK_EQ (gf_rd_string (&r, &q), GF_OK);
+  gf_writer_init (&w, b, sizeof b);
+  gf_wr_cstring (&w, "sk-ecdsa-sha2-nistp256@openssh.com");
+  gf_wr_cstring (&w, "nistp256");
+  gf_wr_string (&w, q.data, q.len);
+  gf_wr_string (&w, app, strlen (app));
+  CHECK_EQ (gf_key_from_blob (&k, b, w.len), GF_OK);
+  return k;
+}
+
+/* What a FIDO library hands back for an assertion: the signature over
+   SHA256(application) || flags || counter || SHA256(data) as the token
+   makes it, with Ed25519's 64 bytes raw and ECDSA's integers in DER.  The
+   token is asked for the application and key handle of KEY, and the library
+   packs the answer.  */
+static size_t
+token_answer_packed (const struct ap *x, const gf_key *key, enum gf_sigalg alg,
+                     gf_slice data, uint8_t *out, size_t cap)
+{
+  uint8_t buf[69], sig[GF_SIG_MAX], raw[80];
+  const uint8_t *app, *h;
+  size_t al, hl, sl, rl, n = 0;
+  gf_reader r, rr;
+  gf_slice name, body, ri, si;
+  int ed = gf_key_type (x->token_plain) == GF_KEY_ED25519;
+
+  app = gf_key_application (key, &al);
+  h = gf_key_sk_handle (key, &hl);
+  CHECK (app != NULL && h != NULL);
+  CHECK (hl == x->token_handle_len && memcmp (h, x->token_handle, hl) == 0);
+  CHECK_EQ (gf_hash_compute (GF_HASH_SHA256, app, al, buf, 32), GF_OK);
+  buf[32] = x->token_flags;
+  buf[33] = 0;
+  buf[34] = 0;
+  buf[35] = 0;
+  buf[36] = 7;
+  CHECK_EQ (gf_hash_compute (GF_HASH_SHA256, data.data, data.len, buf + 37, 32),
+            GF_OK);
+  CHECK_EQ (gf_key_sign (x->token_plain, ed ? GF_SIG_ED25519 : GF_SIG_ECDSA_NISTP256,
+                         buf, sizeof buf, sig, sizeof sig, &sl), GF_OK);
+  gf_reader_init (&r, sig, sl);
+  CHECK_EQ (gf_rd_string (&r, &name), GF_OK);
+  CHECK_EQ (gf_rd_string (&r, &body), GF_OK);
+  if (ed)
+    {
+      memcpy (raw, body.data, body.len);
+      rl = body.len;
+    }
+  else
+    {
+      /* The mpints of the SSH signature are the contents of DER integers. */
+      gf_reader_init (&rr, body.data, body.len);
+      CHECK_EQ (gf_rd_string (&rr, &ri), GF_OK);
+      CHECK_EQ (gf_rd_string (&rr, &si), GF_OK);
+      raw[0] = 0x30;
+      raw[1] = (uint8_t) (4 + ri.len + si.len);
+      raw[2] = 0x02;
+      raw[3] = (uint8_t) ri.len;
+      memcpy (raw + 4, ri.data, ri.len);
+      raw[4 + ri.len] = 0x02;
+      raw[5 + ri.len] = (uint8_t) si.len;
+      memcpy (raw + 6 + ri.len, si.data, si.len);
+      rl = 6 + ri.len + si.len;
+    }
+  CHECK_EQ (gf_sk_signature_pack (key, alg, raw, rl, x->token_flags, 7, out, cap, &n),
+            GF_OK);
+  return n;
+}
+
 /* A user certificate for the security key, signed by CA.  */
 static gf_key *
 soft_sk_cert (gf_key *ca, const gf_key *plain, const char *app,
@@ -2422,6 +2515,66 @@ test_external_signer (void)
   gf_key_free (ca);
 }
 
+/* A client signing with a security key through a token: the application
+   gives the token the key handle and application the file or the token
+   holds, and the library packs what it answers.  Ed25519 and P-256, the
+   answer checked by the client and then by the server.  */
+static void
+test_security_key_client (void)
+{
+  static const uint8_t handle[70] = { 0x11, 0x22, 0x33, 0x44 };
+  gf_auth_server_config sc = srv_config (GF_AUTH_PUBLICKEY);
+  int t;
+
+  for (t = 0; t < 2; t++)
+    {
+      gf_key *plain = NULL, *sk;
+      struct cli_creds cr;
+      struct ap x;
+
+      CHECK_EQ (gf_key_generate (&plain, t ? GF_KEY_ECDSA_P256 : GF_KEY_ED25519, 0),
+                GF_OK);
+      sk = t ? soft_sk_public_p256 (plain, "ssh:") : soft_sk_public (plain, "ssh:");
+      CHECK_EQ (gf_key_sk_attach_handle (sk, GF_SK_USER_PRESENT, handle, sizeof handle),
+                GF_OK);
+      cr = (struct cli_creds) { "alice", { sk }, 1, NULL, 0, 0 };
+
+      ap_new (&x, &sc, &cr);
+      x.sign_mode = SIGN_TOKEN_PACKED;
+      x.token_plain = plain;
+      x.token_flags = GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED;
+      x.token_handle = handle;
+      x.token_handle_len = sizeof handle;
+      x.authorized[0] = sk;
+      x.nauthorized = 1;
+      ap_run (&x);
+      CHECK_EQ (x.cli_authenticated, 1);
+      CHECK_EQ (x.sign_calls, 1);
+      CHECK_EQ (x.sign_alg, t ? GF_SIG_SK_ECDSA_NISTP256 : GF_SIG_SK_ED25519);
+      CHECK_EQ (x.srv_sk_flags, GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED);
+      CHECK_EQ (x.srv_sk_counter, 7);
+      ap_free (&x);
+
+      /* A token that was not touched: its answer packs, and the client's
+         own check, which is the server's policy, refuses it.  */
+      ap_new (&x, &sc, &cr);
+      x.sign_mode = SIGN_TOKEN_PACKED;
+      x.token_plain = plain;
+      x.token_flags = 0;
+      x.token_handle = handle;
+      x.token_handle_len = sizeof handle;
+      x.authorized[0] = sk;
+      x.nauthorized = 1;
+      ap_run (&x);
+      CHECK_EQ (x.sent_signed, 0);
+      CHECK_EQ (x.cli_authenticated, 0);
+      ap_free (&x);
+
+      gf_key_free (sk);
+      gf_key_free (plain);
+    }
+}
+
 #ifdef HAVE_GNUTLS
 /* ---------------------------------------------------------------- */
 /* X.509 chains                                                       */
@@ -2691,6 +2844,7 @@ main (void)
   test_limits_and_timeout ();
   test_certificates ();
   test_security_keys ();
+  test_security_key_client ();
   test_external_signer ();
 #ifdef HAVE_GNUTLS
   test_x509 ();
