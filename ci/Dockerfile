@@ -70,9 +70,15 @@ ENV SAN="-g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -fn
 ENV ASAN_OPTIONS=abort_on_error=1 LSAN_OPTIONS=suppressions=/src/fuzz/lsan.supp:print_suppressions=0
 RUN make distclean >/dev/null 2>&1; \
     ./configure --without-gnutls CFLAGS="$SAN" LDFLAGS="-fsanitize=address,undefined" \
-    && make -j"$(nproc)" -C src CFLAGS="$SAN -fsanitize-coverage=trace-pc" \
-    && make -j"$(nproc)" check CFLAGS="$SAN -fsanitize-coverage=trace-pc" \
+    && make -j"$(nproc)" check CFLAGS="$SAN" \
        || (cat tests/test-suite.log fuzz/test-suite.log; exit 1)
+# Coverage (for the mutation below) is for the library and the fuzz targets
+# only: a library built with it needs the callback that fuzz/driver.c
+# defines, which the unit tests do not link.
+RUN make -C src clean \
+    && make -j"$(nproc)" -C src CFLAGS="$SAN -fsanitize-coverage=trace-pc" \
+    && make -C fuzz clean \
+    && make -j"$(nproc)" -C fuzz check TESTS= CFLAGS="$SAN -fsanitize-coverage=trace-pc"
 RUN cd fuzz && for t in $(ls corpus); do \
       ./fuzz-$t -runs=100000000 -max_total_time=30 -seed=1 -save=/tmp/crash-$t.bin \
         corpus/$t || exit 1; \
