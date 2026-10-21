@@ -108,6 +108,11 @@ PKCS#8, RFC 4716, PuTTY.
 Host key checking, key revocation lists, and X.509 chains as keys (RFC 6187,
 with GnuTLS).
 .TP
+.BR foxtrot_agent (3)
+The messages of the ssh-agent protocol, for a client whose keys are in an
+agent: framing, the list of identities, signing requests and replies, and
+session-bind.  The socket is the application's.
+.TP
 .BR foxtrot_policy (3), " foxtrot_crypto" (3), " foxtrot_wire" (3), " foxtrot_status" (3)
 The algorithm policy, the cryptographic primitives (all from libgcrypt), the
 wire encoding, and the status codes.
@@ -161,7 +166,8 @@ SSH protocol 1; CBC and CTR ciphers and separate MACs in the transport (the
 ciphers are all AEAD); SHA-1 signatures and
 .IR ssh-rsa ;
 DSA; ECDSA over P-521; finite-field Diffie-Hellman; compression; agent and X11
-forwarding; host-based authentication; and the old password change.
+forwarding (a client can have its keys in an agent, see
+.BR foxtrot_agent (3)); host-based authentication; and the old password change.
 Keys are held to a minimum strength, and the Terrapin attack is closed by
 strict key exchange, which is required of the peer.
 .PP

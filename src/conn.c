@@ -95,6 +95,8 @@ struct gf_conn
   struct pending_keys read_keys;
   uint8_t session_id[GF_KEX_MAX_HASH];
   size_t sid_len;
+  uint8_t host_sig[GF_SIG_MAX];	/* The host key's signature of the first H.  */
+  size_t host_sig_len;
   gf_key *peer_key;		/* Client: the server's host key.  */
   const gf_key *sign_key;	/* Server: the key used.  */
   gf_conn_info info;
@@ -397,6 +399,21 @@ derive_keys (gf_conn *c, const gf_kex_secret *k, const uint8_t *h, size_t hlen)
   return r;
 }
 
+/* Keep the host key's signature of the first exchange hash, for
+   gf_conn_info.  A rekey's is not kept: it is over a later hash.  */
+static void
+keep_host_sig (gf_conn *c, const uint8_t *sig, size_t len)
+{
+  if (!c->first_kex)
+    return;
+  c->host_sig_len = 0;
+  if (len <= sizeof c->host_sig)
+    {
+      memcpy (c->host_sig, sig, len);
+      c->host_sig_len = len;
+    }
+}
+
 static void
 fill_info (gf_conn *c)
 {
@@ -406,6 +423,8 @@ fill_info (gf_conn *c)
   c->info.cipher_s2c = c->algs.s2c;
   c->info.session_id = c->session_id;
   c->info.session_id_len = c->sid_len;
+  c->info.host_sig = c->host_sig;
+  c->info.host_sig_len = c->host_sig_len;
   c->info.peer_ident = gf_ident_string (&c->ident_peer);
   c->info.peer_software = gf_ident_software (&c->ident_peer);
   c->info.host_key = c->server ? c->sign_key : c->peer_key;
@@ -652,6 +671,7 @@ handle_kex_init (gf_conn *c, const uint8_t *p, size_t n)
   r = gf_wr_status (&w) == GF_OK ? send_packet (c, msg, w.len) : GF_ERR_BUFSIZE;
   free (msg);
   c->sign_key = key;
+  keep_host_sig (c, sig, siglen);
   if (r == GF_OK)
     r = derive_keys (c, &k, h, hlen);
   gf_wipe (&k, sizeof k);
@@ -715,6 +735,7 @@ handle_kex_reply (gf_conn *c, const uint8_t *p, size_t n)
 
   if (c->first_kex)
     {
+      keep_host_sig (c, sig.data, sig.len);
       /* The application decides whether to trust the key; the signature
          has shown that the server holds it.  */
       c->in_event = 1;

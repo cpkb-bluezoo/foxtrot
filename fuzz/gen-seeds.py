@@ -330,6 +330,47 @@ add('conn', 'client-cut', b'\x00\x05' + sinit)
 add('conn', 'ident-only', b'\x01\x01SSH-2.0-x\r\n')
 add('conn', 'garbage', b'\x01\x20' + b'SSH-2.0-x\r\n' + bytes(range(256)))
 
+# ---- agent: [mode][chunk or key/algorithm] bytes ----
+# Mode 0 is an agent's byte stream, 1 an IDENTITIES_ANSWER, 2 a SIGN_RESPONSE,
+# 3 data for a SIGN_REQUEST and a session-bind.
+agent = hexc('vectors-agent.h')
+parts = re.search(r'vec_agent_identities\[\] = \{(.*?)NULL', open(os.path.join(TESTS, 'vectors-agent.h')).read(), re.S).group(1)
+a_ident = bytes.fromhex(''.join(re.findall(r'"([0-9a-f]*)"', parts)))
+a_sign = agent['vec_agent_sign3_response']
+a_sign_ed = agent['vec_agent_sign0_response']
+a_empty = agent['vec_agent_empty_answer']
+a_fail = agent['vec_agent_failure']
+def afr(p): return u32(len(p)) + p
+add('agent', 'ident-answer', b'\x01\x00' + a_ident)
+add('agent', 'ident-empty', b'\x01\x00' + a_empty)
+add('agent', 'ident-cut', b'\x01\x00' + a_ident[:300])
+add('agent', 'ident-count-huge', b'\x01\x00' + b'\x0c\xff\xff\xff\xff' + b'\0' * 8)
+add('agent', 'ident-one-empty', b'\x01\x00' + b'\x0c\0\0\0\x01' + b'\0' * 8)
+add('agent', 'ident-trailing', b'\x01\x00' + a_ident + b'\0')
+add('agent', 'sign-rsa', b'\x02\x00' + a_sign)
+add('agent', 'sign-ed25519', b'\x02\x00' + a_sign_ed)
+add('agent', 'sign-trailing', b'\x02\x00' + a_sign + b'\0')
+add('agent', 'sign-cut', b'\x02\x00' + a_sign[:20])
+add('agent', 'failure', b'\x02\x00' + a_fail)
+stream = afr(a_ident) + afr(a_sign) + afr(a_fail) + afr(a_empty) + afr(b'\x06')
+add('agent', 'stream', b'\x00\x07' + stream)
+add('agent', 'stream-cut', b'\x00\x03' + stream[:400])
+add('agent', 'stream-one-byte', b'\x00\x00' + stream)
+add('agent', 'stream-zero-length', b'\x00\x05' + afr(a_fail) + u32(0) + afr(a_fail))
+add('agent', 'stream-oversize', b'\x00\x05' + afr(a_fail) + u32(256 * 1024 + 1) + b'\x0c')
+add('agent', 'stream-huge-length', b'\x00\x05' + u32(0xffffffff))
+add('agent', 'stream-big-partial', b'\x00\x09' + u32(256 * 1024) + b'\x0e' * 3000)
+# The byte after the mode is key + 8 * algorithm: the key by its index in
+# vec_agent_signs, the algorithm by its number in policy.h.
+add('agent', 'request-ed25519', bytes([3, 0 + 8 * 1]) + b'data to be signed')
+add('agent', 'request-rsa-sha2-256', bytes([3, 3 + 8 * 4]) + b'data to be signed')
+add('agent', 'request-rsa-sha2-512', bytes([3, 4 + 8 * 5]) + b'data to be signed')
+add('agent', 'request-ed25519-cert', bytes([3, 5 + 8 * 6]) + b'data to be signed')
+add('agent', 'request-rsa-cert', bytes([3, 6 + 8 * 9]) + b'data to be signed')
+add('agent', 'request-wrong-algorithm', bytes([3, 0 + 8 * 4]) + b'data to be signed')
+add('agent', 'request-empty-data', bytes([3, 8]))
+add('agent', 'request-bind', bytes([3, 8]) + b'\x20' + bytes(range(32)) + agent['vec_agent_bind_sig'])
+
 n = 0
 for target, items in seeds.items():
     d = os.path.join(OUT, target)

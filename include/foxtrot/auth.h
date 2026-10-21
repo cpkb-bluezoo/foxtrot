@@ -302,7 +302,8 @@ typedef struct gf_auth_client_events
      For a security key the token is given SHA256(DATA) as its challenge,
      gf_key_application and gf_key_sk_handle of KEY (key.h), and the flags
      and counter of its authenticator data go in the blob.
-     Required for such a key.  Return 0 to take the job, and answer with
+     Required for such a key.  (agent.h makes and reads an ssh-agent's
+     messages; the socket is the application's.)  Return 0 to take the job, and answer with
      gf_auth_client_sign_respond or gf_auth_client_sign_fail, inside the call
      or later; DATA is valid only until you answer.  Return nonzero to say
      you cannot, and the key is skipped.  The signature is the whole blob

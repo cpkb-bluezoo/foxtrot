@@ -26,6 +26,8 @@
                          [--sftp "COMMAND; COMMAND; ..."]
                          [--cert FILE] [--known-hosts FILE] [--host-name NAME]
                          [--sk-token FILE [--print-sk-pub]]
+                         [--agent SOCKET [--agent-key SHA256:...]
+                          [--agent-bind | --agent-bind-bad]]
 
    Connects to 127.0.0.1:PORT, completes the transport handshake with the
    given algorithms (default: the policy's), asks the application to trust
@@ -43,7 +45,15 @@
    from its public part, application "ssh:", with a key handle; the signature
    is made as a token and a FIDO library would give it, raw or DER, and
    packed by the library; --print-sk-pub prints the key as an
-   authorized_keys line and exits), or by answering every
+   authorized_keys line and exits), through an ssh-agent (--agent: SOCKET is
+   the agent's Unix socket; the identities it lists are offered, or just the
+   ones with the fingerprint given by --agent-key, and the signing is done by
+   the agent through the sign event, over the socket this program drives
+   itself, as an application does: the library only makes and reads the
+   messages; --agent-bind first tells the agent which session this is, with
+   the host key and its signature of the exchange hash, as ssh does, and
+   --agent-bind-bad does so with a damaged signature, which the agent must
+   refuse), or by answering every
    keyboard-interactive prompt with ANSWER, as given; with --rekey it then
    forces a key exchange and waits for it; --rekey-bytes N makes the
    connection rekey by itself every N bytes.  With --exec it then runs
@@ -73,7 +83,9 @@
    with up to 16 reads or writes of 32 KiB in flight, and prints
    "RESULT command status" (0 is success), and for a listing "LS name size
    perms", "STAT size=n perms=o", "NAME name".  Prints "KEX ...", "HOSTKEY ...", "SERVICE ...", "AUTH OK" or
-   "AUTH FAILED", "REKEYED ...", "OUT text" (output of up to 200 bytes),
+   "AUTH FAILED", "AGENT IDENTITIES n SKIPPED m", "AGENT KEY fingerprint
+   type comment", "AGENT BIND OK" or "AGENT BIND REFUSED", "AGENT SIGN alg OK"
+   or "AGENT SIGN alg REFUSED", "REKEYED ...", "OUT text" (output of up to 200 bytes),
    "RECEIVED n", "STDERR n", "SENT n", "EXIT status" and "DONE", and exits 0
    if all that was asked went well.  */
 
@@ -85,7 +97,9 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
+#include <foxtrot/agent.h>
 #include <foxtrot/session.h>
 #include <foxtrot/crypto.h>
 #include <foxtrot/key.h>
@@ -104,6 +118,17 @@ struct ctx
   uint32_t token_counter;
   const char *host_name;	/* The name looked up in it.  */
   unsigned port;
+  /* --agent: the socket, the reader of its replies, the reply being waited
+     for, and the identities it holds that are to be offered.  */
+  int agent_fd, agent_bind;	/* The bind is 1, or 2 with a damaged
+				   signature.  */
+  const char *agent_fp;
+  gf_agent_reader *agent_rd;
+  uint8_t *agent_reply;
+  size_t agent_reply_len;
+  gf_key *agent_keys[16];
+  const gf_key *agent_offer[16];
+  size_t nagent_keys, agent_total;
   int rekey, no_auth, check_pattern;
   int established, service, authed, auth_failed, rekeyed, banners;
   uint64_t send_total, sent, received, stderr_bytes;
@@ -184,10 +209,176 @@ on_host_key (void *user, const gf_key *key)
   return 0;
 }
 
+/* ---- The agent ---- */
+
+static int
+agent_on_frame (void *user, const uint8_t *payload, size_t len)
+{
+  struct ctx *x = user;
+
+  if (x->agent_reply != NULL)
+    return 1;			/* More than was asked for.  */
+  x->agent_reply = malloc (len);
+  if (x->agent_reply == NULL)
+    return 1;
+  memcpy (x->agent_reply, payload, len);
+  x->agent_reply_len = len;
+  return 0;
+}
+
+/* Send REQ and wait for the one frame that answers it.  */
+static int
+agent_call (struct ctx *x, const uint8_t *req, size_t len)
+{
+  uint8_t buf[4096];
+
+  free (x->agent_reply);
+  x->agent_reply = NULL;
+  if (sock_write (x->agent_fd, req, len) != 0)
+    return -1;
+  while (x->agent_reply == NULL)
+    {
+      struct pollfd pfd = { x->agent_fd, POLLIN, 0 };
+      ssize_t n;
+
+      if (poll (&pfd, 1, 10000) <= 0)
+        return -1;
+      n = read (x->agent_fd, buf, sizeof buf);
+      if (n <= 0)
+        return -1;
+      if (gf_agent_reader_feed (x->agent_rd, buf, (size_t) n, agent_on_frame,
+                                x) != GF_OK)
+        return -1;
+    }
+  /* Nothing may follow it.  */
+  return gf_agent_reader_idle (x->agent_rd) ? 0 : -1;
+}
+
+static int
+agent_identity (void *user, const gf_key *key, gf_slice comment)
+{
+  struct ctx *x = user;
+  char fp[64], text[96];
+  size_t i, n = comment.len < 60 ? comment.len : 60;
+  const uint8_t *b;
+  size_t bl;
+
+  gf_key_fingerprint (key, fp, sizeof fp);
+  /* The comment is the agent's, so it is not shown as it is.  */
+  for (i = 0; i < n; i++)
+    text[i] = comment.data[i] >= 0x20 && comment.data[i] < 0x7f
+      ? (char) comment.data[i] : '?';
+  text[n] = '\0';
+  printf ("AGENT KEY %s %s %s\n", fp, gf_key_type_name (key), text);
+  x->agent_total++;
+  if (x->agent_fp != NULL && strcmp (x->agent_fp, fp) != 0)
+    return 0;
+  if (x->nagent_keys == sizeof x->agent_keys / sizeof x->agent_keys[0])
+    return 0;
+  /* The key is the callback's alone: keep a copy of it.  */
+  b = gf_key_blob (key, &bl);
+  if (gf_key_from_blob (&x->agent_keys[x->nagent_keys], b, bl) != GF_OK)
+    return 1;
+  x->agent_offer[x->nagent_keys] = x->agent_keys[x->nagent_keys];
+  x->nagent_keys++;
+  return 0;
+}
+
+static int
+agent_open (struct ctx *x, const char *path)
+{
+  struct sockaddr_un sun;
+  uint8_t req[16];
+  size_t n, skipped = 0;
+  int r;
+
+  memset (&sun, 0, sizeof sun);
+  sun.sun_family = AF_UNIX;
+  if (strlen (path) >= sizeof sun.sun_path)
+    return -1;
+  strcpy (sun.sun_path, path);
+  x->agent_fd = socket (AF_UNIX, SOCK_STREAM, 0);
+  if (x->agent_fd < 0
+      || connect (x->agent_fd, (struct sockaddr *) &sun, sizeof sun) < 0)
+    return -1;
+  if (gf_agent_reader_new (&x->agent_rd) != GF_OK
+      || gf_agent_request_identities (req, sizeof req, &n) != GF_OK
+      || agent_call (x, req, n) != 0
+      || gf_agent_type (x->agent_reply, x->agent_reply_len)
+         != GF_AGENT_IDENTITIES_ANSWER)
+    return -1;
+  r = gf_agent_identities (x->agent_reply, x->agent_reply_len, agent_identity,
+                           x, &skipped);
+  if (r != GF_OK)
+    return -1;
+  printf ("AGENT IDENTITIES %zu SKIPPED %zu\n", x->agent_total, skipped);
+  return 0;
+}
+
+/* The sign event: the agent signs.  The reply is the signature blob the
+   machine checks against the key.  */
+static int
+agent_sign (void *user, const gf_key *key, enum gf_sigalg alg, gf_slice data)
+{
+  struct ctx *x = user;
+  size_t cap = data.len + 8192, n = 0;
+  uint8_t *req = malloc (cap);
+  gf_slice sig;
+  int ok = 0;
+
+  if (req == NULL)
+    return 1;
+  if (gf_agent_sign_request (key, alg, data.data, data.len, req, cap, &n)
+      == GF_OK
+      && agent_call (x, req, n) == 0
+      && gf_agent_type (x->agent_reply, x->agent_reply_len)
+         == GF_AGENT_SIGN_RESPONSE
+      && gf_agent_sign_response (x->agent_reply, x->agent_reply_len, &sig)
+         == GF_OK)
+    ok = 1;
+  free (req);
+  printf ("AGENT SIGN %s %s\n", gf_sigalg_name (alg), ok ? "OK" : "REFUSED");
+  if (!ok)
+    return gf_session_auth_sign_fail (x->s) != GF_OK;
+  return gf_session_auth_sign_respond (x->s, sig.data, sig.len) != GF_OK;
+}
+
+/* Tell the agent which session this is, as ssh does once it trusts the host
+   key and before it asks for a signature.  */
+static int
+agent_bind (struct ctx *x, const gf_conn_info *info)
+{
+  uint8_t req[8192], sig[GF_SIG_MAX];
+  size_t n = 0;
+  gf_slice sid = { info->session_id, info->session_id_len };
+  gf_slice hs = { info->host_sig, info->host_sig_len };
+  enum gf_agent_type t;
+
+  if (hs.len == 0 || hs.len > sizeof sig)
+    return -1;
+  if (x->agent_bind == 2)
+    {
+      /* A signature that is not the host key's over this session.  */
+      memcpy (sig, hs.data, hs.len);
+      sig[hs.len - 1] ^= 1;
+      hs.data = sig;
+    }
+  if (gf_agent_session_bind (info->host_key, sid, hs, req, sizeof req, &n)
+      != GF_OK
+      || agent_call (x, req, n) != 0)
+    return -1;
+  t = gf_agent_type (x->agent_reply, x->agent_reply_len);
+  printf ("AGENT BIND %s\n", t == GF_AGENT_SUCCESS ? "OK" : "REFUSED");
+  return 0;
+}
+
 static int
 on_established (void *user, const gf_conn_info *info)
 {
   struct ctx *x = user;
+
+  if (x->agent_bind && agent_bind (x, info) != 0)
+    return 1;
 
   printf ("KEX %s %s %s\n", gf_kex_name (info->kex),
           gf_cipher_name (info->cipher_c2s), gf_sigalg_name (info->hostkey_alg));
@@ -1027,7 +1218,7 @@ main (int argc, char **argv)
   enum gf_cipher cipher = 0;
   enum gf_sigalg alg = 0;
   const char *user = "nobody", *keyfile = NULL, *certfile = NULL, *password = NULL;
-  const char *tokenfile = NULL;
+  const char *tokenfile = NULL, *agentpath = NULL;
   int print_sk_pub = 0;
   gf_key *key = NULL, *token = NULL;
   const gf_key *keys[1];
@@ -1042,6 +1233,7 @@ main (int argc, char **argv)
     }
   memset (&x, 0, sizeof x);
   memset (&cfg, 0, sizeof cfg);
+  x.agent_fd = -1;
   for (i = 2; i < argc; i++)
     {
       if (strcmp (argv[i], "--kex") == 0 && i + 1 < argc)
@@ -1069,6 +1261,14 @@ main (int argc, char **argv)
         tokenfile = argv[++i];
       else if (strcmp (argv[i], "--print-sk-pub") == 0)
         print_sk_pub = 1;
+      else if (strcmp (argv[i], "--agent") == 0 && i + 1 < argc)
+        agentpath = argv[++i];
+      else if (strcmp (argv[i], "--agent-key") == 0 && i + 1 < argc)
+        x.agent_fp = argv[++i];
+      else if (strcmp (argv[i], "--agent-bind") == 0)
+        x.agent_bind = 1;
+      else if (strcmp (argv[i], "--agent-bind-bad") == 0)
+        x.agent_bind = 2;
       else if (strcmp (argv[i], "--password") == 0 && i + 1 < argc)
         password = argv[++i];
       else if (strcmp (argv[i], "--kbd") == 0 && i + 1 < argc)
@@ -1238,6 +1438,17 @@ main (int argc, char **argv)
         }
     }
 
+  if (agentpath != NULL)
+    {
+      if (agent_open (&x, agentpath) != 0 || x.nagent_keys == 0)
+        {
+          fprintf (stderr, "no use of the agent at %s\n", agentpath);
+          return 2;
+        }
+    }
+  else if (x.agent_bind)
+    return 2;
+
   x.fd = socket (AF_INET, SOCK_STREAM, 0);
   memset (&sa, 0, sizeof sa);
   sa.sin_family = AF_INET;
@@ -1251,6 +1462,11 @@ main (int argc, char **argv)
   cfg.client_auth.user = user;
   cfg.client_auth.keys = keyfile ? keys : NULL;
   cfg.client_auth.nkeys = keyfile ? 1 : 0;
+  if (agentpath != NULL)
+    {
+      cfg.client_auth.keys = x.agent_offer;
+      cfg.client_auth.nkeys = x.nagent_keys;
+    }
   cfg.client_auth.password = password;
   memset (&ev, 0, sizeof ev);
   ev.user = &x;
@@ -1260,7 +1476,7 @@ main (int argc, char **argv)
   ev.rekeyed = on_rekeyed;
   ev.auth_banner = auth_banner;
   ev.auth_kbdint = x.kbd_answer ? auth_kbdint : NULL;
-  ev.auth_sign = x.token ? sk_sign : NULL;
+  ev.auth_sign = x.token ? sk_sign : agentpath ? agent_sign : NULL;
   ev.authenticated = auth_ok;
   ev.auth_failed = auth_failed;
   ev.channel_open = chan_open;
@@ -1308,6 +1524,12 @@ main (int argc, char **argv)
   gf_session_free (x.s);
   gf_key_free (ckey);
   gf_key_free (key);
+  for (i = 0; (size_t) i < x.nagent_keys; i++)
+    gf_key_free (x.agent_keys[i]);
+  gf_agent_reader_free (x.agent_rd);
+  free (x.agent_reply);
+  if (x.agent_fd >= 0)
+    close (x.agent_fd);
   gf_knownhosts_free (x.kh);
   close (x.fd);
   if (x.no_auth)

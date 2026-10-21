@@ -104,7 +104,13 @@ never touches:
                       SSH_ASKPASS, so no tty is needed.  It also runs
                       OpenSSH user and host certificates (ssh-keygen -s,
                       TrustedUserCAKeys, HostCertificate, @cert-authority)
-                      and known_hosts both ways.
+                      and known_hosts both ways.  With ssh-agent and
+                      ssh-add it also logs in with keys held by a real
+                      agent (the client drives the socket): plain keys,
+                      one with a passphrase, certificates, the identities
+                      foxtrot refuses, and session-bind with
+                      destination-constrained keys (ssh-add -H -h, which
+                      needs OpenSSH 8.9 or later).
   interop-keyfiles.sh passphrase-protected private key files against
                       ssh-keygen, with the real bcrypt-pbkdf (interop-key
                       supplies it from python3's bcrypt module, as an
@@ -142,7 +148,7 @@ fuzz/ has a fuzz target for each parser that reads what a peer or a file
 sends: the identification line, the binary packet, KEXINIT, public keys and
 certificates (blob and text, and making them), private key files in all
 the formats, known_hosts,
-authorized_keys, revocation lists, X.509 chains,
+authorized_keys, revocation lists, ssh-agent messages, X.509 chains,
 authentication, channels, SFTP and the whole connection.  Each is a libFuzzer
 entry point (LLVMFuzzerTestOneInput) that also checks what must hold on any
 input, not only that nothing crashes: for example that a known_hosts line we

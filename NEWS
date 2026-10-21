@@ -17,6 +17,8 @@ foxtrot NEWS - history of user-visible changes.
 ** Stapled OCSP responses are checked with an X.509 chain (gf_key_with_x509_ocsp, gf_x509_trust_require_ocsp).
 ** A server session enforces what a user's certificate permits (pty, forwarding); gf_session_permits.
 ** Client keys can be elsewhere (agent, token, HSM): the sign event, gf_auth_client_sign_respond.
+** The ssh-agent protocol for clients (agent.h), with no I/O: a push-parsing frame reader, requests for identities, signatures and session-bind@openssh.com, and parsers of the replies that skip what the key policy refuses; tested against messages of OpenSSH's ssh-agent, fuzzed, and used by the interoperability test with keys that have a passphrase, certificates and destination constraints.
+** gf_conn_info has two more members, host_sig and host_sig_len: the host key's signature of the first exchange hash, for gf_agent_session_bind.
 ** libgcrypt 1.12.4 or later is required, at build and at run time: earlier versions abort on some Ed25519 keys.
 ** Fuzz targets (fuzz/) with a coverage-guided driver; sanitizer builds are clean.
 ** A private key file with a zero, one or repeated RSA prime is refused (libgcrypt crashed on it).

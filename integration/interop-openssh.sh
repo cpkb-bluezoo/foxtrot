@@ -22,6 +22,7 @@
 # have in common, with public key (also host-bound), password and
 # keyboard-interactive authentication, with rekeying after authentication,
 # with OpenSSH user and host certificates (made by ssh-keygen -s) both ways,
+# with keys held by an ssh-agent (ssh-agent and ssh-add, if there are any),
 # and with the algorithms foxtrot refuses, to check that they are refused.  Needs ssh, ssh-keygen and sshd (set SSHD if it is not in
 # /usr/sbin); skips itself (exit 77) when they are missing, and when
 # GF_NO_INTEROP is set.
@@ -44,8 +45,10 @@ SERVER=$builddir/interop-server
 dir=$(mktemp -d "${TMPDIR:-/tmp}/foxtrot-interop.XXXXXX") || exit 99
 sshd_pid=
 server_pid=
+agent_pid=
 cleanup ()
 {
+  [ -n "$agent_pid" ] && kill "$agent_pid" 2>/dev/null
   [ -n "$sshd_pid" ] && kill "$sshd_pid" 2>/dev/null
   [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
   rm -rf "$dir"
@@ -168,6 +171,119 @@ done
 $SSH_KEYGEN -q -t ecdsa -N '' -f "$dir/sk_stranger" || exit 99
 client --user "$user" --sk-token "$dir/sk_stranger" && fail "client authenticated with an unknown security key"
 grep -q '^AUTH FAILED' "$dir/client.out" || fail "unknown security key: no failure reported"
+# Keys in an agent.  The client drives the agent's socket itself (that is
+# an application's part); the library makes the requests and reads the
+# replies, and the sign event is answered with what the agent signed.  The
+# agent has a key with a passphrase (that this program never sees: it can not
+# read the file), one sshd does not know, and keys foxtrot refuses to
+# offer, which are listed and skipped.
+if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1; then
+  ssh-agent -D -a "$dir/agent.sock" > "$dir/agent.log" 2>&1 &
+  agent_pid=$!
+  i=0
+  while [ $i -lt 50 ] && [ ! -S "$dir/agent.sock" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -S "$dir/agent.sock" ] || { echo "ssh-agent would not start; agent tests skipped"; agent_pid=; }
+fi
+agent_add ()
+{
+  SSH_AUTH_SOCK=$dir/agent.sock "$@"
+}
+if [ -n "$agent_pid" ]; then
+  cat > "$dir/agent-askpass" <<'EOT'
+#!/bin/sh
+echo "$ASKPASS_ANSWER"
+EOT
+  chmod +x "$dir/agent-askpass"
+  $SSH_KEYGEN -q -t ed25519 -N 'agent passphrase' -f "$dir/enc" || exit 99
+  $SSH_KEYGEN -q -t ecdsa -b 521 -N '' -f "$dir/p521" || exit 99
+  $SSH_KEYGEN -q -t rsa -b 1024 -N '' -f "$dir/rsa1k" || exit 99
+  cat "$dir/enc.pub" >> "$dir/authorized_keys"
+  $SSH_KEYGEN -y -P '' -f "$dir/enc" > /dev/null 2>&1 && fail "the agent test key is not protected"
+  client --user "$user" --key "$dir/enc" && fail "client read a passphrase-protected key file"
+  agent_skipped=2
+  for k in uk_ed25519 uk_ecdsa uk_rsa p521 rsa1k stranger; do
+    agent_add ssh-add -q "$dir/$k" || { fail "ssh-add $k"; }
+  done
+  if $SSH_KEYGEN -q -t dsa -N '' -f "$dir/dsa" 2>/dev/null \
+     && agent_add ssh-add -q "$dir/dsa" 2>/dev/null; then
+    agent_skipped=3
+  fi
+  ASKPASS_ANSWER='agent passphrase' SSH_ASKPASS="$dir/agent-askpass" SSH_ASKPASS_REQUIRE=force \
+    DISPLAY=none agent_add ssh-add -q "$dir/enc" < /dev/null \
+    || fail "ssh-add of a key with a passphrase"
+  agent_client ()
+  {
+    client --user "$user" --agent "$dir/agent.sock" "$@"
+  }
+  fp_of ()
+  {
+    $SSH_KEYGEN -l -f "$dir/$1.pub" | cut -d' ' -f2
+  }
+  # Everything it holds is listed: the keys sshd takes and the one it does
+  # not, and the three foxtrot refuses (P-521, RSA of 1024 bits, DSA) are
+  # counted and not offered.
+  agent_client || { fail "client with an agent"; cat "$dir/client.out"; }
+  grep -q "^AGENT IDENTITIES 5 SKIPPED $agent_skipped\$" "$dir/client.out" \
+    || { fail "agent: the identities or the skipped ones"; cat "$dir/client.out"; }
+  grep -q '^AUTH OK' "$dir/client.out" || fail "client with an agent: not authenticated"
+  # Each kind of key signs through the agent: the one with a passphrase too.
+  for k in uk_ed25519 uk_ecdsa uk_rsa enc; do
+    agent_client --agent-key "$(fp_of $k)" \
+      || { fail "client with the agent's $k"; cat "$dir/client.out"; }
+    grep -q '^AGENT SIGN .* OK$' "$dir/client.out" && grep -q '^AUTH OK' "$dir/client.out" \
+      || { fail "agent $k: no signature through the agent"; cat "$dir/client.out"; }
+  done
+  agent_client --agent-key "$(fp_of uk_rsa)"
+  grep -q '^AGENT SIGN rsa-sha2-[0-9]* OK$' "$dir/client.out" \
+    || fail "agent rsa: signed under a SHA-1 algorithm?"
+  # A key sshd would not take is never signed with: the client asks sshd
+  # first.
+  agent_client --agent-key "$(fp_of stranger)" && fail "client authenticated with an agent key sshd does not know"
+  grep -q '^AUTH FAILED' "$dir/client.out" || fail "agent: unknown key: no failure reported"
+  grep -q '^AGENT SIGN' "$dir/client.out" && fail "agent: signed for a key sshd does not take"
+  agent_client --agent-key "$(fp_of enc)" --exec "echo through the agent" \
+    || { fail "client exec through an agent"; cat "$dir/client.out"; }
+  grep -q '^OUT through the agent' "$dir/client.out" || fail "agent: no output"
+  agent_client --agent-key "$(fp_of enc)" --rekey \
+    || { fail "client rekey after an agent signed"; cat "$dir/client.out"; }
+  grep -q '^REKEYED' "$dir/client.out" || fail "agent: no rekey"
+  # session-bind: the agent checks the host key's signature of the exchange
+  # hash, for each kind of host key, and refuses a damaged one.
+  for h in ssh-ed25519 ecdsa-sha2-nistp256 rsa-sha2-512 rsa-sha2-256; do
+    agent_client --agent-key "$(fp_of uk_ed25519)" --agent-bind --hostkey $h --rekey \
+      || { fail "agent bind with the $h host key"; cat "$dir/client.out"; }
+    grep -q '^AGENT BIND OK$' "$dir/client.out" || fail "agent bind $h: not accepted"
+    agent_client --agent-key "$(fp_of uk_ed25519)" --agent-bind-bad --hostkey $h
+    grep -q '^AGENT BIND REFUSED$' "$dir/client.out" || fail "agent bind $h: a damaged signature was accepted"
+  done
+  # A key that is good for one destination only (ssh-add -h): the agent signs
+  # for it only in a session it has been told is with that host.
+  for h in ed25519 ecdsa rsa; do
+    echo "127.0.0.1 $(cut -d' ' -f1,2 "$dir/hk_$h.pub")" >> "$dir/kh_agent"
+  done
+  echo "elsewhere.example $(cut -d' ' -f1,2 "$dir/stranger.pub")" > "$dir/kh_agent_other"
+  agent_add ssh-add -q -D
+  if agent_add ssh-add -q -H "$dir/kh_agent" -h 127.0.0.1 "$dir/uk_ed25519" 2>/dev/null; then
+    agent_client && fail "agent: a destination-constrained key signed for a session it was not told of"
+    grep -q '^AGENT SIGN ssh-ed25519 REFUSED$' "$dir/client.out" || fail "agent constraint: no refusal"
+    for h in ssh-ed25519 ecdsa-sha2-nistp256 rsa-sha2-512; do
+      agent_client --agent-bind --hostkey $h \
+        || { fail "agent: constrained key after a bind ($h)"; cat "$dir/client.out"; }
+      grep -q '^AGENT BIND OK$' "$dir/client.out" && grep -q '^AGENT SIGN .* OK$' "$dir/client.out" \
+        || fail "agent: constrained key after a bind ($h): not signed"
+    done
+    agent_client --agent-bind-bad && fail "agent: a damaged bind let a constrained key sign"
+    # Constrained to a host that is not this one.
+    agent_add ssh-add -q -D
+    agent_add ssh-add -q -H "$dir/kh_agent_other" -h elsewhere.example "$dir/uk_ed25519" \
+      || fail "ssh-add -h elsewhere.example"
+    agent_client --agent-bind && fail "agent: a key constrained to another host signed"
+    grep -q '^AGENT SIGN .* OK$' "$dir/client.out" && fail "agent: signed for another host"
+  else
+    echo "ssh-add -h not supported; destination constraint tests skipped"
+  fi
+  agent_add ssh-add -q -D
+fi
 # Rekeying after authentication, in the middle of the session.
 client --user "$user" --key "$dir/uk_ed25519" --rekey \
   || { fail "client rekey"; cat "$dir/client.out"; }
@@ -438,6 +554,24 @@ if [ -n "$sshd_pid" ]; then
   # sshd's forced command is its own business; the certificate is accepted.
   client --user "$user" --key "$dir/uk_ed25519" --cert "$dir/forced.cert.pub" \
     || { fail "client forced-command certificate"; cat "$dir/client.out"; }
+  # Certificates in an agent: ssh-add loads KEY-cert.pub with KEY, and the
+  # agent lists the key and its certificate.  sshd takes the certificate and
+  # not the key, so what signs is the certificate, under its algorithm.
+  if [ -n "$agent_pid" ]; then
+    for t in ed25519 ecdsa rsa; do
+      command cp -p "$dir/uk_$t" "$dir/agentkey_$t"
+      command cp -f "$dir/user-$t.cert.pub" "$dir/agentkey_$t-cert.pub"
+      agent_add ssh-add -q -D
+      agent_add ssh-add -q "$dir/agentkey_$t" || fail "ssh-add of a certificate ($t)"
+      client --user "$user" --agent "$dir/agent.sock" \
+        || { fail "client with a certificate in the agent ($t)"; cat "$dir/client.out"; }
+      grep -q '^AGENT IDENTITIES 2 SKIPPED 0$' "$dir/client.out" \
+        || fail "agent certificate $t: the key and its certificate are not both listed"
+      grep -q '^AGENT SIGN .*-cert-v01@openssh.com OK$' "$dir/client.out" && grep -q '^AUTH OK' "$dir/client.out" \
+        || { fail "agent certificate $t: not signed as a certificate"; cat "$dir/client.out"; }
+    done
+    agent_add ssh-add -q -D
+  fi
 
   # Host certificates: sshd presents them when the client asks for the
   # certificate algorithm, and the client trusts one only if known_hosts has

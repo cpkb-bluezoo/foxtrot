@@ -20,6 +20,7 @@
 lib_LTLIBRARIES = libfoxtrot.la
 
 libfoxtrot_la_SOURCES = \
+  agent.c \
   auth.c \
   authkeys.c \
   base64.c \
@@ -54,6 +55,7 @@ libfoxtrot_la_LDFLAGS = -version-info $(LIBFOXTROT_LTVERSION) \
 
 foxtrotincludedir = $(includedir)/foxtrot
 foxtrotinclude_HEADERS = \
+  $(top_srcdir)/include/foxtrot/agent.h \
   $(top_srcdir)/include/foxtrot/auth.h \
   $(top_srcdir)/include/foxtrot/authkeys.h \
   $(top_srcdir)/include/foxtrot/chan.h \

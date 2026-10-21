@@ -123,6 +123,19 @@ test_matrix (void)
                          p.cl.info.session_id_len) == 0);
           CHECK (gf_key_equal (p.cl.info.host_key, p.sv.info.host_key));
           CHECK (gf_slice_equals (p.cl.info.peer_software, "foxtrot_" VERSION));
+          /* The host key's signature of the exchange hash, which is the
+             session identifier, is there for both ends to hand on (to an
+             agent: agent.h).  */
+          CHECK (p.cl.info.host_sig_len > 0);
+          CHECK (p.cl.info.host_sig_len == p.sv.info.host_sig_len);
+          CHECK (p.cl.info.host_sig_len > 0
+                 && memcmp (p.cl.info.host_sig, p.sv.info.host_sig,
+                            p.cl.info.host_sig_len) == 0);
+          CHECK_EQ (gf_key_verify (p.cl.info.host_key, p.cl.info.hostkey_alg,
+                                   p.cl.info.session_id,
+                                   p.cl.info.session_id_len,
+                                   p.cl.info.host_sig,
+                                   p.cl.info.host_sig_len), GF_OK);
 
           /* Data both ways.  */
           n = mkmsg (m, 94, 100, 7);
@@ -194,8 +207,8 @@ test_rekey (void)
 {
   struct pair p;
   gf_conn_config cc = config (0, 0), sc = config (1, 1);
-  uint8_t sid[64];
-  size_t sidlen, i;
+  uint8_t sid[64], sig[GF_SIG_MAX];
+  size_t sidlen, siglen, i;
 
   CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
   pair_start (&p);
@@ -203,6 +216,9 @@ test_rekey (void)
   expect_established (&p);
   sidlen = p.cl.info.session_id_len;
   memcpy (sid, p.cl.info.session_id, sidlen);
+  siglen = p.cl.info.host_sig_len;
+  CHECK (siglen > 0 && siglen <= sizeof sig);
+  memcpy (sig, p.cl.info.host_sig, siglen);
 
   /* Rekey by the client, then by the server, with traffic going both ways
      while it happens.  */
@@ -227,6 +243,15 @@ test_rekey (void)
   CHECK_EQ (p.cl.info.session_id_len, sidlen);
   CHECK (memcmp (p.cl.info.session_id, sid, sidlen) == 0);
   CHECK (memcmp (p.sv.info.session_id, sid, sidlen) == 0);
+  /* The signature stays the first exchange's, as the session identifier
+     does: still the host key's over it, not over a later hash.  */
+  CHECK_EQ (p.cl.info.host_sig_len, siglen);
+  CHECK (memcmp (p.cl.info.host_sig, sig, siglen) == 0);
+  CHECK_EQ (p.sv.info.host_sig_len, siglen);
+  CHECK (memcmp (p.sv.info.host_sig, sig, siglen) == 0);
+  CHECK_EQ (gf_key_verify (p.cl.info.host_key, p.cl.info.hostkey_alg, sid,
+                           sidlen, p.cl.info.host_sig, p.cl.info.host_sig_len),
+            GF_OK);
   /* Every message arrived, in order, once.  */
   CHECK_EQ (p.sv.nmsgs + p.cl.nmsgs, 8);
   CHECK_EQ (p.cl.host_key_calls, 1);

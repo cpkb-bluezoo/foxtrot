@@ -52,6 +52,10 @@ Pre-alpha.  What exists today:
             principals, command, permitopen and the no- options
   krl       OpenSSH key revocation lists: keys, hashes, certificates by
             serial and key ID, CAs; agrees with ssh-keygen -Q
+  agent     the messages of the ssh-agent protocol, for a client with its keys
+            in an agent (the socket is the application's): framing,
+            identities, signing, session-bind; checked against a real
+            ssh-agent
   conn      the transport: negotiation, key exchange, rekeying, EXT_INFO,
             service request; interoperating with OpenSSH 9.6
 

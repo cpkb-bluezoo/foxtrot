@@ -113,6 +113,15 @@ typedef struct gf_conn_info
   /* H of the first key exchange: what user authentication signs.  */
   const uint8_t *session_id;
   size_t session_id_len;
+  /* The host key's signature over that exchange hash, as the server sent it
+     (the signature blob: string algorithm name, string signature).  It stays
+     the first exchange's across rekeys, as the session identifier does.
+     What an agent is given with the host key and the identifier to bind a
+     session to its keys (gf_agent_session_bind in agent.h).  Empty only for
+     a signature larger than GF_SIG_MAX, which a key this library accepts
+     does not make.  */
+  const uint8_t *host_sig;
+  size_t host_sig_len;
   /* The peer's identification line without CR LF, and its software
      version and comments.  */
   gf_slice peer_ident;

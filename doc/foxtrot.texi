@@ -289,6 +289,7 @@ checked by removing it and seeing a test fail.
 their corpora.  There is one for each parser of what a peer or a file
 sends (the identification line, packets, key exchange messages, keys and
 certificates, private key files and other key formats, @file{known_hosts}, @file{authorized_keys}, revocation lists,
+messages of an @command{ssh-agent},
 X.509 chains,
 authentication, channels, SFTP and a whole connection), and each checks
 what must hold on any input as well as that nothing crashes.  Built with
@@ -302,7 +303,10 @@ same sanitizers.
 foxtrot's server, for the algorithms they share, through authentication,
 commands, bulk transfers with rekeying, port forwarding and SFTP (including
 its extensions, against @command{sshd}'s own @command{sftp-server} and
-against @command{sftp} and @command{scp}), and checks that every algorithm foxtrot refuses is refused.
+against @command{sftp} and @command{scp}), and checks that every algorithm foxtrot refuses is refused.  Keys held by a real
+@command{ssh-agent}, one of them protected by a passphrase, and
+certificates and destination-constrained keys in it, log in to
+@command{sshd}.
 
 @node Security policy
 @chapter Security policy
@@ -986,7 +990,8 @@ signing done: @code{gf_auth_client_config.keys} may hold public keys (a
 public key from @code{gf_key_from_blob} or @code{gf_key_from_text}, a
 certificate, a FIDO security key) when the events have a @code{sign}
 function.  The library does not talk to an SSH agent, a token or an HSM, since
-that is I/O, but it asks whoever does, in the way the keyboard-interactive
+that is I/O (for an agent it makes and reads the messages, see
+@ref{The agent protocol}), but it asks whoever does, in the way the keyboard-interactive
 method asks a person: when the server has said it would take the key, the
 application is handed the exact bytes to sign and the algorithm, answers with
 @code{gf_auth_client_sign_respond} or @code{_sign_fail} inside the call or
@@ -1023,9 +1028,94 @@ Signing can take as long as a person does, and the server's grace time (two
 minutes) runs meanwhile.  A key with a private part is signed for at once, as
 before; the function is called only for the others.
 @item
-The agent protocol itself (the requests and replies on the agent's socket) is
-not part of the library.
+For an agent the messages of its protocol are made and read by
+@file{agent.h}; the socket stays the application's.  @xref{The agent
+protocol}.
 @end itemize
+
+@node The agent protocol
+@subsection The ssh-agent protocol
+@cindex agent
+@cindex ssh-agent
+@cindex SSH_AUTH_SOCK
+@cindex session-bind
+
+@file{agent.h} is the client's side of the ssh-agent protocol
+(draft-ietf-sshm-ssh-agent, formerly draft-miller-ssh-agent): the framing,
+the requests and the replies, and nothing else.  It does no I/O.  The
+application opens the agent's socket (a Unix socket, usually named by
+@env{SSH_AUTH_SOCK}), writes the bytes the library makes to it, and gives
+what it reads to the library.  The messages are the part that handles
+bytes from outside, and that is why they are here, with the other parsers
+and a fuzz target of their own, and the socket is not.
+
+@itemize @bullet
+@item
+@strong{Framing.}  A frame is a length and that many bytes, the first of
+which is the type of the message.  @code{gf_agent_reader_feed} is a push
+parser in the manner of @code{gf_packet_receive}: it takes whatever the socket
+delivered, in pieces of any size, and calls back with each frame that is
+complete.  The length is checked when its four bytes are in and before any
+of the frame is waited for; a length of zero, or over 256 KiB (OpenSSH's
+limit, @code{GF_AGENT_MAX_FRAME}), ends the stream and the reader refuses
+everything after.  A frame that arrives whole is handed over where it lies;
+one that arrives in pieces is held, and the memory held grows with the bytes
+that have come, never with the length announced.
+@item
+@strong{Requests.}  There are three: @code{gf_agent_request_identities},
+@code{gf_agent_sign_request} and @code{gf_agent_session_bind}, each writing
+a frame to a buffer of the caller's.  There is deliberately nothing to add,
+remove, lock or unlock keys, so that a program that uses the library to
+sign cannot be made to change the agent.  The signing request names the key
+by its blob (the certificate's for a certificate) and derives the RSA flags
+from the algorithm: @samp{rsa-sha2-256} and @samp{rsa-sha2-512} and their
+certificate forms ask for the SHA-2 signature; no request ever leaves the flag
+for SHA-1 set, which would be the agent's default, and an algorithm the
+policy refuses (@samp{ssh-rsa}, which has no @code{gf_sigalg}) is
+@code{GF_ERR_UNSUPPORTED}, as is one that is not the key's.
+@item
+@strong{Replies.}  @code{gf_agent_type} names the type of a message, and
+@code{GF_AGENT_UNKNOWN} for anything else.  @code{gf_agent_identities} calls
+back with each key and comment of an identities answer, and
+@code{gf_agent_sign_response} gives the signature blob as a slice of the
+frame, to be passed straight to @code{gf_session_auth_sign_respond} (the
+machine checks it against the key before it sends it, as for any signer).
+Every parser reads a message from end to end before it calls anything, and
+refuses one with bytes left over, a length that runs past the end, or a
+count that the bytes could not hold; an identities answer that claims four
+billion keys costs eight bytes of arithmetic and nothing else.
+@item
+@strong{Keys.}  The agent's identities go through @code{gf_key_from_blob},
+so what the policy refuses (DSA, ECDSA over P-521, RSA under 2048 bits, a
+certificate that is not what its CA signed) is skipped and counted, never
+offered, and the policy is in one place.  A callback that wants to keep a
+key makes its own from the blob.  The comment is whatever the agent
+sends, with escape sequences if it likes: sanitise it before showing it to
+anyone.
+@item
+@strong{Destination constraints.}  An agent that holds a key added with
+@command{ssh-add -h} signs for it only in a session it has been told about,
+and checks that the host key it is told about is the one that signed the
+exchange hash.  Send @code{gf_agent_session_bind} (the extension
+@samp{session-bind@@openssh.com}, with the forwarding flag clear) once the
+host key is trusted and before the first signing request, with
+@code{gf_conn_info.host_key}, @code{session_id} and @code{host_sig}; the
+last is the server's signature over the exchange hash of the first key
+exchange, which a connection now keeps.  An agent that does not know the
+extension answers failure, and so does one that is given a signature that
+is not the host key's, which the interoperability test checks by damaging one.
+@end itemize
+
+An application that has the agent sign wires it up in four steps: connect,
+write @code{gf_agent_request_identities} and read the answer with
+@code{gf_agent_identities}, pass the keys that come back (copied) as the
+@code{keys} of the client authentication, and answer each sign event by
+writing @code{gf_agent_sign_request} and giving the signature of the reply
+to @code{gf_session_auth_sign_respond}, or calling @code{_sign_fail} if
+@code{gf_agent_type} says the agent refused.  @file{integration/interop-client.c}
+does this in a page, for @command{ssh-agent} itself, for keys with a
+passphrase (the agent has them decrypted; this program never sees the
+file), certificates and constrained keys.
 
 @node The connection protocol
 @section The connection protocol
