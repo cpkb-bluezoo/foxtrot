@@ -41,36 +41,60 @@
 #include <foxtrot/crypto.h>
 #include <foxtrot/key.h>
 
+/* Append LEN bytes of S to CMD (capacity CAP, current length *O),
+   keeping room for the terminating NUL.  Returns 0 on overflow. */
+static int
+cmd_cat (char *cmd, size_t cap, size_t *o, const char *s, size_t len)
+{
+  if (len >= cap - *o)
+    return 0;
+  memcpy (cmd + *o, s, len);
+  *o += len;
+  cmd[*o] = '\0';
+  return 1;
+}
+
+static int
+cmd_hex (char *cmd, size_t cap, size_t *o, const uint8_t *b, size_t n)
+{
+  static const char digits[] = "0123456789abcdef";
+  size_t i;
+
+  if (n > (cap - *o) / 2)
+    return 0;
+  for (i = 0; i < n; i++)
+    {
+      cmd[(*o)++] = digits[b[i] >> 4];
+      cmd[(*o)++] = digits[b[i] & 15];
+    }
+  cmd[*o] = '\0';
+  return 1;
+}
+
 static int
 bcrypt_via_python (void *user, const uint8_t *pass, size_t passlen,
                    const uint8_t *salt, size_t saltlen, uint32_t rounds,
                    uint8_t *out, size_t outlen)
 {
-  char cmd[1024], hex[256];
+  static const char prog[] =
+    "python3 -c 'import sys,bcrypt; a=sys.argv; "
+    "sys.stdout.write(bcrypt.kdf(bytes.fromhex(a[1]), bytes.fromhex(a[2]), "
+    "int(a[3]), int(a[4]), ignore_few_rounds=True).hex())' ";
+  char cmd[1024], tail[64], hex[256];
   size_t i, o = 0;
   FILE *p;
 
   (void) user;
-  if (passlen * 2 + saltlen * 2 + 200 > sizeof cmd)
+  if (outlen > sizeof hex / 2)
     return 1;
-  o = (size_t) snprintf (cmd, sizeof cmd,
-    "python3 -c 'import sys,bcrypt; a=sys.argv; "
-    "sys.stdout.write(bcrypt.kdf(bytes.fromhex(a[1]), bytes.fromhex(a[2]), "
-    "int(a[3]), int(a[4]), ignore_few_rounds=True).hex())' ");
-  for (i = 0; i < passlen; i++)
-    {
-      if (i == 0)
-        cmd[o++] = '\'';
-      o += (size_t) snprintf (cmd + o, sizeof cmd - o, "%02x", pass[i]);
-    }
-  if (passlen == 0)
-    cmd[o++] = '\'';
-  o += (size_t) snprintf (cmd + o, sizeof cmd - o, "' ");
-  cmd[o++] = '\'';
-  for (i = 0; i < saltlen; i++)
-    o += (size_t) snprintf (cmd + o, sizeof cmd - o, "%02x", salt[i]);
-  o += (size_t) snprintf (cmd + o, sizeof cmd - o, "' %zu %u", outlen,
-                          (unsigned) rounds);
+  snprintf (tail, sizeof tail, "' %zu %u", outlen, (unsigned) rounds);
+  if (!cmd_cat (cmd, sizeof cmd, &o, prog, sizeof prog - 1)
+      || !cmd_cat (cmd, sizeof cmd, &o, "'", 1)
+      || !cmd_hex (cmd, sizeof cmd, &o, pass, passlen)
+      || !cmd_cat (cmd, sizeof cmd, &o, "' '", 3)
+      || !cmd_hex (cmd, sizeof cmd, &o, salt, saltlen)
+      || !cmd_cat (cmd, sizeof cmd, &o, tail, strlen (tail)))
+    return 1;
   p = popen (cmd, "r");
   if (p == NULL)
     return 1;

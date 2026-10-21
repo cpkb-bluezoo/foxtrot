@@ -736,10 +736,17 @@ sftp_request (void *user, const gf_sftp_request *q)
                           & GF_FILEXFER_ATTR_PERMISSIONS)
                           ? q->attrs.permissions & 0777 : 0755) < 0 ? errno : 0);
     case GF_FXP_RENAME:
-      /* v3 RENAME does not replace.  */
+      /* v3 RENAME does not replace.  The kernel makes the existence
+         check and the rename one atomic step.  */
+#ifdef RENAME_NOREPLACE
+      return sftp_status (x, q->id,
+                          renameat2 (AT_FDCWD, path, AT_FDCWD, path2,
+                                     RENAME_NOREPLACE) < 0 ? errno : 0);
+#else
       if (lstat (path2, &st) == 0)
         return sftp_status (x, q->id, EEXIST);
       return sftp_status (x, q->id, rename (path, path2) < 0 ? errno : 0);
+#endif
     case GF_FXP_REALPATH:
       {
         gf_sftp_name nm;
