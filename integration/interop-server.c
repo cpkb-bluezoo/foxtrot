@@ -58,6 +58,12 @@
    negotiated and who the peer is, and "AUTH OK user method" or "AUTH
    FAILED" how it ended.  */
 
+/* renameat2 and RENAME_NOREPLACE are glibc's, and only declared with this.
+   config.h sets it, but a build that never ran configure must see it too.  */
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1
+#endif
+
 #ifdef HAVE_CONFIG_H
 # include <config.h>
 #endif
@@ -737,15 +743,15 @@ sftp_request (void *user, const gf_sftp_request *q)
                           ? q->attrs.permissions & 0777 : 0755) < 0 ? errno : 0);
     case GF_FXP_RENAME:
       /* v3 RENAME does not replace.  The kernel makes the existence
-         check and the rename one atomic step.  */
+         check and the rename one atomic step.  Without it there is no way
+         to do this safely (checking and then renaming leaves a gap in
+         which the target can appear and be overwritten), so refuse.  */
 #ifdef RENAME_NOREPLACE
       return sftp_status (x, q->id,
                           renameat2 (AT_FDCWD, path, AT_FDCWD, path2,
                                      RENAME_NOREPLACE) < 0 ? errno : 0);
 #else
-      if (lstat (path2, &st) == 0)
-        return sftp_status (x, q->id, EEXIST);
-      return sftp_status (x, q->id, rename (path, path2) < 0 ? errno : 0);
+      return sftp_status (x, q->id, ENOSYS);
 #endif
     case GF_FXP_REALPATH:
       {
