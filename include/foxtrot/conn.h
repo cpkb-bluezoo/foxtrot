@@ -41,8 +41,10 @@
        (the host_key callback) whether it trusts the key: a client has no
        default and must set the callback;
      - rekeys before the packet layer's limits and every hour or gigabyte
-       (config below), whether we or the peer start it; application
-       messages sent during a key exchange are held and sent after it;
+       (config below), whether we or the peer start it, once the layer above
+       has said the user is authenticated (gf_conn_set_authenticated);
+       application messages sent during a key exchange are held and sent
+       after it;
      - answers a peer's DISCONNECT, and sends the right DISCONNECT when it
        finds a protocol violation.
 
@@ -258,8 +260,19 @@ int gf_conn_send_ignore (gf_conn *c, uint64_t now_us, const uint8_t *data,
 int gf_conn_send_debug (gf_conn *c, uint64_t now_us, int always_display,
                         const char *text);
 
-/* Start a key exchange now (also happens by itself when due).  */
+/* Start a key exchange now (also happens by itself when due).  Not before
+   gf_conn_set_authenticated: GF_ERR_STATE.  */
 int gf_conn_rekey (gf_conn *c, uint64_t now_us);
+
+/* Tell the transport that the user has authenticated (the session does).
+   Until then nothing rekeys: not when due, which is put off until now, and
+   not on request; and a server takes a KEXINIT from the client for a protocol
+   error, as OpenSSH's sshd does, since each one costs it a key exchange and
+   a signature that nobody has earned.  A client does take a rekey the server
+   starts, as OpenSSH's ssh does.  Only after the first key exchange has
+   completed (GF_ERR_STATE before).  A connection used with no
+   authentication layer has to call this to rekey at all.  */
+int gf_conn_set_authenticated (gf_conn *c);
 
 /* Send DISCONNECT with REASON and DESCRIPTION (may be NULL) and close.  The
    caller then closes the transport.  */

@@ -434,7 +434,9 @@ typedef struct gf_sftp_request
   uint32_t pflags;		/* OPEN.  */
   gf_sftp_attrs attrs;		/* OPEN, SETSTAT, FSETSTAT, MKDIR.  */
   uint64_t offset;		/* READ, WRITE.  */
-  uint32_t length;		/* READ: at most this many bytes.  */
+  uint32_t length;		/* READ: at most this many bytes, never more
+				   than gf_sftp_server_data can send (the
+				   packet size less 16).  */
   gf_slice data;		/* WRITE.  */
   gf_slice ext_name;		/* EXTENDED.  */
   gf_slice ext_data;		/* EXTENDED: the rest of the request.  */

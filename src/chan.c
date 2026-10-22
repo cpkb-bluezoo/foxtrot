@@ -330,19 +330,28 @@ refuse_global (gf_chans *m, void *ctx)
 /* Opening                                                            */
 /* ------------------------------------------------------------------ */
 
+#define MAX_OPEN_FAILURE_TEXT 1024
+
 static int
 send_open_failure (gf_chans *m, uint32_t remote, uint32_t reason,
                    const char *text)
 {
-  uint8_t b[128];
+  uint8_t b[MAX_OPEN_FAILURE_TEXT + 64];
+  size_t n = strlen (text);
   gf_writer w;
 
+  /* The text is the application's: a long one is cut, never sent as a
+     message with a hole in it.  */
+  if (n > MAX_OPEN_FAILURE_TEXT)
+    n = MAX_OPEN_FAILURE_TEXT;
   gf_writer_init (&w, b, sizeof b);
   gf_wr_u8 (&w, GF_MSG_CHANNEL_OPEN_FAILURE);
   gf_wr_u32 (&w, remote);
   gf_wr_u32 (&w, reason);
-  gf_wr_cstring (&w, text);
+  gf_wr_string (&w, text, n);
   gf_wr_cstring (&w, "");
+  if (gf_wr_status (&w) != GF_OK)
+    return die (m, GF_DISCONNECT_BY_APPLICATION, GF_ERR_BUFSIZE);
   return send_msg (m, b, w.len);
 }
 
@@ -765,7 +774,11 @@ send_some (gf_chans *m, uint32_t id, int extended, uint32_t xtype,
     return GF_ERR_STATE;
   if (data == NULL && len > 0)
     return GF_ERR_INVAL;
-  chunk_max = c->rmax < GF_CHAN_MAX_PACKET ? c->rmax : GF_CHAN_MAX_PACKET;
+  /* What a transport payload holds after the message's header, which for
+     extended data is four bytes longer.  */
+  chunk_max = extended ? GF_CHAN_MAX_PACKET - 4 : GF_CHAN_MAX_PACKET;
+  if (c->rmax < chunk_max)
+    chunk_max = c->rmax;
   while (done < len && c->rwin > 0)
     {
       size_t n = len - done;

@@ -2406,6 +2406,117 @@ test_extensions_client (void)
   world_free (&w);
 }
 
+/* A write callback for a transport that first takes nothing, then fails.  */
+static int failing_write_mode;		/* 0: take nothing; 1: fail.  */
+static int failing_write_calls;
+
+static long
+failing_write (void *user, const uint8_t *d, size_t n)
+{
+  (void) user;
+  (void) d;
+  (void) n;
+  failing_write_calls++;
+  return failing_write_mode ? -1 : 0;
+}
+
+/* The disconnect event is optional: a server made without one must not be
+   brought down by output that fails to flush.  */
+static void
+test_writable_without_disconnect (void)
+{
+  struct world w;
+  gf_sftp_server_events se;
+  uint8_t b[600], body[600];
+  gf_writer bw;
+  size_t n;
+
+  world_new (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
+             &(gf_sftp_client_config) { 0, 0, 0 });
+  w.hold = 1;
+  gf_sftp_server_free (w.srv);
+  memset (&se, 0, sizeof se);
+  se.user = &w;
+  se.write = failing_write;
+  se.request = srv_request;
+  se.disconnect = NULL;
+  CHECK_EQ (gf_sftp_server_new (&w.srv, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 },
+                                &se), GF_OK);
+  failing_write_mode = 0;
+  failing_write_calls = 0;
+  {
+    uint8_t v[4] = { 0, 0, 0, 3 };
+
+    n = pkt (b, sizeof b, GF_FXP_INIT, v, 4);
+    srv_feed (&w, b, n);		/* Its VERSION is queued, untaken.  */
+  }
+  CHECK (failing_write_calls >= 1);
+  CHECK (gf_sftp_server_pending (w.srv) > 0);
+  gf_writer_init (&bw, body, sizeof body);
+  gf_wr_u32 (&bw, 1);
+  gf_wr_cstring (&bw, "p");
+  n = pkt (b, sizeof b, GF_FXP_STAT, body, bw.len);
+  srv_feed (&w, b, n);
+  CHECK_EQ (gf_sftp_server_status (w.srv, 1, GF_FX_NO_SUCH_FILE, "no"), GF_OK);
+  /* The transport fails when the output is tried again.  */
+  failing_write_mode = 1;
+  CHECK (gf_sftp_server_writable (w.srv) != GF_OK);
+  CHECK_EQ (gf_sftp_server_writable (w.srv), GF_ERR_CLOSED);
+  world_free (&w);
+}
+
+/* The length of a READ: what the client asks for is clamped to what the
+   server could answer with, so an application that allocates for it is not
+   made to allocate 4 GiB; and a client cannot ask for one that would wrap
+   its own packet size check.  */
+static void
+test_read_lengths (void)
+{
+  struct world w;
+  uint8_t b[600], body[600];
+  gf_writer bw;
+  size_t n;
+  uint8_t h[4] = { 'H', 0, 0, 0 };
+
+  srv_ready (&w, &(gf_sftp_server_config) { 0, 0, 0, NULL, 0 });
+  w.hold = 1;
+  gf_writer_init (&bw, body, sizeof body);
+  gf_wr_u32 (&bw, 1);
+  gf_wr_cstring (&bw, "hhhh");
+  gf_wr_u64 (&bw, 0);
+  gf_wr_u32 (&bw, 0xffffffffu);
+  n = pkt (b, sizeof b, GF_FXP_READ, body, bw.len);
+  srv_feed (&w, b, n);
+  CHECK_EQ (w.last_request.type, GF_FXP_READ);
+  CHECK_EQ (w.last_request.length, GF_SFTP_DEFAULT_MAX_PACKET - 16);
+  CHECK_EQ (w.srv_disconnect, 0);
+  world_free (&w);
+
+  srv_ready (&w, &(gf_sftp_server_config) { 1000, 0, 0, NULL, 0 });
+  w.hold = 1;
+  gf_writer_init (&bw, body, sizeof body);
+  gf_wr_u32 (&bw, 1);
+  gf_wr_cstring (&bw, "hhhh");
+  gf_wr_u64 (&bw, 0);
+  gf_wr_u32 (&bw, 2000);
+  n = pkt (b, sizeof b, GF_FXP_READ, body, bw.len);
+  srv_feed (&w, b, n);
+  CHECK_EQ (w.last_request.length, 1000 - 16);
+  world_free (&w);
+
+  cli_ready_world (&w, NULL);
+  CHECK_EQ (gf_sftp_client_read (w.cli, h, 4, 0, 0xfffffff0u, NULL, NULL),
+            GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_read (w.cli, h, 4, 0, 0xffffffffu, NULL, NULL),
+            GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_read (w.cli, h, 4, 0, GF_SFTP_DEFAULT_MAX_PACKET,
+                                 NULL, NULL), GF_ERR_INVAL);
+  CHECK_EQ (gf_sftp_client_read (w.cli, h, 4, 0,
+                                 GF_SFTP_DEFAULT_MAX_PACKET - 16, NULL, NULL),
+            GF_OK);
+  world_free (&w);
+}
+
 int
 main (void)
 {
@@ -2414,6 +2525,8 @@ main (void)
   test_server_protocol ();
   test_server_responses ();
   test_output_limits ();
+  test_writable_without_disconnect ();
+  test_read_lengths ();
   test_client_protocol ();
   test_extensions (0);
   test_extensions (1);

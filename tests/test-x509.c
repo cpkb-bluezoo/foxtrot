@@ -296,13 +296,18 @@ test_sign_verify (void)
     const char *blob, *priv, *sig;
     enum gf_sigalg alg, plain;
     const char *plainname;
+    const char *signame;	/* In the signature (RFC 6187 section 3).  */
+    const char *keyalg;		/* The key algorithm, which it is not.  */
   } v[] = {
     { vec_x_p256_blob, vec_x_p256_private, vec_x_p256_sig, GF_SIG_X509_ECDSA_NISTP256,
-      GF_SIG_ECDSA_NISTP256, "ecdsa-sha2-nistp256" },
+      GF_SIG_ECDSA_NISTP256, "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256",
+      "x509v3-ecdsa-sha2-nistp256" },
     { vec_x_p384_blob, vec_x_p384_private, vec_x_p384_sig, GF_SIG_X509_ECDSA_NISTP384,
-      GF_SIG_ECDSA_NISTP384, "ecdsa-sha2-nistp384" },
+      GF_SIG_ECDSA_NISTP384, "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384",
+      "x509v3-ecdsa-sha2-nistp384" },
     { vec_x_rsa_blob, vec_x_rsa_private, vec_x_rsa_sig, GF_SIG_X509_RSA2048_SHA256,
-      GF_SIG_RSA_SHA2_256, "rsa-sha2-256" }
+      GF_SIG_RSA_SHA2_256, "rsa-sha2-256", "rsa2048-sha256",
+      "x509v3-rsa2048-sha256" }
   };
   size_t i;
 
@@ -342,6 +347,25 @@ test_sign_verify (void)
       CHECK (gf_key_has_private (signer) && gf_key_equal (signer, k));
       CHECK_EQ (gf_key_sign (signer, v[i].alg, msg, msglen, mine, sizeof mine, &mn), GF_OK);
       CHECK_EQ (gf_key_verify (k, v[i].alg, msg, msglen, mine, mn), GF_OK);
+      /* What we make names the signature format, as RFC 6187 says, and
+         what names the key algorithm instead (as this library once did) is
+         not a signature.  */
+      {
+        gf_reader r;
+        gf_slice nm, body;
+        gf_writer w;
+        static uint8_t old[GF_SIG_MAX];
+
+        gf_reader_init (&r, mine, mn);
+        CHECK_EQ (gf_rd_string (&r, &nm), GF_OK);
+        CHECK (gf_slice_equals (nm, v[i].signame));
+        CHECK_EQ (gf_rd_string (&r, &body), GF_OK);
+        gf_writer_init (&w, old, sizeof old);
+        gf_wr_cstring (&w, v[i].keyalg);
+        gf_wr_string (&w, body.data, body.len);
+        CHECK_EQ (gf_key_verify (k, v[i].alg, msg, msglen, old, w.len),
+                  GF_ERR_HOSTKEY);
+      }
       CHECK_EQ (gf_key_sign (signer, v[i].plain, msg, msglen, mine, sizeof mine, &mn),
                 GF_ERR_UNSUPPORTED);
       CHECK_EQ (gf_key_sign (priv, v[i].alg, msg, msglen, mine, sizeof mine, &mn),
@@ -491,6 +515,10 @@ test_verify (void)
   BAD (t, vec_x_p256_blob, GF_X509_CLIENT, NULL, NOW, "not for this purpose");
   BAD (t, vec_x_tlsonly_blob, GF_X509_SERVER, NULL, NOW, "not for this purpose");
   BAD (t, vec_x_anyeku_blob, GF_X509_SERVER, NULL, NOW, "not for this purpose");
+  /* The same "any", listed after an OID too long for a small buffer: the
+     list is still read to its end.  */
+  BAD (t, vec_x_longany_blob, GF_X509_SERVER, NULL, NOW, "not for this purpose");
+  BAD (t, vec_x_longany_blob, GF_X509_CLIENT, NULL, NOW, "not for this purpose");
   /* The end certificate must be allowed to sign; and no SHA-1. */
   BAD (t, vec_x_nodsig_blob, GF_X509_SERVER, NULL, NOW, "key usage lacks digitalSignature");
   /* Made when the generator ran, so tested late in the century. */

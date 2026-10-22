@@ -40,6 +40,10 @@
 #define PBKDF2_MAX_ITER 5000000UL
 #define ARGON2_MAX_MEMORY (512UL * 1024)	/* KiB.  */
 #define ARGON2_MAX_PASSES 1000UL
+/* Memory times passes, in KiB: what one file may make a reader do.  The
+   two bounds above allow 512 GiB of memory traffic together; this is 4 GiB,
+   a few seconds, and puttygen asks for far less.  */
+#define ARGON2_MAX_WORK (4UL * 1024 * 1024)
 #define ARGON2_MAX_LANES 16UL
 
 /* ================================================================== */
@@ -1293,7 +1297,10 @@ gf_key_randomart (const gf_key *key, char *out, size_t cap, size_t *len)
   char title[48], base[24];
   unsigned bits;
 
-  if (key == NULL || out == NULL || len == NULL || cap < 200)
+  /* Two borders and FLD_Y rows, each FLD_X characters between two bars
+     and a newline, and the NUL.  */
+  if (key == NULL || out == NULL || len == NULL
+      || cap < (FLD_Y + 2) * (FLD_X + 3) + 1)
     return GF_ERR_INVAL;
   tn = gf_key_type_name (key);
   if (strstr (tn, "x509v3") != NULL)
@@ -1561,7 +1568,8 @@ ppk_parse (struct ppk *k, const char *text, size_t len)
           || !number (v, vn, ARGON2_MAX_MEMORY, &k->mem) || k->mem == 0)
         return GF_ERR_UNSUPPORTED;
       if (!ppk_header (&p, end, "Argon2-Passes", &v, &vn)
-          || !number (v, vn, ARGON2_MAX_PASSES, &k->passes) || k->passes == 0)
+          || !number (v, vn, ARGON2_MAX_PASSES, &k->passes) || k->passes == 0
+          || k->mem * k->passes > ARGON2_MAX_WORK)
         return GF_ERR_UNSUPPORTED;
       if (!ppk_header (&p, end, "Argon2-Parallelism", &v, &vn)
           || !number (v, vn, ARGON2_MAX_LANES, &k->lanes) || k->lanes == 0)

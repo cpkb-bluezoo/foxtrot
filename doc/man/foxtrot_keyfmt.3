@@ -62,7 +62,7 @@ A .ppk file of format 3, unencrypted or under AES\-256\-CBC with a key made by A
 int \fBgf_key_from_ppk\fP (gf_key **out, const char *text, size_t len, const char *passphrase, char *comment, size_t cap);
 .SS "Picture"
 .PP
-The randomart image of the SHA\-256 fingerprint of KEY (a certificate has the one of the key it certifies), the one ssh\-keygen \-lv prints: nine lines of 19 characters, each ending in a newline, the first and last being the border with the key type and size and "[SHA256]".  OUT is NUL\-terminated; *LEN receives its length without the NUL.  The least CAP is 200.
+The randomart image of the SHA\-256 fingerprint of KEY (a certificate has the one of the key it certifies), the one ssh\-keygen \-lv prints: eleven lines of 19 characters, each ending in a newline, the first and last being the border with the key type and size and "[SHA256]".  OUT is NUL\-terminated; *LEN receives its length without the NUL.  The least CAP is 221 (eleven lines of twenty bytes, and the NUL).
 .TP
 int \fBgf_key_randomart\fP (const gf_key *key, char *out, size_t cap, size_t *len);
 .SH "SEE ALSO"

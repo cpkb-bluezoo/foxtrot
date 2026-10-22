@@ -109,6 +109,9 @@ leaf('client', 'p256', cn='alice', san=[x509.RFC822Name('alice@example.org')], e
 leaf('noeku', 'p256', eku=None)
 leaf('tlsonly', 'p256', eku=[ExtendedKeyUsageOID.SERVER_AUTH])
 leaf('anyeku', 'p256', eku=[x509.ObjectIdentifier('2.5.29.37.0')])
+# "any" again, behind an OID too long for a small buffer: still not ours.
+leaf('longany', 'p256', eku=[x509.ObjectIdentifier('1.3.6.1.4.1.99999.' + '.'.join(['123456789'] * 7)),
+                           x509.ObjectIdentifier('2.5.29.37.0')])
 leaf('expired', 'p256', start=dt(2010), end=dt(2011))
 leaf('future', 'p256', start=dt(2098), end=dt(2099))
 leaf('nosan', 'p256', cn='cn.example.org', san=None)
@@ -174,8 +177,12 @@ def blob(name_, chain, ocsp=()):
     for o in ocsp: b += s(o)
     return b
 
+# RFC 6187 section 3: the signature carries the name of the plain signature
+# format ("rsa2048-sha256", "ecdsa-sha2-[identifier]"), not the "x509v3-" key
+# algorithm name.
+SIGNAME = {'rsa': 'rsa2048-sha256', 'p256': 'ecdsa-sha2-nistp256', 'p384': 'ecdsa-sha2-nistp384'}
 def sigblob(kind, key, msg):
-    n = keyname(kind)
+    n = SIGNAME[kind]
     if kind == 'rsa':
         return s(n.encode()) + s(key.sign(msg, padding.PKCS1v15(), hashes.SHA256()))
     h = hashes.SHA256() if kind == 'p256' else hashes.SHA384()
@@ -202,7 +209,7 @@ def openssl_ok(chain, trusted, crl_der=None, at=NOW):
 
 # What openssl says of each chain, for the checks that are about the PKI and
 # not about SSH (names and purposes are ours to check).
-for tag in ('p256', 'p384', 'rsa', 'client', 'noeku', 'tlsonly', 'anyeku', 'nosan', 'nodsig', 'ed'):
+for tag in ('p256', 'p384', 'rsa', 'client', 'noeku', 'tlsonly', 'anyeku', 'longany', 'nosan', 'nodsig', 'ed'):
     assert openssl_ok(leaves[tag][2], [root]), tag
 assert not openssl_ok(leaves['expired'][2], [root]), 'expired'
 assert not openssl_ok(leaves['future'][2], [root]), 'future'
@@ -223,7 +230,7 @@ emit('vec_x_crl_bad', crl_bad.public_bytes(serialization.Encoding.DER))
 for tag, (c, k, chain) in leaves.items():
     emit('vec_x_%s_leaf' % tag, der(c))
     kind = {'p256': 'p256', 'p384': 'p384', 'rsa': 'rsa'}.get(tag)
-    ck = {'ip6': 'p256', 'dnsip': 'p256', 'widestar': 'p256', 'ekuca': 'p256', 'weakca': 'p256', 'oldroot': 'p256', 'client': 'p256', 'noeku': 'p256', 'tlsonly': 'p256', 'anyeku': 'p256', 'expired': 'p256',
+    ck = {'ip6': 'p256', 'dnsip': 'p256', 'widestar': 'p256', 'ekuca': 'p256', 'weakca': 'p256', 'oldroot': 'p256', 'client': 'p256', 'noeku': 'p256', 'tlsonly': 'p256', 'anyeku': 'p256', 'longany': 'p256', 'expired': 'p256',
           'future': 'p256', 'sha1': 'p256', 'nosan': 'p256', 'wrongca': 'p256', 'nodsig': 'p256',
           'revoked': 'p256', 'oldinter': 'p256', 'p256_chainroot': 'p256'}.get(tag, kind)
     if ck:

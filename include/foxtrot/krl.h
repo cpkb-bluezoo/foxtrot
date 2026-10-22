@@ -63,8 +63,9 @@
 extern "C" {
 #endif
 
-/* The most revocation entries (serial ranges, key IDs, hashes and keys)
-   all the lists loaded may hold, and the longest list.  */
+/* The most revocation entries (serial ranges, key IDs, hashes and keys,
+   and the certificates sections that hold the first two) all the lists
+   loaded may hold, and the longest list.  */
 #define GF_KRL_MAX_ENTRIES (1u << 22)
 #define GF_KRL_MAX_SIZE (64u << 20)
 

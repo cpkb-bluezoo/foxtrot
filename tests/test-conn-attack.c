@@ -832,6 +832,7 @@ test_scripted_rekey_rules (void)
   /* A KEXINIT without the first-exchange markers is a proper rekey start,
      and the server answers with its own.  */
   client_handshake (&c);
+  CHECK_EQ (gf_conn_set_authenticated (c.s.sv.c), GF_OK);
   n = kexinit_payload (ki, sizeof ki, &l);
   CHECK_EQ (send_payload (&c.s, ki, n), GF_OK);
   ps = drain (&c);
@@ -847,6 +848,7 @@ test_scripted_rekey_rules (void)
   /* A rekey KEXINIT that carries the strict markers again is also fine
      (they are only meaningful the first time).  */
   client_handshake (&c);
+  CHECK_EQ (gf_conn_set_authenticated (c.s.sv.c), GF_OK);
   n = kexinit_payload (ki, sizeof ki, &good_client);
   CHECK_EQ (send_payload (&c.s, ki, n), GF_OK);
   ps = drain (&c);
@@ -855,6 +857,77 @@ test_scripted_rekey_rules (void)
   /* A second KEXINIT in the same exchange.  */
   CHECK (send_payload (&c.s, ki, n) != GF_OK);
   CHECK_EQ (c.s.sv.closed, 1);
+  client_free (&c);
+}
+
+/* The first key exchange travels in the clear, so a man in the middle can
+   replay the server's KEX_ECDH_REPLY to the client.  A client that took it
+   again would verify the same signature, ask about the same host key, and
+   derive the same keys a second time: it would send a second NEWKEYS and
+   restart its sequence number, and so encrypt new packets under a key and
+   nonce it had already used.  The second REPLY must end the connection.  */
+static void
+test_replayed_kex_reply (void)
+{
+  struct pair p;
+  gf_conn_config cc, sc;
+  const uint8_t *b;
+  size_t total;
+
+  memset (&cc, 0, sizeof cc);
+  memset (&sc, 0, sizeof sc);
+  sc.host_keys = &hostkey;
+  sc.nhost_keys = 1;
+  CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
+  pair_start (&p);
+  /* Identification and KEXINIT each way, then the client's ECDH_INIT to the
+     server, whose REPLY is the first packet it writes in answer.  */
+  deliver (&p.cl, &p.sv, 0);
+  deliver (&p.sv, &p.cl, 0);
+  deliver (&p.cl, &p.sv, 0);
+  b = p.sv.out.buf;
+  CHECK (p.sv.out.len > 6);
+  total = 4 + ((size_t) b[0] << 24 | (size_t) b[1] << 16 | (size_t) b[2] << 8
+               | b[3]);
+  CHECK (total <= p.sv.out.len);
+  CHECK_EQ (b[5], GF_MSG_KEX_ECDH_REPLY);
+
+  CHECK_EQ (gf_conn_receive (p.cl.c, tst_now, b, total), GF_OK);
+  CHECK_EQ (p.cl.host_key_calls, 1);
+  CHECK_EQ (p.cl.closed, 0);
+  CHECK (p.cl.out.len > 0);		/* Its NEWKEYS.  */
+  p.cl.out.len = 0;
+
+  /* The same REPLY again.  */
+  CHECK (gf_conn_receive (p.cl.c, tst_now, b, total) != GF_OK);
+  CHECK_EQ (p.cl.closed, 1);
+  CHECK_EQ (p.cl.close_reason, GF_DISCONNECT_PROTOCOL_ERROR);
+  CHECK_EQ (p.cl.host_key_calls, 1);
+  pair_free (&p);
+}
+
+/* A server takes a peer's KEXINIT for a protocol error until the user has
+   authenticated: each rekey costs it a key exchange and a signature, and
+   OpenSSH's sshd refuses them there too.  */
+static void
+test_preauth_rekey_refused (void)
+{
+  struct client c;
+  struct packets ps;
+  uint8_t ki[2048];
+  size_t n;
+  struct lists l = {
+    "curve25519-sha256", "ssh-ed25519", "chacha20-poly1305@openssh.com",
+    "none", 0
+  };
+
+  client_handshake (&c);
+  n = kexinit_payload (ki, sizeof ki, &l);
+  CHECK (send_payload (&c.s, ki, n) != GF_OK);
+  ps = drain (&c);
+  CHECK_EQ (c.s.sv.closed, 1);
+  CHECK (ps.n >= 1 && ps.p[ps.n - 1].type == 1);
+  CHECK_EQ (c.s.sv.close_reason, GF_DISCONNECT_PROTOCOL_ERROR);
   client_free (&c);
 }
 
@@ -872,6 +945,8 @@ main (void)
   test_established_attacks ();
   test_scripted_client ();
   test_scripted_rekey_rules ();
+  test_preauth_rekey_refused ();
+  test_replayed_kex_reply ();
   gf_key_free (hostkey);
   TST_DONE ();
 }

@@ -283,7 +283,16 @@ gf_sigalg_base (enum gf_sigalg alg)
 const char *
 gf_sigalg_signature_name (enum gf_sigalg alg)
 {
-  return gf_sigalg_name (gf_sigalg_base (alg));
+  /* RFC 6187 section 3: the signature of an X.509 chain names the plain
+     signature format of the key in the end certificate, not the "x509v3-"
+     algorithm of the key.  */
+  switch (alg)
+    {
+    case GF_SIG_X509_ECDSA_NISTP256:	return "ecdsa-sha2-nistp256";
+    case GF_SIG_X509_ECDSA_NISTP384:	return "ecdsa-sha2-nistp384";
+    case GF_SIG_X509_RSA2048_SHA256:	return "rsa2048-sha256";
+    default:				return gf_sigalg_name (gf_sigalg_base (alg));
+    }
 }
 
 enum gf_sigalg

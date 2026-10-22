@@ -180,7 +180,7 @@ int \fBgf_sigalg_is_user_only\fP (enum gf_sigalg alg);
 enum gf_sigalg \fBgf_sigalg_base\fP (enum gf_sigalg alg);
 .br
 const char *\fBgf_sigalg_signature_name\fP (enum gf_sigalg alg);
-The plain algorithm of a certificate algorithm (itself otherwise), and the name in the signature, which is that algorithm's.
+The plain algorithm of a certificate algorithm (itself otherwise), and the name in the signature, which is that algorithm's.  For an X.509 algorithm the name in the signature is not its own but, as RFC 6187 section 3 has it, that of the signature format of the key in the end certificate: "ecdsa\-sha2\-nistp256", "ecdsa\-sha2\-nistp384" or "rsa2048\-sha256".  User authentication still names the key by the algorithm's own name (gf_sigalg_name).
 .SH "SEE ALSO"
 foxtrot(7)
 .PP

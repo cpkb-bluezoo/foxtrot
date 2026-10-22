@@ -300,6 +300,15 @@ pump (struct pair *p, size_t chunk)
     }
 }
 
+/* Both ends are told the user has authenticated, as the session does, so
+   that they rekey.  Established first.  */
+static inline void
+pair_authenticate (struct pair *p)
+{
+  CHECK_EQ (gf_conn_set_authenticated (p->cl.c), GF_OK);
+  CHECK_EQ (gf_conn_set_authenticated (p->sv.c), GF_OK);
+}
+
 static void
 pair_start (struct pair *p)
 {

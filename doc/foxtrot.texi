@@ -607,8 +607,10 @@ With GnuTLS (3.8 or later; @command{configure} looks for it, and
 @option{--without-gnutls} turns it off) a key can be a chain of X.509
 certificates, as in RFC 6187: @samp{x509v3-ecdsa-sha2-nistp256},
 @samp{x509v3-ecdsa-sha2-nistp384} and @samp{x509v3-rsa2048-sha256}.  The key
-blob is the RFC's, the signature the key in the end certificate makes, with the
-algorithm name in it.  @file{x509.h} reads the chains, attaches one to a private key
+blob is the RFC's, the signature the key in the end certificate makes, with
+the name of the signature format in it as RFC 6187 section 3 has it
+(@samp{ecdsa-sha2-nistp256}, @samp{ecdsa-sha2-nistp384} or
+@samp{rsa2048-sha256}, not the @samp{x509v3-} name of the key).  @file{x509.h} reads the chains, attaches one to a private key
 (@code{gf_key_with_x509}) for a server's host key or a client's user key, and
 validates one against trust the application gives it.  Absent on purpose:
 @samp{x509v3-ssh-rsa} and @samp{x509v3-ssh-dss} (SHA-1 and DSA), P-521, and
@@ -922,6 +924,16 @@ number wrap.  A key exchange that does not finish in 60 seconds ends the
 connection.  Between a peer's KEXINIT and its NEWKEYS the peer may send
 only transport and key exchange messages.  Application messages sent
 during our own key exchange are held and sent after it, up to 1 MiB.
+
+Nothing rekeys before the user has authenticated.  A rekey that falls due
+before then is put off, and begins when the transport is told (the session
+tells it) that authentication has succeeded.  A server takes a client's
+KEXINIT before that for a protocol error: each rekey costs it a key exchange
+and a signature, which the peer has not yet earned the right to, and
+OpenSSH's @command{sshd} refuses them there too.  A client does take a rekey
+that the server starts, as OpenSSH's @command{ssh} does.  An application
+that uses the transport without the authentication layer calls
+@code{gf_conn_set_authenticated} itself.
 
 @node Authentication
 @section Authentication

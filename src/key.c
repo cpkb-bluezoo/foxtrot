@@ -709,8 +709,8 @@ alg_fits_key (const gf_key *k, enum gf_sigalg alg)
 }
 
 /* The algorithm whose arithmetic an algorithm uses: an X.509 chain signs as
-   the key in its end certificate does, and the name in the signature stays
-   the one that was negotiated.  */
+   the key in its end certificate does, under the name RFC 6187 gives the
+   signature (gf_sigalg_signature_name).  */
 static enum gf_sigalg
 crypto_alg (enum gf_sigalg alg)
 {
@@ -742,8 +742,8 @@ gf_key_sign (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
     return GF_ERR_INVAL;
   if (!alg_fits_key (k, alg) || gf_sigalg_is_user_only (alg))
     return GF_ERR_UNSUPPORTED;	/* A token signs security keys, not us.  */
+  signame = gf_sigalg_signature_name (alg);
   alg = gf_sigalg_base (alg);	/* A certificate signs as its key does.  */
-  signame = gf_sigalg_name (alg);
   alg = crypto_alg (alg);
   rc = gf_crypto_init ();
   if (rc != GF_OK)
@@ -873,7 +873,7 @@ verify_impl (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
   uint8_t digest[64];
   uint8_t skdata[2 * 32 + 1 + 4];
   enum gf_hash h = GF_HASH_SHA256;
-  const char *hname = "sha256";
+  const char *hname = "sha256", *signame;
   int rc, sk;
   uint8_t flags = 0;
   uint32_t counter = 0;
@@ -882,6 +882,7 @@ verify_impl (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
     return GF_ERR_INVAL;
   if (!alg_fits_key (k, alg))
     return GF_ERR_UNSUPPORTED;
+  signame = gf_sigalg_signature_name (alg);
   alg = gf_sigalg_base (alg);
   sk = alg == GF_SIG_SK_ED25519 || alg == GF_SIG_SK_ECDSA_NISTP256;
   rc = gf_crypto_init ();
@@ -893,7 +894,7 @@ verify_impl (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
       || (sk && (gf_rd_u8 (&r, &flags) != GF_OK
                  || gf_rd_u32 (&r, &counter) != GF_OK))
       || gf_rd_finish (&r) != GF_OK
-      || !gf_slice_equals (name, gf_sigalg_name (alg)))
+      || !gf_slice_equals (name, signame))
     return GF_ERR_HOSTKEY;
   if (sk)
     {

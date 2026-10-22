@@ -214,6 +214,7 @@ test_rekey (void)
   pair_start (&p);
   pump (&p, 0);
   expect_established (&p);
+  pair_authenticate (&p);
   sidlen = p.cl.info.session_id_len;
   memcpy (sid, p.cl.info.session_id, sidlen);
   siglen = p.cl.info.host_sig_len;
@@ -271,6 +272,7 @@ test_automatic_rekey (void)
   CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
   pair_start (&p);
   pump (&p, 0);
+  pair_authenticate (&p);
   for (i = 0; i < 60; i++)
     {
       traffic (&p, 1, 30, (uint8_t) i);
@@ -292,6 +294,7 @@ test_automatic_rekey (void)
   CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
   pair_start (&p);
   pump (&p, 0);
+  pair_authenticate (&p);
   for (i = 0; i < 20; i++)
     {
       traffic (&p, 1, 2000, (uint8_t) i);
@@ -312,6 +315,7 @@ test_automatic_rekey (void)
   pair_start (&p);
   pump (&p, 0);
   expect_established (&p);
+  pair_authenticate (&p);
   CHECK (gf_conn_timeout (p.cl.c) > tst_now);
   CHECK (gf_conn_timeout (p.cl.c) < tst_now + 6000000);
   tst_now += 4000000;
@@ -323,6 +327,70 @@ test_automatic_rekey (void)
   pump (&p, 0);
   CHECK_EQ (p.cl.rekeyed, 1);
   CHECK_EQ (p.sv.rekeyed, 1);
+  pair_free (&p);
+}
+
+/* Before the user is authenticated nothing rekeys: not by the clock, and not
+   when asked.  OpenSSH's sshd takes a KEXINIT there for a protocol error, so
+   a client that sent one at the hour would be cut off, and a rekey is a
+   key exchange and a signature that nobody has yet earned.  */
+static void
+test_no_rekey_before_authentication (void)
+{
+  struct pair p;
+  gf_conn_config cc, sc;
+
+  memset (&cc, 0, sizeof cc);
+  memset (&sc, 0, sizeof sc);
+  sc.host_keys = keys;
+  sc.nhost_keys = 1;
+  cc.rekey_interval_us = sc.rekey_interval_us = 1000000;
+  tst_now = 1000000;
+  CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
+  pair_start (&p);
+  pump (&p, 0);
+  expect_established (&p);
+  tst_now += 5000000;
+  /* Due, but not to be started, and not to be waited for in a loop.  */
+  CHECK_EQ (gf_conn_timeout (p.cl.c), UINT64_MAX);
+  CHECK_EQ (gf_conn_timeout (p.sv.c), UINT64_MAX);
+  CHECK_EQ (gf_conn_on_timeout (p.cl.c, tst_now), GF_OK);
+  CHECK_EQ (gf_conn_on_timeout (p.sv.c, tst_now), GF_OK);
+  CHECK_EQ (p.cl.out.len, 0);
+  CHECK_EQ (p.sv.out.len, 0);
+  CHECK_EQ (gf_conn_rekey (p.cl.c, tst_now), GF_ERR_STATE);
+  CHECK_EQ (gf_conn_rekey (p.sv.c, tst_now), GF_ERR_STATE);
+  CHECK_EQ (p.cl.out.len, 0);
+  CHECK_EQ (p.cl.closed + p.sv.closed, 0);
+  /* Once the layer above says the user is in, what was put off starts.  */
+  CHECK_EQ (gf_conn_set_authenticated (p.cl.c), GF_OK);
+  CHECK_EQ (gf_conn_set_authenticated (p.sv.c), GF_OK);
+  CHECK (gf_conn_timeout (p.cl.c) <= tst_now);
+  CHECK_EQ (gf_conn_on_timeout (p.cl.c, tst_now), GF_OK);
+  pump (&p, 0);
+  CHECK_EQ (p.cl.rekeyed, 1);
+  CHECK_EQ (p.sv.rekeyed, 1);
+  pair_free (&p);
+
+  /* A client takes a rekey the server starts before it has itself
+     authenticated, as OpenSSH's does.  */
+  memset (&cc, 0, sizeof cc);
+  CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
+  pair_start (&p);
+  pump (&p, 0);
+  expect_established (&p);
+  CHECK_EQ (gf_conn_set_authenticated (p.sv.c), GF_OK);
+  CHECK_EQ (gf_conn_rekey (p.sv.c, tst_now), GF_OK);
+  pump (&p, 0);
+  CHECK_EQ (p.cl.rekeyed, 1);
+  CHECK_EQ (p.sv.rekeyed, 1);
+  CHECK_EQ (p.cl.closed + p.sv.closed, 0);
+  pair_free (&p);
+
+  /* Not before the first key exchange has finished.  */
+  CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
+  CHECK_EQ (gf_conn_set_authenticated (p.cl.c), GF_ERR_STATE);
+  CHECK_EQ (gf_conn_set_authenticated (NULL), GF_ERR_INVAL);
   pair_free (&p);
 }
 
@@ -426,6 +494,7 @@ test_rekey_key_change (void)
   pair_start (&p);
   pump (&p, 0);
   expect_established (&p);
+  pair_authenticate (&p);
   hk[0] = other;			/* The server now signs with another key.  */
   CHECK_EQ (gf_conn_rekey (p.sv.c, tst_now), GF_OK);
   pump (&p, 0);
@@ -517,6 +586,25 @@ test_disconnect (void)
   CHECK_EQ (p.cl.close_error, GF_ERR_CLOSED);
   CHECK_EQ (p.cl.close_reason, GF_DISCONNECT_TOO_MANY_CONNECTIONS);
   pair_free (&p);
+
+  /* A description too long for the message does not lose the DISCONNECT:
+     the peer still hears the reason.  */
+  {
+    char longtext[400];
+
+    memset (longtext, 'd', sizeof longtext - 1);
+    longtext[sizeof longtext - 1] = '\0';
+    CHECK_EQ (pair_new (&p, &cc, &sc), GF_OK);
+    pair_start (&p);
+    pump (&p, 0);
+    CHECK_EQ (gf_conn_disconnect (p.sv.c, tst_now,
+                                  GF_DISCONNECT_TOO_MANY_CONNECTIONS, longtext),
+              GF_OK);
+    pump (&p, 0);
+    CHECK_EQ (p.cl.closed, 1);
+    CHECK_EQ (p.cl.close_reason, GF_DISCONNECT_TOO_MANY_CONNECTIONS);
+    pair_free (&p);
+  }
 }
 
 static void
@@ -545,6 +633,7 @@ test_timeouts (void)
   pair_start (&p);
   pump (&p, 0);
   expect_established (&p);
+  pair_authenticate (&p);
   CHECK_EQ (gf_conn_rekey (p.cl.c, tst_now), GF_OK);
   CHECK_EQ (gf_conn_timeout (p.cl.c), tst_now + 2000000);
   p.cl.out.len = 0;			/* Lost.  */
@@ -601,6 +690,7 @@ main (void)
   test_matrix ();
   test_chunks ();
   test_rekey ();
+  test_no_rekey_before_authentication ();
   test_automatic_rekey ();
   test_host_key_refused ();
   test_tampered_exchange ();

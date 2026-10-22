@@ -308,6 +308,7 @@ struct ctx
 {
   gf_krl *t;			/* What this list adds.  */
   size_t base;			/* The entries already in the list.  */
+  size_t groups;		/* The certificates sections already in it.  */
 };
 
 static int
@@ -503,6 +504,11 @@ certificates_section (struct ctx *c, gf_slice data)
   gf_reader_init (&r, data.data, data.len);
   if (gf_rd_string (&r, &ca) != GF_OK || gf_rd_string (&r, &reserved) != GF_OK)
     return GF_ERR_ENCODING;
+  /* A section is kept, and walked by every check of a certificate, whether
+     or not it holds anything, so sections are counted against the limit
+     with the entries (though not as entries, for gf_krl_count).  */
+  if (c->base + c->t->entries + c->groups + t->ng >= GF_KRL_MAX_ENTRIES)
+    return GF_ERR_RANGE;
   if (t->ng == t->capg)
     {
       size_t nc = t->capg ? t->capg * 2 : 8;
@@ -688,6 +694,7 @@ gf_krl_load (gf_krl *k, const uint8_t *data, size_t len)
   memset (&t, 0, sizeof t);
   c.t = &t;
   c.base = k->entries;
+  c.groups = k->ng;
   rc = parse (&c, data, len);
   if (rc == GF_OK)
     rc = merge (k, &t);

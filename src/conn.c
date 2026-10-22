@@ -101,6 +101,7 @@ struct gf_conn
   const gf_key *sign_key;	/* Server: the key used.  */
   gf_conn_info info;
   int ext_window;		/* EXT_INFO may be the next packet.  */
+  int authed;			/* The layer above says the user is in.  */
 
   uint64_t kex_deadline, rekey_due;
 
@@ -216,6 +217,16 @@ send_disconnect (gf_conn *c, uint32_t reason, const char *text)
   gf_wr_u32 (&w, reason);
   gf_wr_cstring (&w, text ? text : reason_text (reason));
   gf_wr_cstring (&w, "");
+  if (gf_wr_status (&w) != GF_OK)
+    {
+      /* The application's description did not fit: the reason must still
+         reach the peer, with the fixed text.  */
+      gf_writer_init (&w, buf, sizeof buf);
+      gf_wr_u8 (&w, GF_MSG_DISCONNECT);
+      gf_wr_u32 (&w, reason);
+      gf_wr_cstring (&w, reason_text (reason));
+      gf_wr_cstring (&w, "");
+    }
   if (gf_wr_status (&w) == GF_OK)
     (void) send_packet (c, buf, w.len);
 }
@@ -524,7 +535,13 @@ handle_kexinit (gf_conn *c, const uint8_t *p, size_t n)
     FAIL (c, GF_ERR_PROTOCOL, GF_DISCONNECT_PROTOCOL_ERROR);
   if (!c->kex_active)
     {
-      /* A rekey the peer starts.  */
+      /* A rekey the peer starts.  A server has it only from a user who is
+         in: before that each one costs it a key exchange and a signature
+         for nobody, and OpenSSH's sshd refuses them too.  A client takes
+         one from the server it has authenticated the host of, as OpenSSH's
+         does.  */
+      if (c->server && !c->authed)
+        FAIL (c, GF_ERR_PROTOCOL, GF_DISCONNECT_PROTOCOL_ERROR);
       r = begin_kex (c);
       if (r != GF_OK)
         return r;
@@ -694,7 +711,13 @@ handle_kex_reply (gf_conn *c, const uint8_t *p, size_t n)
   gf_key *key = NULL;
   int r;
 
-  if (c->server || !c->kex_done_msg || c->kexc == NULL)
+  /* One REPLY per exchange.  The first exchange travels in the clear, so
+     a second copy may be a man in the middle's replay: taking it would
+     derive the same keys again, send a second NEWKEYS and restart our
+     sequence number, and so reuse a nonce under the keys already in use.
+     After it is handled the ephemeral secret is gone (kexc is NULL) and
+     our NEWKEYS is out, and either refuses the next.  */
+  if (c->server || !c->kex_done_msg || c->kexc == NULL || c->sent_newkeys)
     FAIL (c, GF_ERR_PROTOCOL, GF_DISCONNECT_PROTOCOL_ERROR);
   gf_reader_init (&rd, p + 1, n - 1);
   if (gf_rd_string (&rd, &ks) != GF_OK || gf_rd_string (&rd, &qs) != GF_OK
@@ -711,6 +734,10 @@ handle_kex_reply (gf_conn *c, const uint8_t *p, size_t n)
       FAIL (c, GF_ERR_HOSTKEY, GF_DISCONNECT_HOST_KEY_NOT_VERIFIABLE);
     }
   r = gf_kex_client_finish (c->kexc, qs.data, qs.len, &k);
+  /* The ephemeral secret has done its work: wipe it now rather than at the
+     end of the exchange.  */
+  gf_kex_client_free (c->kexc);
+  c->kexc = NULL;
   if (r != GF_OK)
     {
       gf_key_free (key);
@@ -1047,7 +1074,9 @@ maybe_rekey (gf_conn *c)
   uint64_t rp = gf_packet_count (&c->pkt, GF_DIR_READ);
   uint64_t wp = gf_packet_count (&c->pkt, GF_DIR_WRITE);
 
-  if (!c->established || c->kex_active || c->st != ST_PACKETS)
+  /* Not before the user is in: it is put off, not forgotten (the limits
+     only grow), and starts as soon as the layer above says so.  */
+  if (!c->established || !c->authed || c->kex_active || c->st != ST_PACKETS)
     return GF_OK;
   if (rb < bytes && wb < bytes && rp < packets && wp < packets
       && c->now < c->rekey_due)
@@ -1265,7 +1294,8 @@ gf_conn_timeout (const gf_conn *c)
     return UINT64_MAX;
   if (c->kex_active)
     return c->kex_deadline;
-  if (c->established)
+  /* A rekey that is due but put off is not a time to wake for.  */
+  if (c->established && c->authed)
     return c->rekey_due;
   return UINT64_MAX;
 }
@@ -1428,10 +1458,25 @@ gf_conn_rekey (gf_conn *c, uint64_t now_us)
 
   if (r != GF_OK)
     return r;
+  if (!c->authed)
+    return GF_ERR_STATE;
   if (c->kex_active)
     return GF_OK;
   r = begin_kex (c);
   return r == GF_OK ? GF_OK : fail (c, r);
+}
+
+int
+gf_conn_set_authenticated (gf_conn *c)
+{
+  if (c == NULL)
+    return GF_ERR_INVAL;
+  if (c->st == ST_CLOSED)
+    return GF_ERR_CLOSED;
+  if (!c->established)
+    return GF_ERR_STATE;
+  c->authed = 1;
+  return GF_OK;
 }
 
 int

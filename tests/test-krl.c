@@ -496,6 +496,33 @@ test_limits (void)
   gf_krl_free (k);
 }
 
+/* A certificates section with nothing in it still costs memory and a scan
+   on every check, so sections count as entries too: a list of nothing but
+   empty sections, more than the limit, is refused.  */
+static void
+test_group_limit (void)
+{
+  gf_krl *k;
+  size_t n = (size_t) GF_KRL_MAX_ENTRIES + 1, i, hl;
+  static const uint8_t empty_section[13] = { 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0 };
+  uint8_t *file;
+  gf_writer w;
+
+  CHECK_EQ (gf_krl_new (&k), GF_OK);
+  w = header (1);
+  hl = w.len;
+  file = malloc (hl + n * sizeof empty_section);
+  CHECK (file != NULL);
+  memcpy (file, buf, hl);
+  for (i = 0; i < n; i++)
+    memcpy (file + hl + i * sizeof empty_section, empty_section,
+            sizeof empty_section);
+  CHECK_EQ (gf_krl_load (k, file, hl + n * sizeof empty_section), GF_ERR_RANGE);
+  CHECK_EQ (gf_krl_count (k), 0);
+  free (file);
+  gf_krl_free (k);
+}
+
 static void
 test_arguments (void)
 {
@@ -522,6 +549,7 @@ main (void)
   test_refused ();
   test_atomic_and_prefixes ();
   test_limits ();
+  test_group_limit ();
   test_arguments ();
   TST_DONE ();
 }

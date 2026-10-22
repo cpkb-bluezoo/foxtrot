@@ -163,7 +163,12 @@ int gf_sigalg_is_x509 (enum gf_sigalg alg);
    never negotiated for a host key, and gf_kexinit_make refuses it.  */
 int gf_sigalg_is_user_only (enum gf_sigalg alg);
 /* The plain algorithm of a certificate algorithm (itself otherwise), and
-   the name in the signature, which is that algorithm's.  */
+   the name in the signature, which is that algorithm's.  For an X.509
+   algorithm the name in the signature is not its own but, as RFC 6187
+   section 3 has it, that of the signature format of the key in the end
+   certificate: "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384" or
+   "rsa2048-sha256".  User authentication still names the key by the
+   algorithm's own name (gf_sigalg_name).  */
 enum gf_sigalg gf_sigalg_base (enum gf_sigalg alg);
 const char *gf_sigalg_signature_name (enum gf_sigalg alg);
 

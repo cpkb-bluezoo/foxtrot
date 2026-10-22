@@ -216,6 +216,23 @@ test_write (void)
         }
       CHECK_EQ (n, strlen (out));
       CHECK_EQ (gf_key_randomart (k, out, 100, &n), GF_ERR_INVAL);
+      /* The picture is eleven lines of twenty bytes and a NUL: a buffer
+         one short is refused, and one just big enough is not overrun.  */
+      {
+        struct
+        {
+          char buf[221];
+          char canary[32];
+        } tight;
+
+        memset (&tight, 'C', sizeof tight);
+        CHECK_EQ (gf_key_randomart (k, tight.buf, 220, &n), GF_ERR_INVAL);
+        CHECK_EQ (gf_key_randomart (k, tight.buf, 221, &n), GF_OK);
+        CHECK_EQ (n, 220);
+        CHECK_EQ (tight.buf[220], '\0');
+        CHECK_EQ (tight.canary[0], 'C');
+        CHECK_EQ (tight.canary[31], 'C');
+      }
       gf_key_free (rk);
       gf_key_free (k);
     }
@@ -1410,7 +1427,10 @@ ppk_variants (void)
       { "Argon2id", "1024", "1", "1", "001122334455667788", -1 },
       { "Argon2id", "1024", "1", "1", "00112233445566778899aabbccddeeffgg", GF_ERR_ENCODING },
       { "Scrypt", "1024", "1", "1", "00112233445566778899aabbccddeeff", GF_ERR_UNSUPPORTED },
-      { "Argon2id", "99999999999", "1", "1", "00112233445566778899aabbccddeeff", GF_ERR_UNSUPPORTED }
+      { "Argon2id", "99999999999", "1", "1", "00112233445566778899aabbccddeeff", GF_ERR_UNSUPPORTED },
+      /* Each within its own bound, but together minutes of work.  */
+      { "Argon2id", "524288", "1000", "1", "00112233445566778899aabbccddeeff", GF_ERR_UNSUPPORTED },
+      { "Argon2id", "8192", "513", "1", "00112233445566778899aabbccddeeff", GF_ERR_UNSUPPORTED }
     };
     uint8_t fake[48];
 

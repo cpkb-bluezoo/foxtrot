@@ -65,6 +65,14 @@ io_init (struct io *io, uint32_t max_packet, size_t max_output,
   io->user = user;
 }
 
+/* The most data a DATA packet may carry: the packet size less its header,
+   with room to spare.  */
+static uint32_t
+io_data_cap (const struct io *io)
+{
+  return io->max_packet > 16 ? io->max_packet - 16 : 0;
+}
+
 static void
 io_free (struct io *io)
 {
@@ -607,22 +615,6 @@ gf_sftp_server_pending (const gf_sftp_server *s)
   return s->io.outn;
 }
 
-int
-gf_sftp_server_writable (gf_sftp_server *s)
-{
-  int r;
-
-  if (s->io.dead)
-    return GF_ERR_CLOSED;
-  r = io_flush (&s->io);
-  if (r != GF_OK)
-    {
-      s->io.dead = 1;
-      s->ev.disconnect (s->ev.user, r);
-    }
-  return r;
-}
-
 static int
 srv_die (gf_sftp_server *s, int status)
 {
@@ -633,6 +625,19 @@ srv_die (gf_sftp_server *s, int status)
         s->ev.disconnect (s->ev.user, status);
     }
   return status;
+}
+
+int
+gf_sftp_server_writable (gf_sftp_server *s)
+{
+  int r;
+
+  if (s->io.dead)
+    return GF_ERR_CLOSED;
+  r = io_flush (&s->io);
+  if (r != GF_OK)
+    return srv_die (s, r);
+  return r;
 }
 
 static struct outstanding_srv *
@@ -726,6 +731,10 @@ srv_request (gf_sftp_server *s, const uint8_t *body, size_t len)
       bad = rd_handle (&rd, &rq.handle) != GF_OK
         || gf_rd_u64 (&rd, &rq.offset) != GF_OK
         || gf_rd_u32 (&rd, &rq.length) != GF_OK;
+      /* No more than gf_sftp_server_data could answer with: a client
+         asking for 4 GiB must not have the application allocate it.  */
+      if (!bad && rq.length > io_data_cap (&s->io))
+        rq.length = io_data_cap (&s->io);
       break;
     case GF_FXP_WRITE:
       bad = rd_handle (&rd, &rq.handle) != GF_OK
@@ -1643,7 +1652,7 @@ gf_sftp_client_read (gf_sftp_client *c, const uint8_t *h, size_t hl,
   int r;
 
   if (h == NULL || hl == 0 || hl > GF_SFTP_MAX_HANDLE || length == 0
-      || c == NULL || length + 16 > c->io.max_packet)
+      || c == NULL || length > io_data_cap (&c->io))
     return GF_ERR_INVAL;
   r = cli_begin (c, GF_FXP_READ, tag, length, &n);
   if (r != GF_OK)

@@ -107,11 +107,11 @@ int gf_key_from_ppk (gf_key **out, const char *text, size_t len,
 /* ---- Picture ----
 
    The randomart image of the SHA-256 fingerprint of KEY (a certificate has
-   the one of the key it certifies), the one ssh-keygen -lv prints: nine
+   the one of the key it certifies), the one ssh-keygen -lv prints: eleven
    lines of 19 characters, each ending in a newline, the first and last
    being the border with the key type and size and "[SHA256]".  OUT is
    NUL-terminated; *LEN receives its length without the NUL.  The least CAP
-   is 200.  */
+   is 221 (eleven lines of twenty bytes, and the NUL).  */
 int gf_key_randomart (const gf_key *key, char *out, size_t cap, size_t *len);
 
 #ifdef __cplusplus

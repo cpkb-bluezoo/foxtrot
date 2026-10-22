@@ -959,6 +959,13 @@ gf_x509_verify (const gf_x509_trust *t, const gf_key *key, int purpose,
         int er = gnutls_x509_crt_get_key_purpose_oid (crt[0], (int) idx, eoid,
                                                       &osz, &c2);
 
+        if (er == GNUTLS_E_SHORT_MEMORY_BUFFER)
+          {
+            /* One too long to be any we know: it counts, and the list goes
+               on after it.  */
+            have = 1;
+            continue;
+          }
         if (er < 0)
           break;
         have = 1;

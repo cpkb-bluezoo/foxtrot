@@ -90,6 +90,8 @@ n_send (void *user, const uint8_t *p, size_t n)
     return 1;
   if (x->again_send)
     return GF_ERR_AGAIN;
+  /* What the transport would refuse.  */
+  CHECK (n <= GF_MAX_PAYLOAD);
   if (y->qn + n + 4 > y->qcap)
     {
       y->qcap = (y->qn + n + 4) * 2;
@@ -1190,6 +1192,21 @@ test_open_types_and_limits (void)
   CHECK_EQ (n.a.failed, 1);
   CHECK_EQ (n.a.fail_reason, GF_OPEN_ADMINISTRATIVELY_PROHIBITED);
   CHECK_EQ (gf_chans_count (n.a.m), 0);
+  /* A refusal with a long text is still a well-formed message.  */
+  {
+    char longtext[300];
+
+    memset (longtext, 'r', sizeof longtext - 1);
+    longtext[sizeof longtext - 1] = '\0';
+    CHECK_EQ (gf_chans_open_session (n.a.m, &id, 0, 0), GF_OK);
+    pump (&n);
+    CHECK_EQ (gf_chans_open_reject (n.b.m, n.b.last_open_id,
+                                    GF_OPEN_CONNECT_FAILED, longtext), GF_OK);
+    pump (&n);
+    CHECK_EQ (n.a.failed, 2);
+    CHECK_EQ (n.a.fail_reason, GF_OPEN_CONNECT_FAILED);
+    CHECK_EQ (n.a.disconnect + n.b.disconnect, 0);
+  }
   /* Accept later, then again.  */
   CHECK_EQ (gf_chans_open_session (n.a.m, &id, 0, 0), GF_OK);
   pump (&n);
@@ -1567,11 +1584,38 @@ test_send_failures (void)
   net_free (&n);
 }
 
+/* The largest message of extended data: its header is four bytes longer
+   than data's, and the whole must still fit a transport payload, or the
+   send fails and takes the connection with it.  */
+static void
+test_extended_max_packet (void)
+{
+  struct net n;
+  uint32_t a;
+  static uint8_t big[GF_CHAN_MAX_PACKET];
+  long r;
+
+  memset (big, 'x', sizeof big);
+  net_new (&n, &(gf_chans_config) { 0, 0, 0 }, &(gf_chans_config) { 0, 0, 0 });
+  a = open_session (&n, 0, GF_CHAN_MAX_PACKET);
+  CHECK_EQ (gf_chans_remote_max_packet (n.a.m, a), GF_CHAN_MAX_PACKET);
+  r = gf_chans_send_extended (n.a.m, a, 1, big, sizeof big);
+  CHECK_EQ (r, (long) sizeof big);
+  r = gf_chans_send_data (n.a.m, a, big, sizeof big);
+  CHECK_EQ (r, (long) sizeof big);
+  pump (&n);
+  CHECK_EQ (n.a.disconnect + n.b.disconnect, 0);
+  CHECK_EQ (n.b.rx_err, sizeof big);
+  CHECK_EQ (n.b.rxn, sizeof big);
+  net_free (&n);
+}
+
 int
 main (void)
 {
   gf_crypto_init ();
   test_open_data_close ();
+  test_extended_max_packet ();
   test_flow_control ();
   test_window_stall ();
   test_violations ();

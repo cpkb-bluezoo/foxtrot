@@ -163,6 +163,7 @@ as_authenticated (void *user, gf_slice username)
   memcpy (s->user, username.data, username.len);
   s->user[username.len] = '\0';
   s->phase = GF_PHASE_READY;
+  gf_conn_set_authenticated (s->c);
   return s->ev.authenticated ? s->ev.authenticated (s->ev.user, username) : 0;
 }
 
@@ -210,6 +211,7 @@ ac_authenticated (void *user)
   gf_slice none = { NULL, 0 };
 
   s->phase = GF_PHASE_READY;
+  gf_conn_set_authenticated (s->c);
   return s->ev.authenticated ? s->ev.authenticated (s->ev.user, none) : 0;
 }
 
