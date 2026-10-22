@@ -20,6 +20,53 @@ ciphers, no separate MACs, no SHA-1, no finite-field Diffie-Hellman, no
 ssh-rsa or DSA, no compression, and Strict KEX (the Terrapin countermeasure)
 is mandatory.  See the manual (doc/foxtrot.texi) for the security policy.
 
+Post-quantum key exchange
+-------------------------
+
+The default key exchange preference puts the post-quantum hybrids first:
+mlkem768x25519-sha256, sntrup761x25519-sha512 (also under its OpenSSH 9.0
+name), mlkem768nistp256-sha256 and mlkem1024nistp384-sha384, ahead of
+curve25519-sha256 and ECDH P-256/P-384.  Each hybrid runs a classical
+elliptic-curve exchange and a post-quantum KEM (ML-KEM or Streamlined NTRU
+Prime, from libgcrypt) side by side and hashes the two secrets together, so
+the session key is safe if either half holds.  An attacker who records the
+traffic now and has a quantum computer later gets nothing from it, and one
+who finds a flaw in the newer KEM is no better off than against the curve
+alone.  There is deliberately no pure post-quantum method.
+
+Two limits to know.  The classical methods stay in the closed set and are
+negotiated with a peer that offers nothing better, so a hybrid is used when
+both sides have one, not enforced.  And the hybrid protects confidentiality
+only: host and user keys are still Ed25519, ECDSA and RSA, so authenticating
+the peer does not resist a quantum computer, and neither do X.509 chains or
+OpenSSH certificates.
+
+Certificate validation
+----------------------
+
+Two kinds of certificate are supported, and neither is trusted just because
+it parses and its signature verifies.  The library checks what it can and
+leaves the decision to the application, which has to ask.
+
+OpenSSH certificates (user and host).  gf_key_from_blob refuses one that is
+malformed or whose CA signed with SHA-1, or that holds a key or CA key the
+policy refuses.  gf_cert_check then tests the type, the validity dates and
+the critical options; the CA, the principals and the options are for the
+application, as is a revocation list (krl) and known_hosts or authorized_keys
+for who may sign what.
+
+X.509 chains (RFC 6187, through GnuTLS).  gf_x509_verify checks the chain
+against a trust store the application builds; nothing is trusted by default
+and nothing is read from the system.  Every certificate must be in its
+dates, the chain must lead to a CA in the store with no MD5 or SHA-1
+signature and no key under 112 bits, and none may be on a CRL the store
+holds.  Stapled OCSP responses are checked for signature, freshness and
+revocation (a stale or broken one fails the chain, and the application can
+require one).  The extended key usage must allow secure shell for the role,
+the key usage must allow digitalSignature, and a server's subject
+alternative names must match the host it was dialled as: the common name is
+never consulted.  Nothing is fetched from the network.
+
 Status
 ------
 
