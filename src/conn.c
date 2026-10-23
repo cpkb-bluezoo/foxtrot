@@ -331,19 +331,22 @@ begin_kex (gf_conn *c)
 static int
 flush_pending (gf_conn *c)
 {
-  size_t off = 0;
+  size_t npend = c->pend_len, off = 0;
   int r = GF_OK;
 
-  while (off < c->pend_len && r == GF_OK)
+  while (off < npend && r == GF_OK)
     {
       gf_reader rd;
       uint32_t n;
 
-      gf_reader_init (&rd, c->pend + off, c->pend_len - off);
+      gf_reader_init (&rd, c->pend + off, npend - off);
       gf_rd_u32 (&rd, &n);
       r = send_packet (c, c->pend + off + 4, n);
       off += 4 + n;
     }
+  /* The queue can hold a password or other userauth message.  */
+  if (c->pend != NULL && npend > 0)
+    gf_wipe (c->pend, npend);
   c->pend_len = 0;
   return r;
 }
@@ -565,9 +568,14 @@ handle_kexinit (gf_conn *c, const uint8_t *p, size_t n)
     FAIL (c, r, GF_DISCONNECT_KEY_EXCHANGE_FAILED);
   if (r != GF_OK)
     return r;
-  c->peer_ext_info = c->server
-    ? c->algs.ext_info
-    : gf_namelist_contains (si->kex, GF_KEX_EXTINFO_SERVER);
+  /* RFC 8308 is announced on the first exchange only.  A rekey's KEXINIT
+     omits the marker, and negotiate() reports ext_info only for the initial
+     exchange, so taking this from the rekey would clear a flag the peer
+     did announce.  */
+  if (c->first_kex)
+    c->peer_ext_info = c->server
+      ? c->algs.ext_info
+      : gf_namelist_contains (si->kex, GF_KEX_EXTINFO_SERVER);
 
   if (!c->server)
     {

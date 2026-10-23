@@ -161,6 +161,21 @@ test_ed25519_rfc8032 (void)
   CHECK_EQ (gf_key_verify (k, GF_SIG_ED25519, (const uint8_t *) "", 0, sig,
                            w.len), GF_OK);
 
+  /* y = 2^255-19 is the same residue as 0, written non-canonically.  */
+  {
+    uint8_t bad[64];
+
+    memcpy (bad, rs, 64);
+    memset (bad, 0xff, 31);
+    bad[0] = 0xed;
+    bad[31] = 0x7f;
+    gf_writer_init (&w, sig, sizeof sig);
+    gf_wr_cstring (&w, "ssh-ed25519");
+    gf_wr_string (&w, bad, 64);
+    CHECK_EQ (gf_key_verify (k, GF_SIG_ED25519, (const uint8_t *) "", 0, sig,
+                             w.len), GF_ERR_HOSTKEY);
+  }
+
   /* S + L is the same signature to a lax verifier; not ours.  */
   {
     static const uint8_t l[32] = {

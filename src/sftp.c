@@ -20,6 +20,7 @@
 # include <config.h>
 #endif
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -108,12 +109,17 @@ io_emit (struct io *io, const uint8_t *pkt, size_t n)
 {
   int r;
 
-  if (io->outn + n > io->max_output)
+  if (n > io->max_output || io->outn > io->max_output - n)
     return GF_ERR_AGAIN;
-  if (io->outn + n > io->outcap)
+  if (io->outcap < io->outn + n)
     {
-      size_t cap = (io->outn + n) * 2;
-      uint8_t *p = realloc (io->out, cap);
+      size_t need = io->outn + n, cap;
+      uint8_t *p;
+
+      if (need > SIZE_MAX / 2)
+        return GF_ERR_NOMEM;
+      cap = need * 2;
+      p = realloc (io->out, cap);
 
       if (p == NULL)
         return GF_ERR_NOMEM;

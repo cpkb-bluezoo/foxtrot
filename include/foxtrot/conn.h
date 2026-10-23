@@ -133,7 +133,9 @@ typedef struct gf_conn_info
   /* The server's host key: the one the client verified, or the one a
      server signed with.  */
   const gf_key *host_key;
-  int ext_info;			/* The peer announced RFC 8308 support.  */
+  int ext_info;			/* The peer announced RFC 8308 support on
+				   the first exchange.  A rekey does not
+				   change it.  */
 } gf_conn_info;
 
 typedef struct gf_conn_events

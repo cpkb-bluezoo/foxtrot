@@ -306,7 +306,8 @@ test_format (void)
   {
     static const char *const bad[] = {
       "#x.example.org", "@x.example.org", "!x.example.org", "*", "*.example.org",
-      "a*b", "x?.example.org", "[x.example.org", "x.example.org]"
+      "a*b", "x?.example.org", "[x.example.org", "x.example.org]",
+      "alice@x.example.org"
     };
     size_t b;
     char l[1024];

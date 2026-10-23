@@ -687,6 +687,8 @@ entry_accepts (const struct entry *e, const gf_auth_request *req,
                const gf_key *key, int cert, const gf_cert_info *ci,
                const char *address, const char *hostname, uint64_t now)
 {
+  int verify = e->verify;
+
   if (cert)
     {
       gf_slice fc;
@@ -698,13 +700,24 @@ entry_accepts (const struct entry *e, const gf_auth_request *req,
           : !gf_cert_has_principal (key, (const char *) req->user.data,
                                     req->user.len, 0))
         return 0;
-      /* A command in the line and another in the certificate: neither.  */
+      /* A command in the line and another in the certificate: neither.
+         The certificate's command, when it is the only one, has to be
+         reported to the caller; one this check cannot store is refused
+         rather than silently dropped.  */
       found = gf_cert_critical_option (key, "force-command", &fc);
       if (found < 0)
         return 0;
       if (found == 1 && e->command != NULL
           && !gf_slice_equals (fc, e->command))
         return 0;
+      if (found == 1 && e->command == NULL
+          && fc.len > GF_AUTHKEY_COMMAND_MAX)
+        return 0;
+      found = gf_cert_critical_option (key, "verify-required", &fc);
+      if (found < 0)
+        return 0;
+      if (found == 1)
+        verify = 1;
     }
   else if (e->ca || !gf_key_equal (e->key, key))
     return 0;
@@ -712,7 +725,7 @@ entry_accepts (const struct entry *e, const gf_auth_request *req,
     return 0;
   if (e->from != NULL && !from_ok (e->from, address, hostname))
     return 0;
-  if (e->verify && gf_key_is_security_key (key) && req->has_signature
+  if (verify && gf_key_is_security_key (key) && req->has_signature
       && !(req->sk_flags & GF_SK_USER_VERIFIED))
     return 0;
   return 1;
@@ -751,12 +764,32 @@ gf_authkeys_check (const gf_authkeys *t, const gf_auth_request *req,
         continue;
       if (match != NULL)
         {
+          gf_slice fc;
+          int found = 0;
+
           memset (match, 0, sizeof *match);
           match->line = e->line;
           match->cert_authority = e->ca;
           match->command = e->command;
           match->expiry = e->expiry;
           match->entry = e;
+          /* The line named no command: the certificate's is the one the
+             user must be given.  It is not in the table, so keep a copy
+             in the match.  A conflicting pair was refused above.  */
+          if (cert && e->command == NULL)
+            {
+              found = gf_cert_critical_option (key, "force-command", &fc);
+              if (found < 0)
+                return 0;
+              if (found == 1)
+                {
+                  if (fc.len > GF_AUTHKEY_COMMAND_MAX)
+                    return 0;
+                  memcpy (match->command_buf, fc.data, fc.len);
+                  match->command_buf[fc.len] = '\0';
+                  match->command = match->command_buf;
+                }
+            }
         }
       return 1;
     }

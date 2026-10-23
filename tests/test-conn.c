@@ -214,6 +214,9 @@ test_rekey (void)
   pair_start (&p);
   pump (&p, 0);
   expect_established (&p);
+  /* RFC 8308 is announced on the first exchange.  */
+  CHECK (p.cl.info.ext_info);
+  CHECK (p.sv.info.ext_info);
   pair_authenticate (&p);
   sidlen = p.cl.info.session_id_len;
   memcpy (sid, p.cl.info.session_id, sidlen);
@@ -256,6 +259,8 @@ test_rekey (void)
   /* Every message arrived, in order, once.  */
   CHECK_EQ (p.sv.nmsgs + p.cl.nmsgs, 8);
   CHECK_EQ (p.cl.host_key_calls, 1);
+  CHECK (p.cl.info.ext_info);
+  CHECK (p.sv.info.ext_info);
   pair_free (&p);
 }
 

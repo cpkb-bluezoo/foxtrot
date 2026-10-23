@@ -102,6 +102,10 @@ gf_packet_set_keys (gf_packet *p, enum gf_dir dir, enum gf_cipher cipher,
       || (ivlen > 0 && iv == NULL))
     return GF_ERR_INVAL;
   d = dir == GF_DIR_READ ? &p->read : &p->write;
+  /* A shorter key or an IV the new cipher does not use must not leave the
+     previous epoch's material in the tail of these arrays.  */
+  gf_wipe (d->key, sizeof d->key);
+  gf_wipe (d->iv, sizeof d->iv);
   d->cipher = cipher;
   memcpy (d->key, key, keylen);
   d->keylen = keylen;

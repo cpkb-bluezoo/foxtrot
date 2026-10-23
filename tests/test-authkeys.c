@@ -646,7 +646,10 @@ test_cert_authority (void)
   CHECK (m.cert_authority);
   /* The user must be a principal.  */
   CHECK_EQ (accepts (t, noperm, "bob", ADDR, NULL, NOW, NULL), 0);
-  CHECK_EQ (accepts (t, user, "bob", "192.0.2.9", NULL, NOW, NULL), 1);
+  CHECK_EQ (accepts (t, user, "bob", "192.0.2.9", NULL, NOW, &m), 1);
+  /* The line names no command; the certificate's force-command is the
+     one the user must be given.  */
+  CHECK (m.command != NULL && strcmp (m.command, "/bin/true") == 0);
   /* The certificate's own conditions: dates, source address.  */
   CHECK_EQ (accepts (t, user, "bob", "198.51.100.1", NULL, NOW, NULL), 0);
   CHECK_EQ (accepts (t, user, "bob", NULL, NULL, NOW, NULL), 0);
@@ -757,6 +760,32 @@ test_security_keys (void)
     gf_key_free (ed);
   }
   gf_key_free (sk);
+
+  /* verify-required on the certificate, with nothing about it on the line.  */
+  {
+    gf_key *skcert = cert_of (vec_sk_ed_cert_uv);
+    gf_key *ca = cert_of (vec_sk_ca_blob);
+    char text[512];
+    size_t n;
+    gf_auth_request req;
+
+    CHECK_EQ (gf_key_to_text (ca, text, sizeof text, &n), GF_OK);
+    while (n > 0 && text[n - 1] == '\n')
+      text[--n] = '\0';
+    snprintf (f, sizeof f, "cert-authority %s\n", text);
+    t = table (f, NULL);
+    req = request (skcert, "alice");
+    req.sk_flags = GF_SK_USER_PRESENT;
+    CHECK_EQ (gf_authkeys_check (t, &req, ADDR, NULL, NOW, NULL), 0);
+    req.sk_flags = GF_SK_USER_PRESENT | GF_SK_USER_VERIFIED;
+    CHECK_EQ (gf_authkeys_check (t, &req, ADDR, NULL, NOW, NULL), 1);
+    req.has_signature = 0;
+    req.sk_flags = 0;
+    CHECK_EQ (gf_authkeys_check (t, &req, ADDR, NULL, NOW, NULL), 1);
+    gf_authkeys_free (t);
+    gf_key_free (skcert);
+    gf_key_free (ca);
+  }
 }
 
 static void

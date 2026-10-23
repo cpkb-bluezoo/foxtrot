@@ -63,11 +63,13 @@ int
 gf_crypto_init (void)
 {
   gfi_i18n_init ();
-  if (gcry_control (GCRYCTL_INITIALIZATION_FINISHED_P))
-    return GF_OK;
+  /* Check even when the application finished initialization itself.  An
+     older libgcrypt aborts the process on a peer's Ed25519 point, and
+     that abort is not something a caller can catch.  */
   if (!gcry_check_version (GF_MIN_GCRYPT))
     return GF_ERR_CRYPTO;
-  gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
+  if (!gcry_control (GCRYCTL_INITIALIZATION_FINISHED_P))
+    gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
   return GF_OK;
 }
 

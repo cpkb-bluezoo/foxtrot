@@ -841,6 +841,31 @@ gf_key_sign (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
   return GF_OK;
 }
 
+/* RFC 8032 section 5.1.7: the y coordinate is the low 255 bits and must be
+   reduced (y < 2^255-19).  The top bit is the sign of x.  A larger y is the
+   same point written with a non-canonical representative; a verifier that
+   reduces mod p accepts the mutated signature.  The host signature travels
+   in the clear, before NEWKEYS.  */
+static int
+ed25519_r_canonical (const uint8_t r[ED_LEN])
+{
+  static const uint8_t p[ED_LEN] = {
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
+  };
+  uint8_t y[ED_LEN];
+  int i;
+
+  memcpy (y, r, ED_LEN);
+  y[ED_LEN - 1] &= 0x7f;
+  for (i = ED_LEN - 1; i >= 0; i--)
+    if (y[i] != p[i])
+      return y[i] < p[i];
+  return 0;
+}
+
 /* RFC 8032 section 5.1.7: S must be less than the group order L, or the
    signature can be altered into another that also verifies.  */
 static int
@@ -918,7 +943,8 @@ verify_impl (const gf_key *k, enum gf_sigalg alg, const uint8_t *data,
 
   if (alg == GF_SIG_ED25519)
     {
-      if (sd.len != 2 * ED_LEN || !ed25519_s_canonical (sd.data + ED_LEN))
+      if (sd.len != 2 * ED_LEN || !ed25519_r_canonical (sd.data)
+          || !ed25519_s_canonical (sd.data + ED_LEN))
         return GF_ERR_HOSTKEY;
       if (gcry_sexp_build (&sig, NULL, "(sig-val (eddsa (r %b)(s %b)))",
                            ED_LEN, sd.data, ED_LEN, sd.data + ED_LEN))

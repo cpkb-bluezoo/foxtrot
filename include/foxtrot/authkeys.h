@@ -52,7 +52,11 @@
    and reported, for the application and the session (session.h) to enforce:
 
      command="COMMAND"    the command to run in place of what the client
-                          asks (gf_session_force)
+                          asks (gf_session_force).  A certificate
+                          force-command is reported the same way when the
+                          line does not name a different one: the two must
+                          agree, and the certificate's command is what
+                          match->command then carries.
      no-pty, no-port-forwarding, no-agent-forwarding, no-X11-forwarding,
      no-user-rc, restrict, and the positive pty, port-forwarding,
      agent-forwarding, X11-forwarding, user-rc that undo them after a
@@ -121,13 +125,21 @@ enum gf_authkey_list
   GF_AUTHKEY_ENVIRONMENT
 };
 
+/* Longest force-command this check will report.  A longer one is refused:
+   authorizing the key without handing the command back would drop it.  */
+#define GF_AUTHKEY_COMMAND_MAX 4096
+
 typedef struct gf_authkey_match
 {
   size_t line;			/* The line of the file, from 1, for logs.  */
   int cert_authority;		/* The key was accepted as a CA.  */
   /* NULL, or the command the user must be given instead of anything else
-     (NUL-terminated).  */
+     (NUL-terminated).  A line's command= points into the table.  A
+     certificate force-command, when the line has none, is copied into
+     command_buf and this points there: it lives as long as this match,
+     not a copy of it.  */
   const char *command;
+  char command_buf[GF_AUTHKEY_COMMAND_MAX + 1];
   uint64_t expiry;		/* Seconds since 1970, or 0 for none.  */
   const void *entry;		/* Private.  */
 } gf_authkey_match;

@@ -519,7 +519,12 @@ in_dates (gnutls_x509_crt_t c, uint64_t now, const char **why)
       *why = "not yet valid";
       return 0;
     }
-  if (exp != GNUTLS_X509_NO_WELL_DEFINED_EXPIRATION && now >= (uint64_t) exp)
+  /* GnuTLS returns a date before the epoch as a negative time_t.  Casting
+     that to uint64_t makes it look far in the future, so a certificate
+     that expired in 1969 would never expire.  -1 was rejected above;
+     (time_t) -2 is "no well-defined expiration".  */
+  if (exp != GNUTLS_X509_NO_WELL_DEFINED_EXPIRATION
+      && (exp < 0 || now >= (uint64_t) exp))
     {
       *why = "expired";
       return 0;
@@ -1056,6 +1061,12 @@ gf_x509_san (const gf_key *key, size_t *pos, int *type, char *out, size_t cap)
       if (t < 0)
         continue;
       buf[sz] = '\0';
+      /* An interior NUL would make the C string a prefix of the name
+         (admin\0.attacker.example handed out as "admin").  Hostname
+         matching already rejects that; this is the accessor applications
+         use to map a chain to a user.  IP addresses are binary.  */
+      if (t != GNUTLS_SAN_IPADDRESS && (sz == 0 || strlen (buf) != sz))
+        continue;
       switch (t)
         {
         case GNUTLS_SAN_DNSNAME: ours = GF_X509_SAN_DNS; break;
