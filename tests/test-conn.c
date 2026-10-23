@@ -590,6 +590,8 @@ test_disconnect (void)
   CHECK_EQ (p.cl.closed, 1);
   CHECK_EQ (p.cl.close_error, GF_ERR_CLOSED);
   CHECK_EQ (p.cl.close_reason, GF_DISCONNECT_TOO_MANY_CONNECTIONS);
+  CHECK_EQ (gf_conn_receive (p.cl.c, tst_now, (const uint8_t *) "", 0),
+            GF_ERR_CLOSED);
   pair_free (&p);
 
   /* A description too long for the message does not lose the DISCONNECT:

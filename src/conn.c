@@ -845,8 +845,15 @@ handle_disconnect (gf_conn *c, const uint8_t *p, size_t n)
     }
   c->reason = reason;
   c->peer_text = desc;
-  c->fatal = GF_OK;
-  finish_close (c, reason == GF_DISCONNECT_BY_APPLICATION ? 0 : GF_ERR_CLOSED);
+  {
+    int err = reason == GF_DISCONNECT_BY_APPLICATION ? 0 : GF_ERR_CLOSED;
+
+    /* The closed callback and the return from this receive must agree:
+       an application that only checks gf_conn_receive must not think the
+       connection is still usable after a peer disconnect.  */
+    c->fatal = err == 0 ? GF_OK : err;
+    finish_close (c, err);
+  }
   return GF_OK;
 }
 
